@@ -1,0 +1,109 @@
+# Optional advanced configuration.
+# Normal use does not need this file:
+#   dvup list
+#   dvup update
+#   dvup update scoop zedg
+#   dvup add ripgrep brew upgrade ripgrep
+
+version = 1
+
+# Portable Bun preset. dvup automatically replaces this exact default with
+# Bun's official PowerShell installer on Windows or Bash installer on Unix.
+[tools.bun]
+program = "bun"
+args = ["upgrade"]
+lock_processes = ["bun"]
+resource_group = "bun-global"
+
+# Refreshes Homebrew itself and all configured taps. Package-specific upgrades
+# can be added with: dvup add ripgrep brew upgrade ripgrep
+[tools.brew]
+program = "brew"
+args = ["update"]
+platforms = ["macos", "linux"]
+resource_group = "homebrew"
+
+[tools.codex]
+program = "npm"
+args = ["install", "--global", "@openai/codex@latest"]
+resource_group = "node-global"
+
+[[tools.codex.processes]]
+name = "codex"
+action = "wait"
+
+[[tools.codex.processes]]
+name = "node"
+command_contains = "@openai/codex"
+action = "terminate"
+
+[tools.rustup]
+program = "rustup"
+args = ["update"]
+lock_processes = ["cargo", "rustc"]
+
+[tools.scoop]
+program = "scoop"
+args = ["update"]
+platforms = ["windows"]
+resource_group = "scoop"
+
+# Portable uv placeholder. dvup automatically replaces this exact default with
+# Astral's official PowerShell installer on Windows or shell installer on Unix.
+[tools.uv]
+program = "uv"
+args = ["self", "update"]
+lock_processes = ["uv"]
+
+# Optional persistent Scoop app preset. Uncomment if the manifest is `zedg`.
+# [tools.scoop-zedg]
+# program = "scoop"
+# args = ["update", "zedg"]
+# platforms = ["windows"]
+
+# `dvup add claude claude install` creates the equivalent user-level entry:
+# [tools.claude]
+# program = "claude"
+# args = ["install"]
+# lock_processes = ["claude"]
+
+# npm and pnpm are package update methods, not built-in update targets.
+# `dvup add codegraph npm install --global @colbymchenry/codegraph@latest`
+# creates the equivalent user-level entry. A TOML equivalent is:
+# [tools.codegraph]
+# program = "npm"
+# args = ["install", "--global", "@colbymchenry/codegraph@latest"]
+# resource_group = "node-global"
+
+# A package managed by pnpm works the same way:
+# [tools.example-pnpm-package]
+# program = "pnpm"
+# args = ["add", "--global", "package-name@latest"]
+# resource_group = "node-global"
+
+# Bun can also update a specific global package. It uses its own installation
+# directory, so Bun package commands share a separate resource group.
+# [tools.example-bun-package]
+# program = "bun"
+# args = ["add", "--global", "package-name@latest"]
+# resource_group = "bun-global"
+
+# The built-in `brew` target refreshes Homebrew and its taps. A package upgrade
+# uses its own custom target: `dvup add ripgrep brew upgrade ripgrep` creates:
+# [tools.ripgrep]
+# program = "brew"
+# args = ["upgrade", "ripgrep"]
+# platforms = ["macos", "linux"]
+# resource_group = "homebrew"
+
+# A Homebrew cask works the same way:
+# [tools.zed]
+# program = "brew"
+# args = ["upgrade", "--cask", "zed"]
+# platforms = ["macos", "linux"]
+# resource_group = "homebrew"
+
+# Add another tool with only a program and argument list:
+# [tools.example]
+# program = "package-manager"
+# args = ["update", "example"]
