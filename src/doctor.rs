@@ -14,6 +14,7 @@ use crate::{
     config::{Config, Tool},
     error::{Error, Result},
     job::CommandSpec,
+    settings::NetworkSettings,
 };
 
 #[derive(Clone, Debug)]
@@ -74,8 +75,13 @@ impl ToolDiagnosis {
 }
 
 /// Diagnoses configured tools without changing PATH, installations, or config.
-pub fn run(config: &Config, working_directory: &Path, selected_tool: Option<&str>) -> Result<u8> {
-    let diagnoses = diagnose(config, working_directory, selected_tool)?;
+pub fn run(
+    config: &Config,
+    working_directory: &Path,
+    selected_tool: Option<&str>,
+    network: &NetworkSettings,
+) -> Result<u8> {
+    let diagnoses = diagnose(config, working_directory, selected_tool, network)?;
     let report = render_report(&diagnoses);
     print!("{report}");
     Ok(u8::from(diagnoses.iter().any(ToolDiagnosis::has_conflict)))
@@ -86,6 +92,7 @@ pub(crate) fn diagnose(
     config: &Config,
     working_directory: &Path,
     selected_tool: Option<&str>,
+    network: &NetworkSettings,
 ) -> Result<Vec<ToolDiagnosis>> {
     let tools = match selected_tool {
         Some(name) => vec![(
@@ -107,7 +114,7 @@ pub(crate) fn diagnose(
         .unwrap_or_default();
     let extensions = executable_extensions();
     let mut diagnoses = diagnose_tools(&tools, working_directory, &path_directories, &extensions);
-    resolve_diagnosis_versions(&mut diagnoses, working_directory);
+    resolve_diagnosis_versions(&mut diagnoses, working_directory, network);
     Ok(diagnoses)
 }
 
@@ -243,8 +250,14 @@ fn diagnose_executable_cached(
     diagnosis
 }
 
-fn resolve_diagnosis_versions(diagnoses: &mut [ToolDiagnosis], working_directory: &Path) {
-    resolve_diagnosis_versions_with(diagnoses, working_directory, &probe_version);
+fn resolve_diagnosis_versions(
+    diagnoses: &mut [ToolDiagnosis],
+    working_directory: &Path,
+    network: &NetworkSettings,
+) {
+    resolve_diagnosis_versions_with(diagnoses, working_directory, &|path, args, directory| {
+        probe_version(path, args, directory, network)
+    });
 }
 
 fn resolve_diagnosis_versions_with<F>(
@@ -497,7 +510,21 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "com" | "exe" | "bat" | "cmd"
+                )
+            })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
@@ -525,11 +552,7 @@ fn executable_extensions() -> Vec<String> {
             .collect::<Vec<_>>(),
         None => Vec::new(),
     };
-    // Commands are executed through PowerShell on Windows, where a .ps1
-    // launcher takes precedence over application launchers in the same PATH
-    // directory.
-    extensions.retain(|extension| extension != ".ps1");
-    extensions.insert(0, ".ps1".to_owned());
+    extensions.retain(|extension| matches!(extension.as_str(), ".com" | ".exe" | ".bat" | ".cmd"));
     extensions.push(String::new());
     extensions
 }
@@ -552,39 +575,23 @@ fn executable_name(program: &str) -> String {
         .to_owned()
 }
 
-fn probe_version(path: &Path, args: &[String], working_directory: &Path) -> Option<String> {
+fn probe_version(
+    path: &Path,
+    args: &[String],
+    working_directory: &Path,
+    network: &NetworkSettings,
+) -> Option<String> {
     let spec = CommandSpec {
         program: path.to_string_lossy().into_owned(),
         args: args.to_vec(),
         working_directory: working_directory.to_path_buf(),
     };
-    let result = if probe_uses_direct_execution(path) {
-        command::run_direct(&spec)
-    } else {
-        command::run(&spec)
-    }
-    .ok()?;
+    let result = command::run_with_network(&spec, network).ok()?;
     result
         .status
         .success()
         .then(|| compact_version(&result.stdout, &result.stderr))
         .flatten()
-}
-
-fn probe_uses_direct_execution(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
-            })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        true
-    }
 }
 
 fn compact_version(stdout: &[u8], stderr: &[u8]) -> Option<String> {
@@ -814,24 +821,30 @@ mod tests {
         let second = temporary.path().join("second");
         fs::create_dir_all(&first).expect("first PATH directory");
         fs::create_dir_all(&second).expect("second PATH directory");
-        create_executable(&first.join("example.primary"));
-        create_executable(&first.join("example.secondary"));
-        create_executable(&second.join("example.primary"));
+        #[cfg(windows)]
+        let (primary, secondary, extensions) = (
+            "example.cmd",
+            "example.bat",
+            vec![".cmd".to_owned(), ".bat".to_owned()],
+        );
+        #[cfg(not(windows))]
+        let (primary, secondary, extensions) = (
+            "example.primary",
+            "example.secondary",
+            vec![".primary".to_owned(), ".secondary".to_owned()],
+        );
+        create_executable(&first.join(primary));
+        create_executable(&first.join(secondary));
+        create_executable(&second.join(primary));
 
         let candidates = executable_candidates(
             "example",
             temporary.path(),
             &[first.clone(), second.clone()],
-            &[".primary".to_owned(), ".secondary".to_owned()],
+            &extensions,
         );
 
-        assert_eq!(
-            candidates,
-            [
-                first.join("example.primary"),
-                second.join("example.primary")
-            ]
-        );
+        assert_eq!(candidates, [first.join(primary), second.join(primary)]);
     }
 
     #[test]
@@ -879,20 +892,18 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn checks_powershell_launcher_before_pathext_applications() {
-        assert_eq!(
-            executable_extensions().first().map(String::as_str),
-            Some(".ps1")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn runs_native_windows_candidates_without_starting_powershell() {
-        assert!(probe_uses_direct_execution(Path::new("tool.exe")));
-        assert!(probe_uses_direct_execution(Path::new("tool.COM")));
-        assert!(!probe_uses_direct_execution(Path::new("tool.ps1")));
-        assert!(!probe_uses_direct_execution(Path::new("tool.cmd")));
+    fn windows_candidates_exclude_powershell_scripts() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let script = temporary.path().join("tool.ps1");
+        let batch = temporary.path().join("tool.cmd");
+        std::fs::write(&script, "Write-Output 1").expect("write PowerShell script");
+        std::fs::write(&batch, "@echo off\r\n").expect("write batch script");
+        let extensions = executable_extensions();
+        assert!(!extensions.iter().any(|extension| extension == ".ps1"));
+        assert!(extensions.iter().any(|extension| extension == ".exe"));
+        assert!(extensions.iter().any(|extension| extension == ".cmd"));
+        assert!(!is_executable_file(&script));
+        assert!(is_executable_file(&batch));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::{
     error::{Error, Result},
     job::{Job, JobStatus, JobStore},
     process,
+    settings::{AppSettings, NetworkSettings},
     state::StateDirs,
     worker,
 };
@@ -104,6 +105,14 @@ enum Commands {
         /// Explicit alias for the default all-tools behavior.
         #[arg(long)]
         all: bool,
+        /// Install one explicitly configured version of the selected tool.
+        #[arg(
+            long = "to",
+            value_name = "VERSION",
+            requires = "tool",
+            conflicts_with = "all"
+        )]
+        target_version: Option<String>,
         /// Extra arguments appended to the tool command.
         #[arg(conflicts_with = "all")]
         extra_args: Vec<String>,
@@ -196,6 +205,7 @@ pub fn run(cli: Cli) -> Result<u8> {
         Some(root) => StateDirs::at_runtime(root),
         None => StateDirs::discover()?,
     };
+    let settings = AppSettings::load(&state.settings_path())?;
 
     match cli.command {
         None => crate::tui::run(state, None, cli.toml_file),
@@ -215,6 +225,7 @@ pub fn run(cli: Cli) -> Result<u8> {
         Some(Commands::Update {
             tool,
             all,
+            target_version,
             extra_args,
             config,
             execution,
@@ -226,6 +237,7 @@ pub fn run(cli: Cli) -> Result<u8> {
                     working_directory,
                     execution.background,
                     execution.terminate_locking_processes,
+                    settings.network.clone(),
                     state,
                 );
             }
@@ -241,10 +253,20 @@ pub fn run(cli: Cli) -> Result<u8> {
                     std::env::consts::OS
                 )));
             }
+            if let Some(version) = target_version.as_deref() {
+                let (program, args) = definition.update_for_version(&tool, version)?;
+                definition.program = program;
+                definition.args = args;
+            }
             ensure_tool_ready(&tool, &definition, &working_directory)?;
             let background = effective_background(execution.background, definition.background);
             definition.args.extend(extra_args);
-            let mut job = Job::from_tool(tool, definition, working_directory);
+            let mut job = Job::from_tool(
+                tool,
+                definition,
+                working_directory,
+                settings.network.clone(),
+            );
             if execution.terminate_locking_processes {
                 job.terminate_waiting_processes()?;
             }
@@ -260,7 +282,12 @@ pub fn run(cli: Cli) -> Result<u8> {
             }
             let working_directory = std::env::current_dir()?;
             ensure_tool_ready("dvup", &definition, &working_directory)?;
-            let job = Job::from_tool("dvup".to_owned(), definition, working_directory);
+            let job = Job::from_tool(
+                "dvup".to_owned(),
+                definition,
+                working_directory,
+                settings.network.clone(),
+            );
             execute(job, BackgroundMode::Always, state)
         }
         Some(Commands::List { config }) => {
@@ -269,7 +296,12 @@ pub fn run(cli: Cli) -> Result<u8> {
         }
         Some(Commands::Doctor { tool, config }) => {
             let (manifest, working_directory, _) = load_manifest(config, &state)?;
-            doctor::run(&manifest, &working_directory, tool.as_deref())
+            doctor::run(
+                &manifest,
+                &working_directory,
+                tool.as_deref(),
+                &settings.network,
+            )
         }
         Some(Commands::Run {
             name,
@@ -293,6 +325,8 @@ pub fn run(cli: Cli) -> Result<u8> {
                     program: name.clone(),
                     args: vec!["--version".to_owned()],
                 },
+                latest: None,
+                update_version: None,
                 background: ToolBackground::Auto,
                 processes,
                 lock_timeout_secs,
@@ -301,7 +335,12 @@ pub fn run(cli: Cli) -> Result<u8> {
                 platforms: Vec::new(),
                 resource_group: None,
             };
-            let mut job = Job::from_tool(name, definition, std::env::current_dir()?);
+            let mut job = Job::from_tool(
+                name,
+                definition,
+                std::env::current_dir()?,
+                settings.network.clone(),
+            );
             if execution.terminate_locking_processes {
                 job.terminate_waiting_processes()?;
             }
@@ -359,9 +398,9 @@ pub(crate) fn load_manifest(
     if let Some(path) = config_path {
         let working_directory = config_working_directory(&path)?;
         let mut manifest = Config::starter();
-        manifest
-            .tools
-            .extend(UserConfig::load(&path)?.resolve()?.tools);
+        let custom = UserConfig::load(&path)?.resolve()?;
+        manifest.tools.extend(custom.tools);
+        manifest.github = custom.github;
         manifest.validate()?;
         return Ok((manifest, working_directory, ManifestSource::Explicit));
     }
@@ -370,9 +409,9 @@ pub(crate) fn load_manifest(
     let mut customized = false;
     let custom_path = state.custom_config_path();
     if custom_path.is_file() {
-        manifest
-            .tools
-            .extend(UserConfig::load(&custom_path)?.resolve()?.tools);
+        let custom = UserConfig::load(&custom_path)?.resolve()?;
+        manifest.tools.extend(custom.tools);
+        manifest.github = custom.github;
         customized = true;
     }
 
@@ -512,7 +551,7 @@ fn remove_custom_tool(state: StateDirs, name: &str) -> Result<u8> {
             "custom tool `{name}` does not exist"
         )));
     }
-    if custom.tools.is_empty() {
+    if custom.is_empty() {
         fs::remove_file(path)?;
     } else {
         custom.save(&path)?;
@@ -582,6 +621,7 @@ fn update_all(
     working_directory: PathBuf,
     mode: BackgroundMode,
     terminate_locking_processes: bool,
+    network: NetworkSettings,
     state: StateDirs,
 ) -> Result<u8> {
     let started = Instant::now();
@@ -596,7 +636,12 @@ fn update_all(
         let readiness = command::tool_readiness(&tool, &working_directory);
         let probe_program = tool.probe.program.clone();
         let tool_mode = effective_background(mode, tool.background);
-        let mut job = Job::from_tool(name.clone(), tool, working_directory.clone());
+        let mut job = Job::from_tool(
+            name.clone(),
+            tool,
+            working_directory.clone(),
+            network.clone(),
+        );
         if terminate_locking_processes {
             job.terminate_waiting_processes()?;
         }
@@ -819,7 +864,7 @@ fn run_now_inner(job: Job, mode: BackgroundMode, store: &JobStore) -> ExecutionR
         .lock_exclusive()
         .map_err(ExecutionFailure::from_error)?;
 
-    let result = command::run(&job.command);
+    let result = command::run_with_network(&job.command, &job.network);
     FileExt::unlock(&lock_file).map_err(ExecutionFailure::from_error)?;
     let result = result.map_err(ExecutionFailure::from_error)?;
 
@@ -1275,6 +1320,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_target_version_for_one_tool() {
+        let cli = Cli::try_parse_from(["dvup", "update", "codex", "--to", "0.143.0"])
+            .expect("parse target version");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Update {
+                tool: Some(tool),
+                target_version: Some(version),
+                ..
+            }) if tool == "codex" && version == "0.143.0"
+        ));
+    }
+
+    #[test]
+    fn target_version_requires_one_tool_and_conflicts_with_all() {
+        assert!(Cli::try_parse_from(["dvup", "update", "--to", "1.2.3"]).is_err());
+        let error = Cli::try_parse_from(["dvup", "update", "codex", "--all", "--to", "1.2.3"])
+            .expect_err("--all and --to must conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn update_without_tool_means_all_tools() {
         let cli = Cli::try_parse_from(["dvup", "update"]).expect("parse update");
 
@@ -1477,6 +1545,40 @@ mod tests {
 
         remove_custom_tool(state.clone(), "claude-code").expect("remove custom tool");
         assert!(!state.custom_config_path().exists());
+    }
+
+    #[test]
+    fn removing_the_last_custom_tool_preserves_github_monitors() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut custom = UserConfig::empty();
+        custom.tools.insert(
+            "example".to_owned(),
+            UserTool::custom("example", "example".to_owned(), vec!["update".to_owned()]),
+        );
+        custom.github.monitors.push(config::GithubReleaseMonitor {
+            name: "example-release".to_owned(),
+            repository: "owner/repository".to_owned(),
+            asset_regex: r"^example\.zip$".to_owned(),
+            target_directory: temporary.path().join("installed"),
+            format: config::ReleaseAssetFormat::Zip,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled: true,
+        });
+        custom
+            .save(&state.custom_config_path())
+            .expect("seed custom configuration");
+
+        remove_custom_tool(state.clone(), "example").expect("remove custom command");
+
+        let reloaded = UserConfig::load(&state.custom_config_path())
+            .expect("GitHub monitor keeps custom config alive");
+        assert!(reloaded.tools.is_empty());
+        assert_eq!(reloaded.github.monitors.len(), 1);
+        assert_eq!(reloaded.github.monitors[0].name, "example-release");
     }
 
     #[test]

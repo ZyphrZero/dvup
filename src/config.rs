@@ -1,5 +1,10 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -7,20 +12,11 @@ use crate::error::{Error, Result};
 pub const STARTER_TEMPLATE: &str = include_str!("../configs/dvup.example.toml");
 pub const USER_TEMPLATE: &str = include_str!("../configs/dvup.user.example.toml");
 
+#[cfg(unix)]
 const BUN_DEFAULT_PRESET: &str = r#"[tools.bun]
 program = "bun"
 args = ["upgrade"]
-resource_group = "bun-global"
-background = "auto"
-
-[[tools.bun.processes]]
-name = "bun"
-action = "wait""#;
-
-#[cfg(windows)]
-const BUN_PLATFORM_PRESET: &str = r#"[tools.bun]
-program = "Invoke-Expression"
-args = ["Invoke-RestMethod https://bun.sh/install.ps1 | Invoke-Expression"]
+latest = { provider = "github_release", repository = "oven-sh/bun" }
 resource_group = "bun-global"
 background = "auto"
 
@@ -32,6 +28,7 @@ action = "wait""#;
 const BUN_PLATFORM_PRESET: &str = r#"[tools.bun]
 program = "bash"
 args = ["-c", "curl -fsSL https://bun.sh/install | bash"]
+latest = { provider = "github_release", repository = "oven-sh/bun" }
 resource_group = "bun-global"
 background = "auto"
 
@@ -39,21 +36,12 @@ background = "auto"
 name = "bun"
 action = "wait""#;
 
+#[cfg(unix)]
 const UV_DEFAULT_PRESET: &str = r#"[tools.uv]
 program = "uv"
 args = ["self", "update"]
-resource_group = "uv"
-background = "auto"
-
-[[tools.uv.processes]]
-name = "uv"
-action = "wait""#;
-
-#[cfg(windows)]
-const UV_PLATFORM_PRESET: &str = r#"[tools.uv]
-program = "powershell"
-args = ["-ExecutionPolicy", "ByPass", "-c", "irm https://astral.sh/uv/install.ps1 | iex"]
-platforms = ["windows"]
+latest = { provider = "github_release", repository = "astral-sh/uv" }
+update_version = ["uv", "self", "update", "{version}"]
 resource_group = "uv"
 background = "auto"
 
@@ -65,6 +53,8 @@ action = "wait""#;
 const UV_PLATFORM_PRESET: &str = r#"[tools.uv]
 program = "sh"
 args = ["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"]
+latest = { provider = "github_release", repository = "astral-sh/uv" }
+update_version = ["uv", "self", "update", "{version}"]
 platforms = ["macos", "linux"]
 resource_group = "uv"
 background = "auto"
@@ -75,7 +65,7 @@ action = "wait""#;
 
 /// Returns the starter template with platform-appropriate built-in commands.
 pub fn starter_template() -> String {
-    #[cfg(any(windows, unix))]
+    #[cfg(unix)]
     {
         let template = STARTER_TEMPLATE.replacen(BUN_DEFAULT_PRESET, BUN_PLATFORM_PRESET, 1);
         debug_assert_ne!(template, STARTER_TEMPLATE);
@@ -83,7 +73,7 @@ pub fn starter_template() -> String {
         debug_assert_ne!(platform_template, template);
         platform_template
     }
-    #[cfg(not(any(windows, unix)))]
+    #[cfg(not(unix))]
     {
         STARTER_TEMPLATE.to_owned()
     }
@@ -93,17 +83,165 @@ pub fn starter_template() -> String {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub version: u32,
     pub tools: BTreeMap<String, Tool>,
+    #[serde(default, skip_serializing_if = "GithubMonitorConfig::is_empty")]
+    pub(crate) github: GithubMonitorConfig,
 }
 
 /// A user-authored manifest containing concise update and probe commands.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
-    pub version: u32,
     #[serde(default)]
     pub tools: BTreeMap<String, UserTool>,
+    #[serde(default, skip_serializing_if = "GithubMonitorConfig::is_empty")]
+    pub(crate) github: GithubMonitorConfig,
+}
+
+/// GitHub Release repositories managed from the user-authored manifest.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GithubMonitorConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) monitors: Vec<GithubReleaseMonitor>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReleaseAssetFormat {
+    File,
+    Zip,
+    TarGz,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GithubReleaseMonitor {
+    pub(crate) name: String,
+    pub(crate) repository: String,
+    pub(crate) asset_regex: String,
+    pub(crate) target_directory: PathBuf,
+    pub(crate) format: ReleaseAssetFormat,
+    pub(crate) max_download_bytes: u64,
+    pub(crate) max_extracted_bytes: u64,
+    pub(crate) max_extracted_files: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) strip_components: usize,
+    pub(crate) enabled: bool,
+}
+
+impl GithubReleaseMonitor {
+    fn validate(&self) -> Result<()> {
+        if self.name.is_empty()
+            || self.name.trim() != self.name
+            || !self
+                .name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+        {
+            return Err(Error::InvalidConfig(format!(
+                "invalid GitHub release monitor name `{}`",
+                self.name
+            )));
+        }
+        let repository_parts = self.repository.split('/').collect::<Vec<_>>();
+        if repository_parts.len() != 2
+            || repository_parts.iter().any(|part| {
+                part.is_empty()
+                    || !part.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "-_.".contains(character)
+                    })
+            })
+        {
+            return Err(Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` repository must be owner/repo",
+                self.name
+            )));
+        }
+        if self.asset_regex.is_empty() || self.asset_regex.trim() != self.asset_regex {
+            return Err(Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` asset_regex cannot be empty or contain surrounding whitespace",
+                self.name
+            )));
+        }
+        Regex::new(&self.asset_regex).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` has invalid asset_regex: {error}",
+                self.name
+            ))
+        })?;
+        if !self.target_directory.is_absolute() {
+            return Err(Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` target_directory must be an absolute path",
+                self.name
+            )));
+        }
+        if self.format == ReleaseAssetFormat::File && self.strip_components != 0 {
+            return Err(Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` cannot strip components from a plain file",
+                self.name
+            )));
+        }
+        if self.max_download_bytes == 0 || self.max_download_bytes > 8 * 1024 * 1024 * 1024 {
+            return Err(Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` max_download_bytes must be between 1 and 8589934592",
+                self.name
+            )));
+        }
+        match self.format {
+            ReleaseAssetFormat::File
+                if self.max_extracted_bytes != 0 || self.max_extracted_files != 0 =>
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "GitHub release monitor `{}` plain files cannot set extraction limits",
+                    self.name
+                )));
+            }
+            ReleaseAssetFormat::Zip | ReleaseAssetFormat::TarGz
+                if self.max_extracted_bytes == 0
+                    || self.max_extracted_bytes > 16 * 1024 * 1024 * 1024
+                    || self.max_extracted_files == 0
+                    || self.max_extracted_files > 100_000 =>
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "GitHub release monitor `{}` archive limits must allow 1..=17179869184 bytes and 1..=100000 files",
+                    self.name
+                )));
+            }
+            _ => {}
+        }
+        if self.strip_components > 16 {
+            return Err(Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` strip_components cannot exceed 16",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl GithubMonitorConfig {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.monitors.is_empty()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let mut names = HashSet::new();
+        for monitor in &self.monitors {
+            monitor.validate()?;
+            if !names.insert(monitor.name.to_ascii_lowercase()) {
+                return Err(Error::InvalidConfig(format!(
+                    "duplicate GitHub release monitor name `{}`",
+                    monitor.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// One user-authored tool definition.
@@ -112,6 +250,10 @@ pub struct UserConfig {
 pub struct UserTool {
     pub update: Vec<String>,
     pub probe: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<LatestVersionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_version: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "is_auto_background")]
     pub background: ToolBackground,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +289,10 @@ pub struct Tool {
     #[serde(default)]
     pub args: Vec<String>,
     pub probe: ToolProbe,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<LatestVersionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_version: Option<Vec<String>>,
     pub background: ToolBackground,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<ProcessRule>,
@@ -170,6 +316,43 @@ pub struct Tool {
 pub struct ToolProbe {
     pub program: String,
     pub args: Vec<String>,
+}
+
+/// An authoritative registry or repository used to query the latest release.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LatestVersionSource {
+    Npm { package: String },
+    Pypi { package: String },
+    CratesIo { package: String },
+    GithubRelease { repository: String },
+    GithubTag { repository: String },
+}
+
+impl LatestVersionSource {
+    fn validate(&self, context: &str) -> Result<()> {
+        let value = match self {
+            Self::Npm { package } | Self::Pypi { package } | Self::CratesIo { package } => package,
+            Self::GithubRelease { repository } | Self::GithubTag { repository } => repository,
+        };
+        if value.trim().is_empty() {
+            return Err(Error::InvalidConfig(format!(
+                "{context} has an empty latest-version source"
+            )));
+        }
+        if matches!(self, Self::GithubRelease { .. } | Self::GithubTag { .. }) {
+            let mut parts = value.split('/');
+            if parts.next().is_none_or(str::is_empty)
+                || parts.next().is_none_or(str::is_empty)
+                || parts.next().is_some()
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "{context} GitHub repository must use owner/name"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether a configured update must leave the invoking executable first.
@@ -310,6 +493,8 @@ impl Tool {
                 program: name.to_owned(),
                 args: vec!["--version".to_owned()],
             },
+            latest: None,
+            update_version: None,
             background: ToolBackground::Auto,
             processes: vec![ProcessRule::wait(name.to_owned())],
             lock_timeout_secs: default_lock_timeout_secs(),
@@ -318,6 +503,21 @@ impl Tool {
             platforms,
             resource_group,
         }
+    }
+
+    /// Builds the explicitly configured update command for one target version.
+    pub fn update_for_version(&self, name: &str, version: &str) -> Result<(String, Vec<String>)> {
+        validate_target_version(version)?;
+        let template = self.update_version.as_ref().ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "tool `{name}` does not support selecting a target version"
+            ))
+        })?;
+        let command = template
+            .iter()
+            .map(|part| part.replace("{version}", version))
+            .collect();
+        split_user_command(name, "update_version", command)
     }
 
     /// Returns whether this tool is enabled on the current operating system.
@@ -374,6 +574,8 @@ impl UserTool {
         Self {
             update,
             probe: vec![name.to_owned(), "--version".to_owned()],
+            latest: None,
+            update_version: None,
             background: ToolBackground::Auto,
             wait_for: None,
             processes: Vec::new(),
@@ -412,6 +614,8 @@ impl UserTool {
         Self {
             update,
             probe,
+            latest: tool.latest.clone(),
+            update_version: tool.update_version.clone(),
             background: tool.background,
             wait_for: (wait_for.as_slice() != default_wait).then_some(wait_for),
             processes,
@@ -440,6 +644,8 @@ impl UserTool {
                 program: probe_program,
                 args: probe_args,
             },
+            latest: self.latest,
+            update_version: self.update_version,
             background: self.background,
             processes,
             lock_timeout_secs: self.lock_timeout_secs,
@@ -455,9 +661,13 @@ impl UserConfig {
     /// Returns an empty user manifest ready to receive custom tools.
     pub fn empty() -> Self {
         Self {
-            version: 1,
             tools: BTreeMap::new(),
+            github: GithubMonitorConfig::default(),
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.github.is_empty()
     }
 
     /// Reads and validates a user-authored manifest.
@@ -477,12 +687,6 @@ impl UserConfig {
 
     /// Resolves concise user definitions into the complete runtime model.
     pub fn resolve(self) -> Result<Config> {
-        if self.version != 1 {
-            return Err(Error::InvalidConfig(format!(
-                "unsupported version {}; expected 1",
-                self.version
-            )));
-        }
         let mut tools = BTreeMap::new();
         for (name, user_tool) in self.tools {
             if name.trim().is_empty() {
@@ -493,8 +697,8 @@ impl UserConfig {
             tools.insert(name.clone(), user_tool.resolve(&name)?);
         }
         let config = Config {
-            version: self.version,
             tools,
+            github: self.github,
         };
         config.validate_inner(false)?;
         Ok(config)
@@ -529,12 +733,6 @@ impl Config {
     }
 
     fn validate_inner(&self, require_tools: bool) -> Result<()> {
-        if self.version != 1 {
-            return Err(Error::InvalidConfig(format!(
-                "unsupported version {}; expected 1",
-                self.version
-            )));
-        }
         if require_tools && self.tools.is_empty() {
             return Err(Error::InvalidConfig(
                 "at least one [tools.<name>] entry is required".to_owned(),
@@ -556,6 +754,10 @@ impl Config {
                     "tool `{name}` has an empty probe program"
                 )));
             }
+            if let Some(latest) = &tool.latest {
+                latest.validate(&format!("tool `{name}`"))?;
+            }
+            validate_update_version_template(name, tool.update_version.as_deref())?;
             if tool.lock_timeout_secs == 0 {
                 return Err(Error::InvalidConfig(format!(
                     "tool `{name}` must have lock_timeout_secs greater than zero"
@@ -586,6 +788,7 @@ impl Config {
                 rule.validate(&format!("tool `{name}`"))?;
             }
         }
+        self.github.validate()?;
         Ok(())
     }
 }
@@ -606,6 +809,36 @@ fn split_user_command(
         )));
     }
     Ok((program.clone(), args.to_vec()))
+}
+
+fn validate_update_version_template(name: &str, template: Option<&[String]>) -> Result<()> {
+    let Some(template) = template else {
+        return Ok(());
+    };
+    split_user_command(name, "update_version", template.to_vec())?;
+    let placeholders = template
+        .iter()
+        .map(|part| part.matches("{version}").count())
+        .sum::<usize>();
+    if placeholders != 1 {
+        return Err(Error::InvalidConfig(format!(
+            "tool `{name}` update_version must contain exactly one {{version}} placeholder"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_target_version(version: &str) -> Result<()> {
+    if version.is_empty()
+        || !version.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | '_')
+        })
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid target version `{version}`; use letters, digits, dot, dash, plus, or underscore"
+        )));
+    }
+    Ok(())
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
@@ -670,26 +903,16 @@ mod tests {
         let encoded = toml::to_string_pretty(&Config::starter()).expect("serialize starter");
         let decoded: Config = toml::from_str(&encoded).expect("parse starter");
 
-        assert_eq!(decoded.version, 1);
+        let document: toml::Value = toml::from_str(&encoded).expect("parse serialized starter");
+        assert!(document.get("version").is_none());
         assert_eq!(decoded.tools.len(), 9);
         #[cfg(windows)]
         {
-            assert_eq!(decoded.tools["bun"].program, "Invoke-Expression");
-            assert!(
-                decoded.tools["bun"]
-                    .args
-                    .join(" ")
-                    .contains("bun.sh/install.ps1")
-            );
-            assert!(!decoded.tools["bun"].args.iter().any(|arg| arg == "upgrade"));
-            assert_eq!(decoded.tools["uv"].program, "powershell");
-            assert_eq!(decoded.tools["uv"].platforms, ["windows"]);
-            assert!(
-                decoded.tools["uv"]
-                    .args
-                    .join(" ")
-                    .contains("astral.sh/uv/install.ps1")
-            );
+            assert_eq!(decoded.tools["bun"].program, "bun");
+            assert_eq!(decoded.tools["bun"].args, ["upgrade"]);
+            assert_eq!(decoded.tools["uv"].program, "uv");
+            assert_eq!(decoded.tools["uv"].args, ["self", "update"]);
+            assert!(decoded.tools["uv"].platforms.is_empty());
         }
         #[cfg(unix)]
         {
@@ -760,8 +983,6 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         let input = r#"
-version = 1
-
 [tools.codex]
 program = "npm"
 unexpected = true
@@ -772,10 +993,21 @@ unexpected = true
     }
 
     #[test]
+    fn rejects_obsolete_manifest_version_field() {
+        let input = "version = 1\n";
+
+        let runtime_error = toml::from_str::<Config>(input)
+            .expect_err("runtime manifest version should be unknown");
+        assert!(runtime_error.to_string().contains("version"));
+
+        let user_error =
+            UserConfig::parse(input).expect_err("user manifest version should be unknown");
+        assert!(user_error.to_string().contains("version"));
+    }
+
+    #[test]
     fn rejects_unscoped_node_termination() {
         let input = r#"
-version = 1
-
 [tools.codex]
 program = "npm"
 background = "auto"
@@ -830,8 +1062,6 @@ action = "terminate"
     #[test]
     fn rejects_unknown_platform() {
         let input = r#"
-version = 1
-
 [tools.example]
 program = "example"
 platforms = ["freebsd"]
@@ -850,8 +1080,6 @@ args = ["--version"]
     #[test]
     fn rejects_unsafe_resource_group() {
         let input = r#"
-version = 1
-
 [tools.example]
 program = "example"
 resource_group = "../../outside"
@@ -887,14 +1115,10 @@ args = ["--version"]
     #[test]
     fn user_manifest_requires_update_and_probe_commands() {
         let missing_probe = r#"
-version = 1
-
 [tools.example]
 update = ["example", "update"]
 "#;
         let missing_update = r#"
-version = 1
-
 [tools.example]
 probe = ["example", "--version"]
 "#;
@@ -915,9 +1139,7 @@ probe = ["example", "--version"]
 
     #[test]
     fn user_manifest_is_concise_and_resolves_to_the_runtime_model() {
-        let input = r#"version = 1
-
-[tools.claude]
+        let input = r#"[tools.claude]
 update = ["claude", "update"]
 probe = ["claude", "--version"]
 "#;
@@ -942,10 +1164,88 @@ probe = ["claude", "--version"]
     }
 
     #[test]
-    fn user_manifest_rejects_internal_builtin_fields() {
-        let internal_format = r#"version = 1
+    fn user_manifest_resolves_latest_source_and_versioned_update_template() {
+        let input = r#"[tools.codex]
+update = ["npm", "install", "--global", "@openai/codex@latest"]
+probe = ["codex", "--version"]
+latest = { provider = "npm", package = "@openai/codex" }
+update_version = ["npm", "install", "--global", "@openai/codex@{version}"]
+"#;
 
-[tools.example]
+        let runtime = UserConfig::parse(input)
+            .expect("parse version-aware user manifest")
+            .resolve()
+            .expect("resolve version-aware user manifest");
+        let codex = &runtime.tools["codex"];
+
+        assert!(matches!(
+            &codex.latest,
+            Some(LatestVersionSource::Npm { package }) if package == "@openai/codex"
+        ));
+        assert_eq!(
+            codex.update_version.as_deref(),
+            Some(
+                ["npm", "install", "--global", "@openai/codex@{version}"]
+                    .map(str::to_owned)
+                    .as_slice()
+            )
+        );
+        assert_eq!(
+            codex
+                .update_for_version("codex", "0.143.0")
+                .expect("render target-version command"),
+            (
+                "npm".to_owned(),
+                ["install", "--global", "@openai/codex@0.143.0"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+        assert!(codex.update_for_version("codex", "1.2.3;remove").is_err());
+
+        let unsupported = Tool::custom("plain", "plain".to_owned(), vec!["update".to_owned()]);
+        assert!(unsupported.update_for_version("plain", "1.2.3").is_err());
+    }
+
+    #[test]
+    fn user_manifest_accepts_an_explicit_pypi_latest_source() {
+        let input = r#"[tools.hermes]
+update = ["hermes", "update"]
+probe = ["hermes", "--version"]
+latest = { provider = "pypi", package = "hermes-agent" }
+"#;
+
+        let runtime = UserConfig::parse(input)
+            .expect("parse PyPI latest source")
+            .resolve()
+            .expect("resolve PyPI latest source");
+
+        assert!(matches!(
+            &runtime.tools["hermes"].latest,
+            Some(LatestVersionSource::Pypi { package }) if package == "hermes-agent"
+        ));
+    }
+
+    #[test]
+    fn versioned_update_template_requires_exactly_one_placeholder() {
+        for update_version in [
+            r#"["npm", "install", "package"]"#,
+            r#"["npm", "install", "package@{version}", "{version}"]"#,
+        ] {
+            let input = format!(
+                r#"[tools.example]
+update = ["example", "update"]
+probe = ["example", "--version"]
+update_version = {update_version}
+"#
+            );
+            assert!(UserConfig::parse(&input).is_err(), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn user_manifest_rejects_internal_builtin_fields() {
+        let internal_format = r#"[tools.example]
 program = "example"
 args = ["update"]
 background = "auto"
@@ -978,6 +1278,95 @@ args = ["--version"]
             assert!(USER_TEMPLATE.contains(&format!("# [tools.{name}]")));
             assert!(!STARTER_TEMPLATE.contains(&format!("[tools.{name}]")));
         }
+    }
+
+    #[test]
+    fn user_manifest_round_trips_github_release_monitors() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let target = toml::Value::String(temporary.path().join("example").display().to_string());
+        let input = format!(
+            r#"[[github.monitors]]
+name = "example"
+repository = "owner/repository"
+asset_regex = '^example-[0-9]+\.[0-9]+\.[0-9]+-windows-x86_64\.zip$'
+target_directory = {target}
+format = "zip"
+max_download_bytes = 104857600
+max_extracted_bytes = 314572800
+max_extracted_files = 1000
+strip_components = 1
+enabled = true
+"#
+        );
+
+        let user = UserConfig::parse(&input).expect("parse GitHub monitor user manifest");
+        let encoded = toml::to_string_pretty(&user).expect("serialize GitHub monitor manifest");
+        let decoded = UserConfig::parse(&encoded).expect("reload GitHub monitor manifest");
+
+        assert_eq!(decoded.github.monitors.len(), 1);
+        let monitor = &decoded.github.monitors[0];
+        assert_eq!(monitor.name, "example");
+        assert_eq!(monitor.repository, "owner/repository");
+        assert_eq!(
+            monitor.asset_regex,
+            r"^example-[0-9]+\.[0-9]+\.[0-9]+-windows-x86_64\.zip$"
+        );
+        assert_eq!(monitor.target_directory, temporary.path().join("example"));
+    }
+
+    #[test]
+    fn user_manifest_rejects_legacy_github_asset_pattern() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let target = toml::Value::String(temporary.path().join("example").display().to_string());
+        let input = format!(
+            r#"[[github.monitors]]
+name = "example"
+repository = "owner/repository"
+asset_pattern = '^example\.zip$'
+target_directory = {target}
+format = "zip"
+max_download_bytes = 1024
+max_extracted_bytes = 2048
+max_extracted_files = 10
+enabled = true
+"#
+        );
+
+        let error = UserConfig::parse(&input)
+            .expect_err("legacy asset_pattern must not parse in dvup_custom.toml");
+        assert!(error.to_string().contains("asset_pattern"));
+    }
+
+    #[test]
+    fn github_release_monitors_require_unique_names_valid_regex_and_absolute_targets() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let monitor = GithubReleaseMonitor {
+            name: "example".to_owned(),
+            repository: "owner/repository".to_owned(),
+            asset_regex: r"^tool-[0-9.]+-windows\.zip$".to_owned(),
+            target_directory: temporary.path().join("tool"),
+            format: ReleaseAssetFormat::Zip,
+            max_download_bytes: 100 * 1024 * 1024,
+            max_extracted_bytes: 300 * 1024 * 1024,
+            max_extracted_files: 1_000,
+            strip_components: 1,
+            enabled: true,
+        };
+        let mut github = GithubMonitorConfig {
+            monitors: vec![monitor.clone()],
+        };
+        assert!(github.validate().is_ok());
+
+        github.monitors.push(monitor);
+        assert!(github.validate().is_err());
+        github.monitors[1].name = "second".to_owned();
+        github.monitors[1].target_directory = PathBuf::from("relative");
+        assert!(github.validate().is_err());
+
+        github.monitors.truncate(1);
+        github.monitors[0].asset_regex = "[unterminated".to_owned();
+        let error = github.validate().expect_err("invalid regex must fail");
+        assert!(error.to_string().contains("invalid asset_regex"));
     }
 
     #[test]

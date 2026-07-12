@@ -74,6 +74,10 @@ impl StateDirs {
         self.root.join("settings.toml")
     }
 
+    pub fn release_state_path(&self) -> PathBuf {
+        self.root.join("github-releases.json")
+    }
+
     pub fn resource_lock_path(&self, resource_group: &str) -> PathBuf {
         let mut safe_name: String = resource_group
             .chars()

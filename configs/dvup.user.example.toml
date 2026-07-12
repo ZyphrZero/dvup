@@ -1,19 +1,20 @@
-version = 1
+# dvup_custom.toml: strict user-owned command tools and GitHub Release repositories.
+# Uncomment complete entries only. Unknown fields, missing required fields, duplicate
+# monitor names, invalid regexes, and relative target directories are rejected.
 
-# Global and explicitly selected user manifests contain custom tools or built-in overrides.
-# The update and probe commands are explicit arrays; optional runtime settings
-# are written only when they differ from dvup's standard behavior.
+# Minimal custom command
 #
 # [tools.example]
 # update = ["example", "self-update"]
 # probe = ["example", "--version"]
 
-# AI coding tools are user examples rather than built-in presets. Uncomment
-# only the tools installed and managed in your environment.
+# Optional command examples
 #
 # [tools.codex]
 # update = ["npm", "install", "--global", "@openai/codex@latest"]
 # probe = ["codex", "--version"]
+# latest = { provider = "npm", package = "@openai/codex" }
+# update_version = ["npm", "install", "--global", "@openai/codex@{version}"]
 # resource_group = "node-global"
 #
 # [[tools.codex.processes]]
@@ -24,11 +25,44 @@ version = 1
 # [tools.claude]
 # update = ["claude", "update"]
 # probe = ["claude", "--version"]
+# latest = { provider = "npm", package = "@anthropic-ai/claude-code" }
+# update_version = ["claude", "install", "{version}"]
 #
 # [tools.opencode]
 # update = ["opencode", "upgrade"]
 # probe = ["opencode", "--version"]
+# latest = { provider = "npm", package = "opencode-ai" }
+# update_version = ["opencode", "upgrade", "{version}"]
 #
 # [tools.hermes]
 # update = ["hermes", "update"]
 # probe = ["hermes", "--version"]
+# latest = { provider = "pypi", package = "hermes-agent" }
+
+# GitHub Release repository examples
+# asset_regex uses Rust regex syntax and must match exactly one latest-release asset.
+# Single-quoted TOML paths keep Windows backslashes literal.
+#
+# [[github.monitors]]
+# name = "reqable-windows-x64"
+# repository = "reqable/reqable-app"
+# asset_regex = '^reqable-app-windows-x86_64\.zip$'
+# target_directory = 'C:\Tools\Reqable'
+# format = "zip"
+# max_download_bytes = 104857600
+# max_extracted_bytes = 314572800
+# max_extracted_files = 1000
+# strip_components = 0
+# enabled = true
+#
+# [[github.monitors]]
+# name = "wsl-dashboard-windows-x64"
+# repository = "owu/wsl-dashboard"
+# asset_regex = '^WSLDashboard\.[0-9]+\.[0-9]+\.[0-9]+\.Setup\.x64\.zip$'
+# target_directory = 'C:\Tools\WSLDashboard'
+# format = "zip"
+# max_download_bytes = 104857600
+# max_extracted_bytes = 314572800
+# max_extracted_files = 1000
+# strip_components = 0
+# enabled = true

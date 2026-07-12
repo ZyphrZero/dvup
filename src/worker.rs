@@ -274,7 +274,7 @@ fn execute_with_retries(job: &mut Job, store: &JobStore) -> Result<()> {
             ),
         )?;
 
-        let result = match command::run(&job.command) {
+        let result = match command::run_with_network(&job.command, &job.network) {
             Ok(result) => result,
             Err(error) => {
                 let message = error.to_string();
@@ -383,6 +383,7 @@ mod tests {
                 Vec::new(),
             ),
             temporary.path().to_path_buf(),
+            crate::settings::NetworkSettings::default(),
         );
         let job_id = job.id.clone();
         store.save(&job).expect("save job");
@@ -408,6 +409,7 @@ mod tests {
                 Vec::new(),
             ),
             temporary.path().to_path_buf(),
+            crate::settings::NetworkSettings::default(),
         );
         let job_id = job.id.clone();
         store.save(&job).expect("save job");

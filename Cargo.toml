@@ -4,31 +4,42 @@ version = "0.1.0"
 edition = "2024"
 description = "A lock-aware, cross-platform toolchain updater"
 license = "MIT"
+repository = "https://github.com/ZyphrZero/dvup"
 rust-version = "1.85"
 
 [dependencies]
 arboard = { version = "3.6", default-features = false }
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.28"
 directories = "6.0"
 fs2 = "0.4"
+flate2 = "1.1"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.36"
+tar = "0.4"
 taplo = { version = "0.14", default-features = false }
+tempfile = "3.20"
 thiserror = "2.0"
 toml = "0.9"
+ureq = { version = "3.1", default-features = false, features = ["json", "rustls"] }
+zip = { version = "4.3", default-features = false, features = ["deflate"] }
+zeroize = "1.8"
+
+[target.'cfg(not(windows))'.dependencies]
+aes-gcm = "0.10"
+getrandom = "0.3"
+keyring = "3.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
-
-[dev-dependencies]
-tempfile = "3.20"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Threading"] }
 
 [profile.release]
 lto = "thin"

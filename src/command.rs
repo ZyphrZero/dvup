@@ -2,14 +2,18 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
-    process::{Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus},
 };
+
+#[cfg(windows)]
+use std::collections::HashMap;
 
 use crate::{
     config::Tool,
     datetime,
     error::{Error, Result},
     job::CommandSpec,
+    settings::{NetworkSettings, ProxyMode},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,15 +41,37 @@ pub fn update_spec(tool: &Tool, working_directory: &std::path::Path) -> CommandS
 }
 
 pub fn tool_readiness(tool: &Tool, working_directory: &std::path::Path) -> ToolReadiness {
-    if !tool.supports_current_platform() {
-        ToolReadiness::Unsupported
-    } else if !is_available(&probe_spec(tool, working_directory)) {
-        ToolReadiness::TargetMissing
-    } else if !is_available(&update_spec(tool, working_directory)) {
-        ToolReadiness::UpdaterMissing
-    } else {
-        ToolReadiness::Installed
+    tool_readiness_many([tool], working_directory)[0]
+}
+
+pub fn tool_readiness_many<'a>(
+    tools: impl IntoIterator<Item = &'a Tool>,
+    working_directory: &std::path::Path,
+) -> Vec<ToolReadiness> {
+    let tools = tools.into_iter().collect::<Vec<_>>();
+    let mut specs = Vec::with_capacity(tools.len().saturating_mul(2));
+    let mut spec_indices = Vec::with_capacity(tools.len());
+    for tool in &tools {
+        if tool.supports_current_platform() {
+            let probe_index = specs.len();
+            specs.push(probe_spec(tool, working_directory));
+            let update_index = specs.len();
+            specs.push(update_spec(tool, working_directory));
+            spec_indices.push(Some((probe_index, update_index)));
+        } else {
+            spec_indices.push(None);
+        }
     }
+    let available = commands_available(&specs);
+    spec_indices
+        .into_iter()
+        .map(|indices| match indices {
+            None => ToolReadiness::Unsupported,
+            Some((probe, _)) if !available[probe] => ToolReadiness::TargetMissing,
+            Some((_, update)) if !available[update] => ToolReadiness::UpdaterMissing,
+            Some(_) => ToolReadiness::Installed,
+        })
+        .collect()
 }
 
 /// Captured result of an update command.
@@ -122,17 +148,54 @@ fn contains_permission_failure(output: &str) -> bool {
         .any(|marker| output.contains(marker))
 }
 
-/// Executes a command without invoking a shell and captures both output streams.
-pub fn run(spec: &CommandSpec) -> Result<CommandResult> {
-    capture_command(spec, prepare_command(spec))
+/// Executes a command with the application's exact network policy.
+pub(crate) fn run_with_network(
+    spec: &CommandSpec,
+    network: &NetworkSettings,
+) -> Result<CommandResult> {
+    network.validate()?;
+    let mut command = prepare_command(spec);
+    apply_network_environment(&mut command, network);
+    capture_command(spec, command)
 }
 
-/// Executes an already resolved native executable without an intermediary shell.
-pub(crate) fn run_direct(spec: &CommandSpec) -> Result<CommandResult> {
-    let mut command = Command::new(&spec.program);
-    command.args(&spec.args);
-    configure_no_window(&mut command);
-    capture_command(spec, command)
+const PROXY_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+fn apply_network_environment(command: &mut Command, network: &NetworkSettings) {
+    if network.proxy_mode == ProxyMode::Environment {
+        return;
+    }
+    for variable in PROXY_ENVIRONMENT_VARIABLES {
+        command.env_remove(variable);
+    }
+    if network.proxy_mode == ProxyMode::Explicit {
+        let proxy_url = network
+            .proxy_url
+            .as_deref()
+            .expect("validated explicit proxy");
+        for variable in [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ] {
+            command.env(variable, proxy_url);
+        }
+        if let Some(no_proxy) = network.no_proxy_value() {
+            command.env("NO_PROXY", &no_proxy).env("no_proxy", no_proxy);
+        }
+    }
 }
 
 fn capture_command(spec: &CommandSpec, mut command: Command) -> Result<CommandResult> {
@@ -152,19 +215,38 @@ fn capture_command(spec: &CommandSpec, mut command: Command) -> Result<CommandRe
 }
 
 /// Returns whether the command can be resolved without executing it.
+#[cfg(test)]
 pub fn is_available(spec: &CommandSpec) -> bool {
-    let resolved = resolve_program(spec);
+    commands_available(std::slice::from_ref(spec))[0]
+}
+
+fn commands_available(specs: &[CommandSpec]) -> Vec<bool> {
     #[cfg(windows)]
     {
-        resolved.is_file() || powershell_resolves_command(spec)
+        let mut cache = HashMap::new();
+        specs
+            .iter()
+            .map(|spec| {
+                let key = (spec.program.to_lowercase(), spec.working_directory.clone());
+                *cache
+                    .entry(key)
+                    .or_insert_with(|| resolve_program(spec).is_file())
+            })
+            .collect()
     }
     #[cfg(unix)]
     {
-        is_unix_executable(&resolved, spec)
+        specs
+            .iter()
+            .map(|spec| is_unix_executable(&resolve_program(spec), spec))
+            .collect()
     }
     #[cfg(not(any(unix, windows)))]
     {
-        resolved.is_file()
+        specs
+            .iter()
+            .map(|spec| resolve_program(spec).is_file())
+            .collect()
     }
 }
 
@@ -177,16 +259,19 @@ fn prepare_command(spec: &CommandSpec) -> Command {
 
 #[cfg(windows)]
 fn prepare_command(spec: &CommandSpec) -> Command {
-    let mut command = Command::new("powershell.exe");
-    command
-        .args([
-            "-NoLogo",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-        ])
-        .arg(powershell_invocation(spec));
+    let program = resolve_program(spec);
+    let is_batch = program
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_lowercase().as_str(), "bat" | "cmd"));
+    let mut command = if is_batch {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C"]).arg(program);
+        command
+    } else {
+        Command::new(program)
+    };
+    command.args(&spec.args);
     configure_no_window(&mut command);
     command
 }
@@ -203,44 +288,6 @@ pub fn configure_no_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 pub fn configure_no_window(_command: &mut Command) {}
-
-#[cfg(windows)]
-fn powershell_invocation(spec: &CommandSpec) -> String {
-    let arguments = std::iter::once(spec.program.as_str())
-        .chain(spec.args.iter().map(String::as_str))
-        .map(powershell_quote)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("$ProgressPreference = 'SilentlyContinue'; & {arguments}")
-}
-
-#[cfg(windows)]
-fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(windows)]
-fn powershell_resolves_command(spec: &CommandSpec) -> bool {
-    let probe = format!(
-        "Get-Command -Name {} -ErrorAction Stop | Out-Null",
-        powershell_quote(&spec.program)
-    );
-    let mut command = Command::new("powershell.exe");
-    command
-        .args([
-            "-NoLogo",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-        ])
-        .arg(probe)
-        .current_dir(&spec.working_directory)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    configure_no_window(&mut command);
-    command.status().is_ok_and(|status| status.success())
-}
 
 #[cfg(unix)]
 fn is_unix_executable(program: &std::path::Path, spec: &CommandSpec) -> bool {
@@ -338,6 +385,86 @@ pub fn append_to_log(path: &std::path::Path, result: &CommandResult) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
+
+    use crate::settings::{NetworkSettings, ProxyMode};
+
+    fn command_environment(
+        command: &std::process::Command,
+        name: &str,
+    ) -> Option<Option<OsString>> {
+        command
+            .get_envs()
+            .find(|(key, _)| {
+                #[cfg(windows)]
+                {
+                    key.to_string_lossy().eq_ignore_ascii_case(name)
+                }
+                #[cfg(not(windows))]
+                {
+                    *key == OsStr::new(name)
+                }
+            })
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    #[test]
+    fn explicit_network_replaces_all_proxy_environment_variables() {
+        let network = NetworkSettings {
+            proxy_mode: ProxyMode::Explicit,
+            proxy_url: Some("http://127.0.0.1:7890".to_owned()),
+            no_proxy: vec!["localhost".to_owned(), ".example.com".to_owned()],
+        };
+        let mut command = std::process::Command::new("example");
+        super::apply_network_environment(&mut command, &network);
+
+        for name in [
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ] {
+            assert_eq!(
+                command_environment(&command, name),
+                Some(Some(OsString::from("http://127.0.0.1:7890")))
+            );
+        }
+        assert_eq!(
+            command_environment(&command, "NO_PROXY"),
+            Some(Some(OsString::from("localhost,.example.com")))
+        );
+    }
+
+    #[test]
+    fn direct_network_removes_all_proxy_environment_variables() {
+        let network = NetworkSettings {
+            proxy_mode: ProxyMode::Direct,
+            proxy_url: None,
+            no_proxy: Vec::new(),
+        };
+        let mut command = std::process::Command::new("example");
+        super::apply_network_environment(&mut command, &network);
+
+        for name in super::PROXY_ENVIRONMENT_VARIABLES {
+            assert_eq!(command_environment(&command, name), Some(None));
+        }
+    }
+
+    #[test]
+    fn environment_network_does_not_override_command_environment() {
+        let mut command = std::process::Command::new("example");
+        command.env("HTTP_PROXY", "http://inherited.example:8080");
+        super::apply_network_environment(&mut command, &NetworkSettings::default());
+
+        assert_eq!(
+            command_environment(&command, "HTTP_PROXY"),
+            Some(Some(OsString::from("http://inherited.example:8080")))
+        );
+        assert_eq!(command_environment(&command, "HTTPS_PROXY"), None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn resolves_windows_pathext_from_working_directory() {
@@ -433,6 +560,32 @@ mod tests {
     }
 
     #[test]
+    fn batched_readiness_preserves_tool_order_and_status() {
+        let current = std::env::current_exe()
+            .expect("current executable")
+            .to_string_lossy()
+            .into_owned();
+        let working_directory = std::env::current_dir().expect("current directory");
+
+        let mut installed = crate::config::Tool::custom("installed", current.clone(), Vec::new());
+        installed.probe.program = current.clone();
+        let mut updater_missing = installed.clone();
+        updater_missing.program = "dvup-batch-missing-updater-96cf27db".to_owned();
+        let mut target_missing = installed.clone();
+        target_missing.probe.program = "dvup-batch-missing-target-96cf27db".to_owned();
+        let tools = [&installed, &updater_missing, &target_missing];
+
+        assert_eq!(
+            super::tool_readiness_many(tools, &working_directory),
+            [
+                super::ToolReadiness::Installed,
+                super::ToolReadiness::UpdaterMissing,
+                super::ToolReadiness::TargetMissing,
+            ]
+        );
+    }
+
+    #[test]
     fn missing_executable_is_unavailable() {
         let spec = crate::job::CommandSpec {
             program: "dvup-definitely-missing-command-8fcb4ce4".to_owned(),
@@ -445,31 +598,53 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn builds_safe_powershell_invocation() {
+    fn windows_batch_programs_execute_through_cmd() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let script = temporary.path().join("echo-argument.cmd");
+        std::fs::write(&script, "@echo off\r\necho %~1\r\n").expect("write batch script");
         let spec = crate::job::CommandSpec {
-            program: "claude".to_owned(),
-            args: vec!["install".to_owned(), "it's-safe".to_owned()],
-            working_directory: std::env::current_dir().expect("current directory"),
+            program: script.to_string_lossy().into_owned(),
+            args: vec!["two words".to_owned()],
+            working_directory: temporary.path().to_path_buf(),
         };
 
-        assert_eq!(
-            super::powershell_invocation(&spec),
-            "$ProgressPreference = 'SilentlyContinue'; & 'claude' 'install' 'it''s-safe'"
+        let command = super::prepare_command(&spec);
+        assert!(
+            command
+                .get_program()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("cmd.exe")
         );
+        let result =
+            super::run_with_network(&spec, &NetworkSettings::default()).expect("run batch script");
+        assert!(result.status.success());
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "two words");
     }
 
     #[cfg(windows)]
     #[test]
-    fn executes_powershell_cmdlet() {
+    fn native_windows_programs_execute_without_powershell() {
+        let executable = std::env::current_exe().expect("current executable");
         let spec = crate::job::CommandSpec {
-            program: "Write-Output".to_owned(),
-            args: vec!["dvup-powershell-ok".to_owned()],
+            program: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
             working_directory: std::env::current_dir().expect("current directory"),
         };
 
-        assert!(super::is_available(&spec));
-        let result = super::run(&spec).expect("run PowerShell cmdlet");
-        assert!(result.status.success());
-        assert!(String::from_utf8_lossy(&result.stdout).contains("dvup-powershell-ok"));
+        let command = super::prepare_command(&spec);
+
+        assert_eq!(command.get_program(), executable.as_os_str());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cmdlets_are_not_native_commands() {
+        let spec = crate::job::CommandSpec {
+            program: "Write-Output".to_owned(),
+            args: Vec::new(),
+            working_directory: std::env::current_dir().expect("current directory"),
+        };
+
+        assert!(!super::is_available(&spec));
     }
 }

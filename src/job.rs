@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{ProcessAction, ProcessRule, Tool},
     error::{Error, Result},
+    settings::NetworkSettings,
     state::StateDirs,
 };
 
 static JOB_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-const JOB_SCHEMA_VERSION: u32 = 1;
+const JOB_SCHEMA_VERSION: u32 = 2;
 
 /// A command stored in a durable update job.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,6 +86,7 @@ pub struct Job {
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
     pub command: CommandSpec,
+    pub(crate) network: NetworkSettings,
     pub resource_group: String,
     pub process_rules: Vec<ProcessRule>,
     pub lock_timeout_secs: u64,
@@ -95,7 +97,12 @@ pub struct Job {
 
 impl Job {
     /// Creates a durable job from a configured tool.
-    pub fn from_tool(name: String, tool: Tool, working_directory: PathBuf) -> Self {
+    pub(crate) fn from_tool(
+        name: String,
+        tool: Tool,
+        working_directory: PathBuf,
+        network: NetworkSettings,
+    ) -> Self {
         let now = now_unix_ms();
         let process_rules = tool.processes;
         let resource_group = tool.resource_group.unwrap_or_else(|| name.clone());
@@ -110,6 +117,7 @@ impl Job {
                 args: tool.args,
                 working_directory,
             },
+            network,
             resource_group,
             process_rules,
             lock_timeout_secs: tool.lock_timeout_secs,
@@ -276,6 +284,8 @@ mod tests {
                 program: "npm".to_owned(),
                 args: vec!["--version".to_owned()],
             },
+            latest: None,
+            update_version: None,
             background: crate::config::ToolBackground::Auto,
             processes: vec![ProcessRule::wait("node".to_owned())],
             lock_timeout_secs: 10,
@@ -295,6 +305,7 @@ mod tests {
             "npm".to_owned(),
             test_tool(),
             temporary.path().to_path_buf(),
+            NetworkSettings::default(),
         );
 
         store.save(&job).expect("save pending job");
@@ -309,13 +320,27 @@ mod tests {
 
     #[test]
     fn persisted_jobs_require_all_fields_and_reject_unknown_fields() {
-        let job = Job::from_tool("npm".to_owned(), test_tool(), PathBuf::from("."));
+        let job = Job::from_tool(
+            "npm".to_owned(),
+            test_tool(),
+            PathBuf::from("."),
+            NetworkSettings::default(),
+        );
+        assert_eq!(job.schema_version, 2);
+        assert_eq!(job.network, NetworkSettings::default());
         let mut missing = serde_json::to_value(&job).expect("serialize job");
         missing
             .as_object_mut()
             .expect("job object")
             .remove("resource_group");
         assert!(serde_json::from_value::<Job>(missing).is_err());
+
+        let mut missing_network = serde_json::to_value(&job).expect("serialize job");
+        missing_network
+            .as_object_mut()
+            .expect("job object")
+            .remove("network");
+        assert!(serde_json::from_value::<Job>(missing_network).is_err());
 
         let mut unknown = serde_json::to_value(&job).expect("serialize job");
         unknown
@@ -330,8 +355,13 @@ mod tests {
         let temporary = TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let store = JobStore::new(state.clone()).expect("create store");
-        let mut job = Job::from_tool("npm".to_owned(), test_tool(), PathBuf::from("."));
-        job.schema_version = 2;
+        let mut job = Job::from_tool(
+            "npm".to_owned(),
+            test_tool(),
+            PathBuf::from("."),
+            NetworkSettings::default(),
+        );
+        job.schema_version = 1;
         assert!(store.save(&job).is_err());
         fs::write(
             state.job_path(&job.id),
@@ -355,7 +385,12 @@ mod tests {
                 terminate_grace_secs: 3,
             },
         ];
-        let mut job = Job::from_tool("codex".to_owned(), tool, PathBuf::from("."));
+        let mut job = Job::from_tool(
+            "codex".to_owned(),
+            tool,
+            PathBuf::from("."),
+            NetworkSettings::default(),
+        );
 
         assert_eq!(job.terminate_waiting_processes().expect("safe override"), 2);
         assert!(
@@ -366,7 +401,12 @@ mod tests {
 
         let mut unsafe_tool = test_tool();
         unsafe_tool.processes = vec![ProcessRule::wait("node".to_owned())];
-        let mut unsafe_job = Job::from_tool("unsafe".to_owned(), unsafe_tool, PathBuf::from("."));
+        let mut unsafe_job = Job::from_tool(
+            "unsafe".to_owned(),
+            unsafe_tool,
+            PathBuf::from("."),
+            NetworkSettings::default(),
+        );
         assert!(unsafe_job.terminate_waiting_processes().is_err());
     }
 

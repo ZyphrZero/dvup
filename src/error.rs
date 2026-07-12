@@ -24,6 +24,13 @@ pub enum Error {
     #[error("refusing to overwrite existing file {0}; pass --force to replace it")]
     FileExists(PathBuf),
 
+    #[error("settings file {path} is locked or not writable: {source}")]
+    SettingsWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("command is empty")]
     EmptyCommand,
 

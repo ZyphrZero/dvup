@@ -1,11 +1,12 @@
-# Complete built-in tool definitions embedded in the dvup binary.
-# User TOML files use the concise schema in dvup.user.example.toml.
-
-version = 1
+# Internal built-in manifest embedded in dvup. Do not copy it into user data.
+# User-owned commands and GitHub repositories belong in dvup_custom.toml and
+# use the strict schema documented by dvup.user.example.toml.
 
 [tools.dvup]
 program = "cargo"
 args = ["install", "dvup", "--locked"]
+latest = { provider = "crates_io", package = "dvup" }
+update_version = ["cargo", "install", "dvup", "--version", "{version}", "--locked"]
 background = "always"
 resource_group = "cargo-bin"
 
@@ -17,11 +18,11 @@ action = "wait"
 program = "dvup"
 args = ["--version"]
 
-# These portable placeholders are replaced in memory with the official
-# platform-specific installers before the built-in manifest is parsed.
+# dvup substitutes the Unix installer definition for this native preset before parsing.
 [tools.bun]
 program = "bun"
 args = ["upgrade"]
+latest = { provider = "github_release", repository = "oven-sh/bun" }
 resource_group = "bun-global"
 background = "auto"
 
@@ -36,6 +37,7 @@ args = ["--version"]
 [tools.brew]
 program = "brew"
 args = ["update"]
+latest = { provider = "github_release", repository = "Homebrew/brew" }
 platforms = ["macos", "linux"]
 resource_group = "homebrew"
 background = "auto"
@@ -47,6 +49,7 @@ args = ["--version"]
 [tools.rustup]
 program = "rustup"
 args = ["update"]
+latest = { provider = "github_tag", repository = "rust-lang/rustup" }
 background = "auto"
 
 [[tools.rustup.processes]]
@@ -64,6 +67,7 @@ args = ["--version"]
 [tools.scoop]
 program = "scoop"
 args = ["update"]
+latest = { provider = "github_release", repository = "ScoopInstaller/Scoop" }
 platforms = ["windows"]
 resource_group = "scoop"
 background = "auto"
@@ -75,6 +79,8 @@ args = ["--version"]
 [tools.uv]
 program = "uv"
 args = ["self", "update"]
+latest = { provider = "github_release", repository = "astral-sh/uv" }
+update_version = ["uv", "self", "update", "{version}"]
 resource_group = "uv"
 background = "auto"
 
@@ -89,6 +95,8 @@ args = ["--version"]
 [tools.deno]
 program = "deno"
 args = ["upgrade"]
+latest = { provider = "github_release", repository = "denoland/deno" }
+update_version = ["deno", "upgrade", "--version", "{version}"]
 resource_group = "deno"
 background = "auto"
 
@@ -103,6 +111,7 @@ args = ["--version"]
 [tools.pixi]
 program = "pixi"
 args = ["self-update"]
+latest = { provider = "github_release", repository = "prefix-dev/pixi" }
 resource_group = "pixi"
 background = "auto"
 
@@ -117,6 +126,7 @@ args = ["--version"]
 [tools.mise]
 program = "mise"
 args = ["self-update"]
+latest = { provider = "github_release", repository = "jdx/mise" }
 resource_group = "mise"
 background = "auto"
 

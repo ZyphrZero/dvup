@@ -1,15 +1,18 @@
 mod cli;
 mod command;
 mod config;
+mod credential;
 mod datetime;
 mod detach;
 mod doctor;
 mod error;
 mod job;
 mod process;
+mod release;
 mod settings;
 mod state;
 mod tui;
+mod version;
 mod worker;
 
 use std::process::ExitCode;
