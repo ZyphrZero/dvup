@@ -1,0 +1,34 @@
+version = 1
+
+# Global and explicitly selected user manifests contain custom tools or built-in overrides.
+# The update and probe commands are explicit arrays; optional runtime settings
+# are written only when they differ from dvup's standard behavior.
+#
+# [tools.example]
+# update = ["example", "self-update"]
+# probe = ["example", "--version"]
+
+# AI coding tools are user examples rather than built-in presets. Uncomment
+# only the tools installed and managed in your environment.
+#
+# [tools.codex]
+# update = ["npm", "install", "--global", "@openai/codex@latest"]
+# probe = ["codex", "--version"]
+# resource_group = "node-global"
+#
+# [[tools.codex.processes]]
+# name = "node"
+# command_contains = "@openai/codex"
+# action = "terminate"
+#
+# [tools.claude]
+# update = ["claude", "update"]
+# probe = ["claude", "--version"]
+#
+# [tools.opencode]
+# update = ["opencode", "upgrade"]
+# probe = ["opencode", "--version"]
+#
+# [tools.hermes]
+# update = ["hermes", "update"]
+# probe = ["hermes", "--version"]

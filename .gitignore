@@ -1,5 +1,3 @@
 /target/
-/.dvup.toml
-/.kvdev.toml
 *.log
 .codegraph/

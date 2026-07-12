@@ -15,9 +15,11 @@ use crate::{
 };
 
 static JOB_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+const JOB_SCHEMA_VERSION: u32 = 1;
 
 /// A command stored in a durable update job.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
@@ -26,6 +28,7 @@ pub struct CommandSpec {
 
 /// A process currently preventing an update.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LockingProcess {
     pub pid: u32,
     pub name: String,
@@ -34,7 +37,7 @@ pub struct LockingProcess {
 
 /// Current state of a durable job.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobStatus {
     Pending,
     WaitingForLocks {
@@ -74,6 +77,7 @@ impl JobStatus {
 
 /// Durable description and status of an update.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub schema_version: u32,
     pub id: String,
@@ -81,7 +85,6 @@ pub struct Job {
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
     pub command: CommandSpec,
-    #[serde(default = "legacy_resource_group")]
     pub resource_group: String,
     pub process_rules: Vec<ProcessRule>,
     pub lock_timeout_secs: u64,
@@ -90,18 +93,14 @@ pub struct Job {
     pub status: JobStatus,
 }
 
-fn legacy_resource_group() -> String {
-    "default".to_owned()
-}
-
 impl Job {
     /// Creates a durable job from a configured tool.
     pub fn from_tool(name: String, tool: Tool, working_directory: PathBuf) -> Self {
         let now = now_unix_ms();
-        let process_rules = tool.process_rules();
-        let resource_group = tool.resource_group.clone().unwrap_or_else(|| name.clone());
+        let process_rules = tool.processes;
+        let resource_group = tool.resource_group.unwrap_or_else(|| name.clone());
         Self {
-            schema_version: 1,
+            schema_version: JOB_SCHEMA_VERSION,
             id: new_job_id(now),
             name,
             created_at_unix_ms: now,
@@ -123,6 +122,16 @@ impl Job {
     pub fn set_status(&mut self, status: JobStatus) {
         self.status = status;
         self.updated_at_unix_ms = now_unix_ms();
+    }
+
+    fn validate_schema(&self) -> Result<()> {
+        if self.schema_version != JOB_SCHEMA_VERSION {
+            return Err(Error::InvalidJob(format!(
+                "unsupported schema version {}; expected {JOB_SCHEMA_VERSION}",
+                self.schema_version
+            )));
+        }
+        Ok(())
     }
 
     /// Converts configured wait rules to terminate rules for an explicit
@@ -171,6 +180,7 @@ impl JobStore {
     }
 
     pub fn save(&self, job: &Job) -> Result<()> {
+        job.validate_schema()?;
         let final_path = self.dirs.job_path(&job.id);
         let temporary_path = final_path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(job)?;
@@ -190,7 +200,7 @@ impl JobStore {
         if !path.is_file() {
             return Err(Error::JobNotFound(id.to_owned()));
         }
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+        decode_job(&fs::read(path)?)
     }
 
     pub fn list(&self) -> Result<Vec<Job>> {
@@ -200,7 +210,7 @@ impl JobStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            jobs.push(serde_json::from_slice(&fs::read(path)?)?);
+            jobs.push(decode_job(&fs::read(path)?)?);
         }
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at_unix_ms));
         Ok(jobs)
@@ -224,6 +234,12 @@ impl JobStore {
         }
         Ok(fs::read(path)?)
     }
+}
+
+fn decode_job(bytes: &[u8]) -> Result<Job> {
+    let job: Job = serde_json::from_slice(bytes)?;
+    job.validate_schema()?;
+    Ok(job)
 }
 
 fn new_job_id(now: u128) -> String {
@@ -256,8 +272,12 @@ mod tests {
         Tool {
             program: "npm".to_owned(),
             args: vec!["--version".to_owned()],
-            lock_processes: vec!["node".to_owned()],
-            processes: Vec::new(),
+            probe: crate::config::ToolProbe {
+                program: "npm".to_owned(),
+                args: vec!["--version".to_owned()],
+            },
+            background: crate::config::ToolBackground::Auto,
+            processes: vec![ProcessRule::wait("node".to_owned())],
             lock_timeout_secs: 10,
             retries: 2,
             retry_delay_secs: 1,
@@ -288,15 +308,53 @@ mod tests {
     }
 
     #[test]
+    fn persisted_jobs_require_all_fields_and_reject_unknown_fields() {
+        let job = Job::from_tool("npm".to_owned(), test_tool(), PathBuf::from("."));
+        let mut missing = serde_json::to_value(&job).expect("serialize job");
+        missing
+            .as_object_mut()
+            .expect("job object")
+            .remove("resource_group");
+        assert!(serde_json::from_value::<Job>(missing).is_err());
+
+        let mut unknown = serde_json::to_value(&job).expect("serialize job");
+        unknown
+            .as_object_mut()
+            .expect("job object")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<Job>(unknown).is_err());
+    }
+
+    #[test]
+    fn job_store_rejects_an_unsupported_schema_version() {
+        let temporary = TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let store = JobStore::new(state.clone()).expect("create store");
+        let mut job = Job::from_tool("npm".to_owned(), test_tool(), PathBuf::from("."));
+        job.schema_version = 2;
+        assert!(store.save(&job).is_err());
+        fs::write(
+            state.job_path(&job.id),
+            serde_json::to_vec_pretty(&job).expect("serialize job"),
+        )
+        .expect("write job");
+
+        assert!(store.load(&job.id).is_err());
+        assert!(store.list().is_err());
+    }
+
+    #[test]
     fn terminate_strategy_converts_only_safe_wait_rules() {
         let mut tool = test_tool();
-        tool.lock_processes = vec!["codex".to_owned()];
-        tool.processes = vec![ProcessRule {
-            name: "node".to_owned(),
-            command_contains: Some("@openai/codex".to_owned()),
-            action: crate::config::ProcessAction::Wait,
-            terminate_grace_secs: 3,
-        }];
+        tool.processes = vec![
+            ProcessRule::wait("codex".to_owned()),
+            ProcessRule {
+                name: "node".to_owned(),
+                command_contains: Some("@openai/codex".to_owned()),
+                action: crate::config::ProcessAction::Wait,
+                terminate_grace_secs: 3,
+            },
+        ];
         let mut job = Job::from_tool("codex".to_owned(), tool, PathBuf::from("."));
 
         assert_eq!(job.terminate_waiting_processes().expect("safe override"), 2);
@@ -307,7 +365,7 @@ mod tests {
         );
 
         let mut unsafe_tool = test_tool();
-        unsafe_tool.lock_processes = vec!["node".to_owned()];
+        unsafe_tool.processes = vec![ProcessRule::wait("node".to_owned())];
         let mut unsafe_job = Job::from_tool("unsafe".to_owned(), unsafe_tool, PathBuf::from("."));
         assert!(unsafe_job.terminate_waiting_processes().is_err());
     }

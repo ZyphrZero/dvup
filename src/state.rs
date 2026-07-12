@@ -17,15 +17,9 @@ impl StateDirs {
     /// Resolves the per-user state location.
     pub fn discover() -> Result<Self> {
         let project =
-            ProjectDirs::from("dev", "dvup", "dvup").ok_or(Error::StateDirectoryUnavailable)?;
-        let root = project.data_local_dir().to_path_buf();
-        // Keep existing custom tools and in-flight jobs usable after the rename.
-        let legacy = ProjectDirs::from("dev", "kvdev", "kvdev")
-            .ok_or(Error::StateDirectoryUnavailable)?
-            .data_local_dir()
-            .to_path_buf();
+            ProjectDirs::from("dev", "", "dvup").ok_or(Error::StateDirectoryUnavailable)?;
         Ok(Self {
-            root: preferred_root(root, legacy),
+            root: project.data_local_dir().to_path_buf(),
         })
     }
 
@@ -73,7 +67,11 @@ impl StateDirs {
     }
 
     pub fn custom_config_path(&self) -> PathBuf {
-        self.root.join("custom.toml")
+        self.root.join("dvup_custom.toml")
+    }
+
+    pub fn settings_path(&self) -> PathBuf {
+        self.root.join("settings.toml")
     }
 
     pub fn resource_lock_path(&self, resource_group: &str) -> PathBuf {
@@ -91,14 +89,6 @@ impl StateDirs {
             safe_name = "default".to_owned();
         }
         self.locks_dir().join(format!("{safe_name}.lock"))
-    }
-}
-
-fn preferred_root(current: PathBuf, legacy: PathBuf) -> PathBuf {
-    if current.exists() || !legacy.exists() {
-        current
-    } else {
-        legacy
     }
 }
 
@@ -121,15 +111,39 @@ mod tests {
     }
 
     #[test]
-    fn state_root_prefers_dvup_and_falls_back_to_kvdev() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let current = temporary.path().join("dvup");
-        let legacy = temporary.path().join("kvdev");
+    fn discovered_state_path_never_repeats_the_application_name() {
+        let state = StateDirs::discover().expect("discover state directory");
+        let components = state
+            .root()
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
 
-        fs::create_dir_all(&legacy).expect("create legacy state");
-        assert_eq!(preferred_root(current.clone(), legacy.clone()), legacy);
+        assert!(
+            !components.windows(2).any(|pair| {
+                pair[0].eq_ignore_ascii_case("dvup") && pair[1].eq_ignore_ascii_case("dvup")
+            }),
+            "state directory repeats the application name: {}",
+            state.root().display()
+        );
 
-        fs::create_dir_all(&current).expect("create current state");
-        assert_eq!(preferred_root(current.clone(), legacy), current);
+        #[cfg(windows)]
+        assert!(
+            state.root().ends_with(Path::new("dvup").join("data")),
+            "unexpected Windows state directory: {}",
+            state.root().display()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            state.root().ends_with("dev.dvup"),
+            "unexpected macOS state directory: {}",
+            state.root().display()
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            state.root().ends_with("dvup"),
+            "unexpected Linux state directory: {}",
+            state.root().display()
+        );
     }
 }

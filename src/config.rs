@@ -1,55 +1,77 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub const DEFAULT_CONFIG_FILE: &str = ".dvup.toml";
-pub const LEGACY_CONFIG_FILE: &str = ".kvdev.toml";
 pub const STARTER_TEMPLATE: &str = include_str!("../configs/dvup.example.toml");
+pub const USER_TEMPLATE: &str = include_str!("../configs/dvup.user.example.toml");
 
 const BUN_DEFAULT_PRESET: &str = r#"[tools.bun]
 program = "bun"
 args = ["upgrade"]
-lock_processes = ["bun"]
-resource_group = "bun-global""#;
+resource_group = "bun-global"
+background = "auto"
+
+[[tools.bun.processes]]
+name = "bun"
+action = "wait""#;
 
 #[cfg(windows)]
 const BUN_PLATFORM_PRESET: &str = r#"[tools.bun]
 program = "Invoke-Expression"
 args = ["Invoke-RestMethod https://bun.sh/install.ps1 | Invoke-Expression"]
-lock_processes = ["bun"]
-resource_group = "bun-global""#;
+resource_group = "bun-global"
+background = "auto"
+
+[[tools.bun.processes]]
+name = "bun"
+action = "wait""#;
 
 #[cfg(unix)]
 const BUN_PLATFORM_PRESET: &str = r#"[tools.bun]
 program = "bash"
 args = ["-c", "curl -fsSL https://bun.sh/install | bash"]
-lock_processes = ["bun"]
-resource_group = "bun-global""#;
+resource_group = "bun-global"
+background = "auto"
+
+[[tools.bun.processes]]
+name = "bun"
+action = "wait""#;
 
 const UV_DEFAULT_PRESET: &str = r#"[tools.uv]
 program = "uv"
 args = ["self", "update"]
-lock_processes = ["uv"]"#;
+resource_group = "uv"
+background = "auto"
+
+[[tools.uv.processes]]
+name = "uv"
+action = "wait""#;
 
 #[cfg(windows)]
 const UV_PLATFORM_PRESET: &str = r#"[tools.uv]
 program = "powershell"
 args = ["-ExecutionPolicy", "ByPass", "-c", "irm https://astral.sh/uv/install.ps1 | iex"]
-lock_processes = ["uv"]
-platforms = ["windows"]"#;
+platforms = ["windows"]
+resource_group = "uv"
+background = "auto"
+
+[[tools.uv.processes]]
+name = "uv"
+action = "wait""#;
 
 #[cfg(unix)]
 const UV_PLATFORM_PRESET: &str = r#"[tools.uv]
 program = "sh"
 args = ["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"]
-lock_processes = ["uv"]
-platforms = ["macos", "linux"]"#;
+platforms = ["macos", "linux"]
+resource_group = "uv"
+background = "auto"
+
+[[tools.uv.processes]]
+name = "uv"
+action = "wait""#;
 
 /// Returns the starter template with platform-appropriate built-in commands.
 pub fn starter_template() -> String {
@@ -75,6 +97,48 @@ pub struct Config {
     pub tools: BTreeMap<String, Tool>,
 }
 
+/// A user-authored manifest containing concise update and probe commands.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+    pub version: u32,
+    #[serde(default)]
+    pub tools: BTreeMap<String, UserTool>,
+}
+
+/// One user-authored tool definition.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserTool {
+    pub update: Vec<String>,
+    pub probe: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_auto_background")]
+    pub background: ToolBackground,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<ProcessRule>,
+    #[serde(
+        default = "default_lock_timeout_secs",
+        skip_serializing_if = "is_default_lock_timeout_secs"
+    )]
+    pub lock_timeout_secs: u64,
+    #[serde(
+        default = "default_retries",
+        skip_serializing_if = "is_default_retries"
+    )]
+    pub retries: u32,
+    #[serde(
+        default = "default_retry_delay_secs",
+        skip_serializing_if = "is_default_retry_delay_secs"
+    )]
+    pub retry_delay_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_group: Option<String>,
+}
+
 /// One tool update definition.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -82,9 +146,8 @@ pub struct Tool {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Legacy shorthand for process rules whose action is `wait`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lock_processes: Vec<String>,
+    pub probe: ToolProbe,
+    pub background: ToolBackground,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<ProcessRule>,
     #[serde(default = "default_lock_timeout_secs")]
@@ -99,6 +162,23 @@ pub struct Tool {
     /// Tools sharing a resource group are serialized; omitted means the tool name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_group: Option<String>,
+}
+
+/// An explicit command used to detect the target and read its version.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolProbe {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Whether a configured update must leave the invoking executable first.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolBackground {
+    #[default]
+    Auto,
+    Always,
 }
 
 /// What the background worker should do when a process rule matches.
@@ -151,6 +231,15 @@ pub struct ProcessRule {
 }
 
 impl ProcessRule {
+    pub fn wait(name: String) -> Self {
+        Self {
+            name,
+            command_contains: None,
+            action: ProcessAction::Wait,
+            terminate_grace_secs: default_terminate_grace_secs(),
+        }
+    }
+
     pub fn validate(&self, context: &str) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(Error::InvalidConfig(format!(
@@ -207,6 +296,7 @@ impl std::str::FromStr for ProcessRule {
 
 impl Tool {
     /// Creates a custom tool with safe updater defaults.
+    #[cfg(test)]
     pub fn custom(name: &str, program: String, args: Vec<String>) -> Self {
         let resource_group = inferred_resource_group(&program).map(str::to_owned);
         let platforms = inferred_platforms(&program)
@@ -216,26 +306,18 @@ impl Tool {
         Self {
             program,
             args,
-            lock_processes: vec![name.to_owned()],
-            processes: Vec::new(),
+            probe: ToolProbe {
+                program: name.to_owned(),
+                args: vec!["--version".to_owned()],
+            },
+            background: ToolBackground::Auto,
+            processes: vec![ProcessRule::wait(name.to_owned())],
             lock_timeout_secs: default_lock_timeout_secs(),
             retries: default_retries(),
             retry_delay_secs: default_retry_delay_secs(),
             platforms,
             resource_group,
         }
-    }
-
-    /// Expands legacy lock names into explicit wait rules.
-    pub fn process_rules(&self) -> Vec<ProcessRule> {
-        let mut rules = self.processes.clone();
-        rules.extend(self.lock_processes.iter().map(|name| ProcessRule {
-            name: name.clone(),
-            command_contains: None,
-            action: ProcessAction::Wait,
-            terminate_grace_secs: default_terminate_grace_secs(),
-        }));
-        rules
     }
 
     /// Returns whether this tool is enabled on the current operating system.
@@ -283,7 +365,93 @@ fn inferred_platforms(program: &str) -> &'static [&'static str] {
     }
 }
 
-impl Config {
+impl UserTool {
+    /// Creates a concise user definition with an explicit version probe.
+    pub fn custom(name: &str, program: String, args: Vec<String>) -> Self {
+        let mut update = Vec::with_capacity(args.len() + 1);
+        update.push(program.clone());
+        update.extend(args);
+        Self {
+            update,
+            probe: vec![name.to_owned(), "--version".to_owned()],
+            background: ToolBackground::Auto,
+            wait_for: None,
+            processes: Vec::new(),
+            lock_timeout_secs: default_lock_timeout_secs(),
+            retries: default_retries(),
+            retry_delay_secs: default_retry_delay_secs(),
+            platforms: inferred_platforms(&program)
+                .iter()
+                .map(|platform| (*platform).to_owned())
+                .collect(),
+            resource_group: inferred_resource_group(&program).map(str::to_owned),
+        }
+    }
+
+    /// Converts a resolved tool back into the concise user representation.
+    pub fn from_tool(name: &str, tool: &Tool) -> Self {
+        let mut update = Vec::with_capacity(tool.args.len() + 1);
+        update.push(tool.program.clone());
+        update.extend(tool.args.clone());
+        let mut probe = Vec::with_capacity(tool.probe.args.len() + 1);
+        probe.push(tool.probe.program.clone());
+        probe.extend(tool.probe.args.clone());
+        let default_wait = [name.to_owned()];
+        let mut wait_for = Vec::new();
+        let mut processes = Vec::new();
+        for rule in &tool.processes {
+            if rule.action == ProcessAction::Wait
+                && rule.command_contains.is_none()
+                && rule.terminate_grace_secs == default_terminate_grace_secs()
+            {
+                wait_for.push(rule.name.clone());
+            } else {
+                processes.push(rule.clone());
+            }
+        }
+        Self {
+            update,
+            probe,
+            background: tool.background,
+            wait_for: (wait_for.as_slice() != default_wait).then_some(wait_for),
+            processes,
+            lock_timeout_secs: tool.lock_timeout_secs,
+            retries: tool.retries,
+            retry_delay_secs: tool.retry_delay_secs,
+            platforms: tool.platforms.clone(),
+            resource_group: tool.resource_group.clone(),
+        }
+    }
+
+    fn resolve(self, name: &str) -> Result<Tool> {
+        let (program, args) = split_user_command(name, "update", self.update)?;
+        let (probe_program, probe_args) = split_user_command(name, "probe", self.probe)?;
+        let mut processes = self.processes;
+        processes.extend(
+            self.wait_for
+                .unwrap_or_else(|| vec![name.to_owned()])
+                .into_iter()
+                .map(ProcessRule::wait),
+        );
+        Ok(Tool {
+            program,
+            args,
+            probe: ToolProbe {
+                program: probe_program,
+                args: probe_args,
+            },
+            background: self.background,
+            processes,
+            lock_timeout_secs: self.lock_timeout_secs,
+            retries: self.retries,
+            retry_delay_secs: self.retry_delay_secs,
+            platforms: self.platforms,
+            resource_group: self.resource_group,
+        })
+    }
+}
+
+impl UserConfig {
     /// Returns an empty user manifest ready to receive custom tools.
     pub fn empty() -> Self {
         Self {
@@ -292,129 +460,82 @@ impl Config {
         }
     }
 
-    /// Parses and validates the starter manifest embedded in the binary.
-    pub fn starter() -> Self {
-        let mut config: Self = toml::from_str(&starter_template())
-            .expect("bundled configs/dvup.example.toml must be valid TOML");
-        config.apply_platform_defaults();
-        config
-            .validate()
-            .expect("bundled configs/dvup.example.toml must be a valid dvup manifest");
-        config
-    }
-
-    /// Reads and validates a manifest.
+    /// Reads and validates a user-authored manifest.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Err(Error::ConfigNotFound(path.to_path_buf()));
         }
-        let contents = fs::read_to_string(path)?;
-        let mut config: Self = toml::from_str(&contents)?;
-        config.apply_platform_defaults();
-        config.validate()?;
+        Self::parse(&fs::read_to_string(path)?)
+    }
+
+    /// Parses and validates a user-authored manifest.
+    pub fn parse(contents: &str) -> Result<Self> {
+        let config: Self = toml::from_str(contents)?;
+        config.clone().resolve()?;
         Ok(config)
     }
 
-    fn apply_platform_defaults(&mut self) {
-        for tool in self.tools.values_mut() {
-            if tool.resource_group.is_none() {
-                tool.resource_group = inferred_resource_group(&tool.program).map(str::to_owned);
-            }
-            if tool.platforms.is_empty() {
-                tool.platforms = inferred_platforms(&tool.program)
-                    .iter()
-                    .map(|platform| (*platform).to_owned())
-                    .collect();
-            }
-        }
-
-        #[cfg(windows)]
-        if let Some(bun) = self.tools.get_mut("bun") {
-            let legacy_upgrade = bun.program.eq_ignore_ascii_case("bun") && bun.args == ["upgrade"];
-            let nested_powershell = bun.program.eq_ignore_ascii_case("powershell")
-                || bun.program.eq_ignore_ascii_case("powershell.exe");
-            if legacy_upgrade
-                || (nested_powershell && bun.args.join(" ").contains("bun.sh/install.ps1"))
-            {
-                bun.program = "Invoke-Expression".to_owned();
-                bun.args = vec![
-                    "Invoke-RestMethod https://bun.sh/install.ps1 | Invoke-Expression".to_owned(),
-                ];
-            }
-        }
-
-        #[cfg(windows)]
-        if let Some(uv) = self.tools.get_mut("uv") {
-            let legacy_self_update =
-                uv.program.eq_ignore_ascii_case("uv") && uv.args == ["self", "update"];
-            let official_installer = uv.args.join(" ").contains("astral.sh/uv/install.ps1");
-            if legacy_self_update {
-                uv.program = "powershell".to_owned();
-                uv.args = vec![
-                    "-ExecutionPolicy".to_owned(),
-                    "ByPass".to_owned(),
-                    "-c".to_owned(),
-                    "irm https://astral.sh/uv/install.ps1 | iex".to_owned(),
-                ];
-            }
-            if (legacy_self_update || official_installer) && uv.platforms.is_empty() {
-                uv.platforms = vec!["windows".to_owned()];
-            }
-        }
-
-        #[cfg(unix)]
-        if let Some(bun) = self.tools.get_mut("bun") {
-            let legacy_upgrade = bun.program.eq_ignore_ascii_case("bun") && bun.args == ["upgrade"];
-            if legacy_upgrade {
-                bun.program = "bash".to_owned();
-                bun.args = vec![
-                    "-c".to_owned(),
-                    "curl -fsSL https://bun.sh/install | bash".to_owned(),
-                ];
-            }
-        }
-
-        #[cfg(unix)]
-        if let Some(uv) = self.tools.get_mut("uv") {
-            let legacy_self_update =
-                uv.program.eq_ignore_ascii_case("uv") && uv.args == ["self", "update"];
-            let official_installer = uv.args.join(" ").contains("astral.sh/uv/install.sh");
-            if legacy_self_update {
-                uv.program = "sh".to_owned();
-                uv.args = vec![
-                    "-c".to_owned(),
-                    "curl -LsSf https://astral.sh/uv/install.sh | sh".to_owned(),
-                ];
-            }
-            if (legacy_self_update || official_installer) && uv.platforms.is_empty() {
-                uv.platforms = vec!["macos".to_owned(), "linux".to_owned()];
-            }
-        }
-    }
-
-    /// Validates and atomically saves a non-empty manifest.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        self.validate()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = path.with_extension("toml.tmp");
-        fs::write(&temporary, toml::to_string_pretty(self)?)?;
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(temporary, path)?;
-        Ok(())
-    }
-
-    pub fn validate(&self) -> Result<()> {
+    /// Resolves concise user definitions into the complete runtime model.
+    pub fn resolve(self) -> Result<Config> {
         if self.version != 1 {
             return Err(Error::InvalidConfig(format!(
                 "unsupported version {}; expected 1",
                 self.version
             )));
         }
-        if self.tools.is_empty() {
+        let mut tools = BTreeMap::new();
+        for (name, user_tool) in self.tools {
+            if name.trim().is_empty() {
+                return Err(Error::InvalidConfig(
+                    "tool names cannot be empty".to_owned(),
+                ));
+            }
+            tools.insert(name.clone(), user_tool.resolve(&name)?);
+        }
+        let config = Config {
+            version: self.version,
+            tools,
+        };
+        config.validate_inner(false)?;
+        Ok(config)
+    }
+
+    /// Validates and atomically saves a user-authored manifest.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.clone().resolve()?;
+        write_atomic(path, toml::to_string(self)?.as_bytes())
+    }
+
+    /// Validates and atomically saves TOML while preserving editor formatting.
+    pub fn save_text(path: &Path, contents: &str) -> Result<()> {
+        Self::parse(contents)?;
+        write_atomic(path, contents.as_bytes())
+    }
+}
+
+impl Config {
+    /// Parses and validates the complete starter manifest embedded in the binary.
+    pub fn starter() -> Self {
+        let config: Self = toml::from_str(&starter_template())
+            .expect("bundled configs/dvup.example.toml must be valid TOML");
+        config
+            .validate()
+            .expect("bundled configs/dvup.example.toml must be a valid dvup manifest");
+        config
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_inner(true)
+    }
+
+    fn validate_inner(&self, require_tools: bool) -> Result<()> {
+        if self.version != 1 {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported version {}; expected 1",
+                self.version
+            )));
+        }
+        if require_tools && self.tools.is_empty() {
             return Err(Error::InvalidConfig(
                 "at least one [tools.<name>] entry is required".to_owned(),
             ));
@@ -428,6 +549,11 @@ impl Config {
             if tool.program.trim().is_empty() {
                 return Err(Error::InvalidConfig(format!(
                     "tool `{name}` has an empty program"
+                )));
+            }
+            if tool.probe.program.trim().is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "tool `{name}` has an empty probe program"
                 )));
             }
             if tool.lock_timeout_secs == 0 {
@@ -456,13 +582,43 @@ impl Config {
                     )));
                 }
             }
-            let rules = tool.process_rules();
-            for rule in &rules {
+            for rule in &tool.processes {
                 rule.validate(&format!("tool `{name}`"))?;
             }
         }
         Ok(())
     }
+}
+
+fn split_user_command(
+    name: &str,
+    field: &str,
+    command: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    let Some((program, args)) = command.split_first() else {
+        return Err(Error::InvalidConfig(format!(
+            "tool `{name}` has an empty {field} command"
+        )));
+    };
+    if program.trim().is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "tool `{name}` has an empty {field} program"
+        )));
+    }
+    Ok((program.clone(), args.to_vec()))
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    fs::write(&temporary, contents)?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(temporary, path)?;
+    Ok(())
 }
 
 fn normalize_process_name(name: &str) -> String {
@@ -473,26 +629,32 @@ fn normalize_process_name(name: &str) -> String {
         .to_owned()
 }
 
-/// Resolves the default manifest in the current directory.
-pub fn default_path() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(DEFAULT_CONFIG_FILE))
-}
-
-/// Resolves the pre-rename manifest in the current directory.
-pub fn legacy_default_path() -> Result<PathBuf> {
-    Ok(std::env::current_dir()?.join(LEGACY_CONFIG_FILE))
-}
-
 const fn default_lock_timeout_secs() -> u64 {
     86_400
+}
+
+fn is_default_lock_timeout_secs(value: &u64) -> bool {
+    *value == default_lock_timeout_secs()
 }
 
 const fn default_retries() -> u32 {
     8
 }
 
+fn is_default_retries(value: &u32) -> bool {
+    *value == default_retries()
+}
+
 const fn default_retry_delay_secs() -> u64 {
     2
+}
+
+fn is_default_retry_delay_secs(value: &u64) -> bool {
+    *value == default_retry_delay_secs()
+}
+
+fn is_auto_background(value: &ToolBackground) -> bool {
+    *value == ToolBackground::Auto
 }
 
 const fn default_terminate_grace_secs() -> u64 {
@@ -508,17 +670,8 @@ mod tests {
         let encoded = toml::to_string_pretty(&Config::starter()).expect("serialize starter");
         let decoded: Config = toml::from_str(&encoded).expect("parse starter");
 
-        let codex = decoded.tools.get("codex").expect("codex tool");
         assert_eq!(decoded.version, 1);
-        assert_eq!(codex.program, "npm");
-        assert_eq!(codex.args, ["install", "--global", "@openai/codex@latest"]);
-        assert_eq!(decoded.tools.len(), 6);
-        assert_eq!(codex.processes.len(), 2);
-        assert_eq!(codex.processes[1].action, ProcessAction::Terminate);
-        assert_eq!(
-            codex.processes[1].command_contains.as_deref(),
-            Some("@openai/codex")
-        );
+        assert_eq!(decoded.tools.len(), 9);
         #[cfg(windows)]
         {
             assert_eq!(decoded.tools["bun"].program, "Invoke-Expression");
@@ -573,10 +726,6 @@ mod tests {
             Some("bun-global")
         );
         assert_eq!(
-            decoded.tools["codex"].resource_group.as_deref(),
-            Some("node-global")
-        );
-        assert_eq!(
             decoded.tools["scoop"].resource_group.as_deref(),
             Some("scoop")
         );
@@ -584,76 +733,28 @@ mod tests {
         assert!(!decoded.tools.contains_key("pnpm"));
         assert!(decoded.tools.contains_key("brew"));
         assert!(!STARTER_TEMPLATE.contains("npm@latest"));
-        assert!(!STARTER_TEMPLATE.contains("self-update"));
-        assert!(STARTER_TEMPLATE.contains("[tools.scoop-zedg]"));
-        assert!(STARTER_TEMPLATE.contains("args = [\"update\", \"zedg\"]"));
-    }
-
-    #[test]
-    fn migrates_legacy_bun_upgrade_config_to_official_installer() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let path = temporary.path().join("legacy.toml");
-        std::fs::write(
-            &path,
-            r#"version = 1
-
-[tools.bun]
-program = "bun"
-args = ["upgrade"]
-lock_processes = ["bun"]
-"#,
-        )
-        .expect("write legacy config");
-
-        let config = Config::load(&path).expect("load migrated config");
-        let bun = &config.tools["bun"];
-        #[cfg(windows)]
-        {
-            assert_eq!(bun.program, "Invoke-Expression");
-            assert!(bun.args.join(" ").contains("bun.sh/install.ps1"));
+        assert!(!STARTER_TEMPLATE.contains("pnpm self-update"));
+        assert_eq!(decoded.tools["dvup"].background, ToolBackground::Always);
+        assert_eq!(decoded.tools["dvup"].probe.program, "dvup");
+        assert_eq!(decoded.tools["dvup"].program, "cargo");
+        assert_eq!(decoded.tools["dvup"].args, ["install", "dvup", "--locked"]);
+        for name in ["deno", "mise", "pixi", "uv"] {
+            assert!(decoded.tools.contains_key(name));
         }
-        #[cfg(unix)]
-        {
-            assert_eq!(bun.program, "bash");
-            assert!(bun.args.join(" ").contains("bun.sh/install"));
+        for name in ["codex", "claude", "opencode", "hermes"] {
+            assert!(!decoded.tools.contains_key(name));
         }
-        #[cfg(not(any(windows, unix)))]
-        assert_eq!(bun.args, ["upgrade"]);
-        assert_eq!(bun.resource_group.as_deref(), Some("bun-global"));
-    }
-
-    #[test]
-    fn migrates_legacy_uv_self_update_to_official_installer() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let path = temporary.path().join("legacy-uv.toml");
-        std::fs::write(
-            &path,
-            r#"version = 1
-
-[tools.uv]
-program = "uv"
-args = ["self", "update"]
-lock_processes = ["uv"]
-"#,
-        )
-        .expect("write legacy config");
-
-        let config = Config::load(&path).expect("load migrated config");
-        let uv = &config.tools["uv"];
-        #[cfg(windows)]
-        {
-            assert_eq!(uv.program, "powershell");
-            assert!(uv.args.join(" ").contains("astral.sh/uv/install.ps1"));
-            assert_eq!(uv.platforms, ["windows"]);
-        }
-        #[cfg(unix)]
-        {
-            assert_eq!(uv.program, "sh");
-            assert!(uv.args.join(" ").contains("astral.sh/uv/install.sh"));
-            assert_eq!(uv.platforms, ["macos", "linux"]);
-        }
-        #[cfg(not(any(windows, unix)))]
-        assert_eq!(uv.args, ["self", "update"]);
+        assert_eq!(decoded.tools["deno"].args, ["upgrade"]);
+        assert_eq!(decoded.tools["mise"].args, ["self-update"]);
+        assert_eq!(decoded.tools["pixi"].args, ["self-update"]);
+        assert!(
+            decoded
+                .tools
+                .values()
+                .all(|tool| !tool.probe.program.is_empty())
+        );
+        assert!(!STARTER_TEMPLATE.contains("[tools.scoop-zedg]"));
+        assert!(!STARTER_TEMPLATE.contains("[tools.example]"));
     }
 
     #[test]
@@ -677,6 +778,11 @@ version = 1
 
 [tools.codex]
 program = "npm"
+background = "auto"
+
+[tools.codex.probe]
+program = "codex"
+args = ["--version"]
 
 [[tools.codex.processes]]
 name = "node"
@@ -729,6 +835,11 @@ version = 1
 [tools.example]
 program = "example"
 platforms = ["freebsd"]
+background = "auto"
+
+[tools.example.probe]
+program = "example"
+args = ["--version"]
 "#;
 
         let config: Config = toml::from_str(input).expect("parse config");
@@ -744,6 +855,11 @@ version = 1
 [tools.example]
 program = "example"
 resource_group = "../../outside"
+background = "auto"
+
+[tools.example.probe]
+program = "example"
+args = ["--version"]
 "#;
 
         let config: Config = toml::from_str(input).expect("parse config");
@@ -759,8 +875,109 @@ resource_group = "../../outside"
 
         assert_eq!(tool.program, "claude");
         assert_eq!(tool.args, ["install"]);
-        assert_eq!(tool.lock_processes, ["claude"]);
+        assert_eq!(tool.processes.len(), 1);
+        assert_eq!(tool.processes[0].name, "claude");
+        assert_eq!(tool.processes[0].action, ProcessAction::Wait);
         assert_eq!(tool.resource_group, None);
+        assert_eq!(tool.probe.program, "claude");
+        assert_eq!(tool.probe.args, ["--version"]);
+        assert_eq!(tool.background, ToolBackground::Auto);
+    }
+
+    #[test]
+    fn user_manifest_requires_update_and_probe_commands() {
+        let missing_probe = r#"
+version = 1
+
+[tools.example]
+update = ["example", "update"]
+"#;
+        let missing_update = r#"
+version = 1
+
+[tools.example]
+probe = ["example", "--version"]
+"#;
+
+        assert!(
+            UserConfig::parse(missing_probe)
+                .expect_err("probe must be explicit")
+                .to_string()
+                .contains("missing field `probe`")
+        );
+        assert!(
+            UserConfig::parse(missing_update)
+                .expect_err("update must be explicit")
+                .to_string()
+                .contains("missing field `update`")
+        );
+    }
+
+    #[test]
+    fn user_manifest_is_concise_and_resolves_to_the_runtime_model() {
+        let input = r#"version = 1
+
+[tools.claude]
+update = ["claude", "update"]
+probe = ["claude", "--version"]
+"#;
+
+        let user = UserConfig::parse(input).expect("parse concise user manifest");
+        let encoded = toml::to_string(&user).expect("serialize user manifest");
+        let runtime = user.resolve().expect("resolve user manifest");
+        let claude = &runtime.tools["claude"];
+
+        assert!(encoded.contains("update = [\"claude\", \"update\"]"));
+        assert!(encoded.contains("probe = [\"claude\", \"--version\"]"));
+        assert!(!encoded.contains("background"));
+        assert!(!encoded.contains("lock_timeout_secs"));
+        assert_eq!(claude.program, "claude");
+        assert_eq!(claude.args, ["update"]);
+        assert_eq!(claude.probe.program, "claude");
+        assert_eq!(claude.probe.args, ["--version"]);
+        assert_eq!(claude.background, ToolBackground::Auto);
+        assert_eq!(claude.processes.len(), 1);
+        assert_eq!(claude.processes[0].name, "claude");
+        assert_eq!(claude.processes[0].action, ProcessAction::Wait);
+    }
+
+    #[test]
+    fn user_manifest_rejects_internal_builtin_fields() {
+        let internal_format = r#"version = 1
+
+[tools.example]
+program = "example"
+args = ["update"]
+background = "auto"
+
+[tools.example.probe]
+program = "example"
+args = ["--version"]
+"#;
+
+        let error = UserConfig::parse(internal_format)
+            .expect_err("internal tool fields must not parse as a user manifest");
+
+        let message = error.to_string();
+        assert!(message.contains("program") || message.contains("update"));
+    }
+
+    #[test]
+    fn empty_user_template_is_valid_and_contains_no_builtin_tools() {
+        let user = UserConfig::parse(USER_TEMPLATE).expect("valid user template");
+
+        assert!(user.tools.is_empty());
+        assert!(
+            user.resolve()
+                .expect("resolve empty user layer")
+                .tools
+                .is_empty()
+        );
+        assert!(!USER_TEMPLATE.contains("[tools.dvup]"));
+        for name in ["codex", "claude", "opencode", "hermes"] {
+            assert!(USER_TEMPLATE.contains(&format!("# [tools.{name}]")));
+            assert!(!STARTER_TEMPLATE.contains(&format!("[tools.{name}]")));
+        }
     }
 
     #[test]
@@ -820,26 +1037,5 @@ resource_group = "../../outside"
         assert!(bun.platforms.is_empty());
         assert_eq!(scoop.resource_group.as_deref(), Some("scoop"));
         assert_eq!(scoop.platforms, ["windows"]);
-    }
-
-    #[test]
-    fn loading_a_brew_command_applies_safe_defaults_to_older_configs() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let path = temporary.path().join("brew.toml");
-        std::fs::write(
-            &path,
-            r#"version = 1
-
-[tools.ripgrep]
-program = "brew"
-args = ["upgrade", "ripgrep"]
-"#,
-        )
-        .expect("write brew config");
-
-        let config = Config::load(&path).expect("load brew config");
-        let ripgrep = &config.tools["ripgrep"];
-        assert_eq!(ripgrep.resource_group.as_deref(), Some("homebrew"));
-        assert_eq!(ripgrep.platforms, ["macos", "linux"]);
     }
 }

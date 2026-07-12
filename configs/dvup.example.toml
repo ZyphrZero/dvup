@@ -1,109 +1,129 @@
-# Optional advanced configuration.
-# Normal use does not need this file:
-#   dvup list
-#   dvup update
-#   dvup update scoop zedg
-#   dvup add ripgrep brew upgrade ripgrep
+# Complete built-in tool definitions embedded in the dvup binary.
+# User TOML files use the concise schema in dvup.user.example.toml.
 
 version = 1
 
-# Portable Bun preset. dvup automatically replaces this exact default with
-# Bun's official PowerShell installer on Windows or Bash installer on Unix.
+[tools.dvup]
+program = "cargo"
+args = ["install", "dvup", "--locked"]
+background = "always"
+resource_group = "cargo-bin"
+
+[[tools.dvup.processes]]
+name = "dvup"
+action = "wait"
+
+[tools.dvup.probe]
+program = "dvup"
+args = ["--version"]
+
+# These portable placeholders are replaced in memory with the official
+# platform-specific installers before the built-in manifest is parsed.
 [tools.bun]
 program = "bun"
 args = ["upgrade"]
-lock_processes = ["bun"]
 resource_group = "bun-global"
+background = "auto"
 
-# Refreshes Homebrew itself and all configured taps. Package-specific upgrades
-# can be added with: dvup add ripgrep brew upgrade ripgrep
+[[tools.bun.processes]]
+name = "bun"
+action = "wait"
+
+[tools.bun.probe]
+program = "bun"
+args = ["--version"]
+
 [tools.brew]
 program = "brew"
 args = ["update"]
 platforms = ["macos", "linux"]
 resource_group = "homebrew"
+background = "auto"
 
-[tools.codex]
-program = "npm"
-args = ["install", "--global", "@openai/codex@latest"]
-resource_group = "node-global"
-
-[[tools.codex.processes]]
-name = "codex"
-action = "wait"
-
-[[tools.codex.processes]]
-name = "node"
-command_contains = "@openai/codex"
-action = "terminate"
+[tools.brew.probe]
+program = "brew"
+args = ["--version"]
 
 [tools.rustup]
 program = "rustup"
 args = ["update"]
-lock_processes = ["cargo", "rustc"]
+background = "auto"
+
+[[tools.rustup.processes]]
+name = "cargo"
+action = "wait"
+
+[[tools.rustup.processes]]
+name = "rustc"
+action = "wait"
+
+[tools.rustup.probe]
+program = "rustup"
+args = ["--version"]
 
 [tools.scoop]
 program = "scoop"
 args = ["update"]
 platforms = ["windows"]
 resource_group = "scoop"
+background = "auto"
 
-# Portable uv placeholder. dvup automatically replaces this exact default with
-# Astral's official PowerShell installer on Windows or shell installer on Unix.
+[tools.scoop.probe]
+program = "scoop"
+args = ["--version"]
+
 [tools.uv]
 program = "uv"
 args = ["self", "update"]
-lock_processes = ["uv"]
+resource_group = "uv"
+background = "auto"
 
-# Optional persistent Scoop app preset. Uncomment if the manifest is `zedg`.
-# [tools.scoop-zedg]
-# program = "scoop"
-# args = ["update", "zedg"]
-# platforms = ["windows"]
+[[tools.uv.processes]]
+name = "uv"
+action = "wait"
 
-# `dvup add claude claude install` creates the equivalent user-level entry:
-# [tools.claude]
-# program = "claude"
-# args = ["install"]
-# lock_processes = ["claude"]
+[tools.uv.probe]
+program = "uv"
+args = ["--version"]
 
-# npm and pnpm are package update methods, not built-in update targets.
-# `dvup add codegraph npm install --global @colbymchenry/codegraph@latest`
-# creates the equivalent user-level entry. A TOML equivalent is:
-# [tools.codegraph]
-# program = "npm"
-# args = ["install", "--global", "@colbymchenry/codegraph@latest"]
-# resource_group = "node-global"
+[tools.deno]
+program = "deno"
+args = ["upgrade"]
+resource_group = "deno"
+background = "auto"
 
-# A package managed by pnpm works the same way:
-# [tools.example-pnpm-package]
-# program = "pnpm"
-# args = ["add", "--global", "package-name@latest"]
-# resource_group = "node-global"
+[[tools.deno.processes]]
+name = "deno"
+action = "wait"
 
-# Bun can also update a specific global package. It uses its own installation
-# directory, so Bun package commands share a separate resource group.
-# [tools.example-bun-package]
-# program = "bun"
-# args = ["add", "--global", "package-name@latest"]
-# resource_group = "bun-global"
+[tools.deno.probe]
+program = "deno"
+args = ["--version"]
 
-# The built-in `brew` target refreshes Homebrew and its taps. A package upgrade
-# uses its own custom target: `dvup add ripgrep brew upgrade ripgrep` creates:
-# [tools.ripgrep]
-# program = "brew"
-# args = ["upgrade", "ripgrep"]
-# platforms = ["macos", "linux"]
-# resource_group = "homebrew"
+[tools.pixi]
+program = "pixi"
+args = ["self-update"]
+resource_group = "pixi"
+background = "auto"
 
-# A Homebrew cask works the same way:
-# [tools.zed]
-# program = "brew"
-# args = ["upgrade", "--cask", "zed"]
-# platforms = ["macos", "linux"]
-# resource_group = "homebrew"
+[[tools.pixi.processes]]
+name = "pixi"
+action = "wait"
 
-# Add another tool with only a program and argument list:
-# [tools.example]
-# program = "package-manager"
-# args = ["update", "example"]
+[tools.pixi.probe]
+program = "pixi"
+args = ["--version"]
+
+[tools.mise]
+program = "mise"
+args = ["self-update"]
+resource_group = "mise"
+background = "auto"
+
+[[tools.mise.processes]]
+name = "mise"
+action = "wait"
+
+[tools.mise.probe]
+program = "mise"
+args = ["--version"]

@@ -6,10 +6,47 @@ use std::{
 };
 
 use crate::{
+    config::Tool,
     datetime,
     error::{Error, Result},
     job::CommandSpec,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolReadiness {
+    Installed,
+    TargetMissing,
+    UpdaterMissing,
+    Unsupported,
+}
+
+pub fn probe_spec(tool: &Tool, working_directory: &std::path::Path) -> CommandSpec {
+    CommandSpec {
+        program: tool.probe.program.clone(),
+        args: tool.probe.args.clone(),
+        working_directory: working_directory.to_path_buf(),
+    }
+}
+
+pub fn update_spec(tool: &Tool, working_directory: &std::path::Path) -> CommandSpec {
+    CommandSpec {
+        program: tool.program.clone(),
+        args: tool.args.clone(),
+        working_directory: working_directory.to_path_buf(),
+    }
+}
+
+pub fn tool_readiness(tool: &Tool, working_directory: &std::path::Path) -> ToolReadiness {
+    if !tool.supports_current_platform() {
+        ToolReadiness::Unsupported
+    } else if !is_available(&probe_spec(tool, working_directory)) {
+        ToolReadiness::TargetMissing
+    } else if !is_available(&update_spec(tool, working_directory)) {
+        ToolReadiness::UpdaterMissing
+    } else {
+        ToolReadiness::Installed
+    }
+}
 
 /// Captured result of an update command.
 #[derive(Debug)]
@@ -87,7 +124,18 @@ fn contains_permission_failure(output: &str) -> bool {
 
 /// Executes a command without invoking a shell and captures both output streams.
 pub fn run(spec: &CommandSpec) -> Result<CommandResult> {
-    let mut command = prepare_command(spec);
+    capture_command(spec, prepare_command(spec))
+}
+
+/// Executes an already resolved native executable without an intermediary shell.
+pub(crate) fn run_direct(spec: &CommandSpec) -> Result<CommandResult> {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
+    configure_no_window(&mut command);
+    capture_command(spec, command)
+}
+
+fn capture_command(spec: &CommandSpec, mut command: Command) -> Result<CommandResult> {
     let output = command
         .current_dir(&spec.working_directory)
         .output()
@@ -129,9 +177,7 @@ fn prepare_command(spec: &CommandSpec) -> Command {
 
 #[cfg(windows)]
 fn prepare_command(spec: &CommandSpec) -> Command {
-    let shell = powershell_program(&spec.working_directory)
-        .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"));
-    let mut command = Command::new(shell);
+    let mut command = Command::new("powershell.exe");
     command
         .args([
             "-NoLogo",
@@ -159,20 +205,6 @@ pub fn configure_no_window(command: &mut Command) {
 pub fn configure_no_window(_command: &mut Command) {}
 
 #[cfg(windows)]
-fn powershell_program(working_directory: &std::path::Path) -> Option<PathBuf> {
-    ["pwsh", "powershell"]
-        .into_iter()
-        .map(|program| {
-            resolve_program(&CommandSpec {
-                program: program.to_owned(),
-                args: Vec::new(),
-                working_directory: working_directory.to_path_buf(),
-            })
-        })
-        .find(|program| program.is_file())
-}
-
-#[cfg(windows)]
 fn powershell_invocation(spec: &CommandSpec) -> String {
     let arguments = std::iter::once(spec.program.as_str())
         .chain(spec.args.iter().map(String::as_str))
@@ -189,14 +221,11 @@ fn powershell_quote(value: &str) -> String {
 
 #[cfg(windows)]
 fn powershell_resolves_command(spec: &CommandSpec) -> bool {
-    let Some(shell) = powershell_program(&spec.working_directory) else {
-        return false;
-    };
     let probe = format!(
         "Get-Command -Name {} -ErrorAction Stop | Out-Null",
         powershell_quote(&spec.program)
     );
-    let mut command = Command::new(shell);
+    let mut command = Command::new("powershell.exe");
     command
         .args([
             "-NoLogo",
@@ -285,19 +314,14 @@ fn resolve_program(spec: &CommandSpec) -> PathBuf {
 #[cfg(windows)]
 fn windows_executable_extensions() -> Vec<String> {
     const SUPPORTED: &[&str] = &["com", "exe", "bat", "cmd"];
-    let configured = std::env::var("PATHEXT").unwrap_or_default();
-    let mut extensions: Vec<String> = configured
+    let Ok(configured) = std::env::var("PATHEXT") else {
+        return Vec::new();
+    };
+    configured
         .split(';')
         .map(|extension| extension.trim().trim_start_matches('.').to_lowercase())
         .filter(|extension| SUPPORTED.contains(&extension.as_str()))
-        .collect();
-    if extensions.is_empty() {
-        extensions = SUPPORTED
-            .iter()
-            .map(|extension| (*extension).to_owned())
-            .collect();
-    }
-    extensions
+        .collect()
 }
 
 /// Appends a command result to a job log.
@@ -378,6 +402,34 @@ mod tests {
         };
 
         assert!(super::is_available(&spec));
+    }
+
+    #[test]
+    fn readiness_distinguishes_the_target_from_its_updater() {
+        let current = std::env::current_exe()
+            .expect("current executable")
+            .to_string_lossy()
+            .into_owned();
+        let working_directory = std::env::current_dir().expect("current directory");
+        let mut tool = crate::config::Tool::custom("example", current.clone(), Vec::new());
+        tool.probe.program = current;
+
+        assert_eq!(
+            super::tool_readiness(&tool, &working_directory),
+            super::ToolReadiness::Installed
+        );
+
+        tool.program = "dvup-missing-updater-96cf27db".to_owned();
+        assert_eq!(
+            super::tool_readiness(&tool, &working_directory),
+            super::ToolReadiness::UpdaterMissing
+        );
+
+        tool.probe.program = "dvup-missing-target-96cf27db".to_owned();
+        assert_eq!(
+            super::tool_readiness(&tool, &working_directory),
+            super::ToolReadiness::TargetMissing
+        );
     }
 
     #[test]

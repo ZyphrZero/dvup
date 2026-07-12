@@ -2,6 +2,11 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
 };
 
 use crate::{
@@ -21,7 +26,18 @@ pub(crate) struct ExecutableCandidate {
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutableDiagnosis {
     pub(crate) program: String,
+    pub(crate) probe_args: Vec<String>,
     pub(crate) candidates: Vec<ExecutableCandidate>,
+}
+
+const MAX_CONCURRENT_DIAGNOSES: usize = 8;
+const MAX_CONCURRENT_VERSION_PROBES: usize = 8;
+
+#[derive(Clone, Debug)]
+struct VersionProbeTask {
+    key: String,
+    path: PathBuf,
+    args: Vec<String>,
 }
 
 impl ExecutableDiagnosis {
@@ -90,20 +106,55 @@ pub(crate) fn diagnose(
         .map(|path| env::split_paths(&path).collect::<Vec<_>>())
         .unwrap_or_default();
     let extensions = executable_extensions();
-    let mut cache = HashMap::new();
-    Ok(tools
-        .into_iter()
-        .map(|(name, tool)| {
-            diagnose_tool(
-                name,
-                &tool,
-                working_directory,
-                &path_directories,
-                &extensions,
-                &mut cache,
-            )
-        })
-        .collect())
+    let mut diagnoses = diagnose_tools(&tools, working_directory, &path_directories, &extensions);
+    resolve_diagnosis_versions(&mut diagnoses, working_directory);
+    Ok(diagnoses)
+}
+
+fn diagnose_tools(
+    tools: &[(String, Tool)],
+    working_directory: &Path,
+    path_directories: &[PathBuf],
+    extensions: &[String],
+) -> Vec<ToolDiagnosis> {
+    if tools.is_empty() {
+        return Vec::new();
+    }
+    let worker_count = tools.len().min(MAX_CONCURRENT_DIAGNOSES);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((name, tool)) = tools.get(index) else {
+                        break;
+                    };
+                    let mut cache = HashMap::new();
+                    let diagnosis = diagnose_tool(
+                        name.clone(),
+                        tool,
+                        working_directory,
+                        path_directories,
+                        extensions,
+                        &mut cache,
+                    );
+                    if tx.send((index, diagnosis)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut ordered = vec![None; tools.len()];
+        for (index, diagnosis) in rx {
+            ordered[index] = Some(diagnosis);
+        }
+        ordered.into_iter().flatten().collect()
+    })
 }
 
 fn diagnose_tool(
@@ -114,20 +165,34 @@ fn diagnose_tool(
     extensions: &[String],
     cache: &mut HashMap<String, ExecutableDiagnosis>,
 ) -> ToolDiagnosis {
-    let target_program = diagnostic_program(&name, tool);
+    let supported = tool.supports_current_platform();
+    if !supported {
+        return ToolDiagnosis {
+            name,
+            supported,
+            target: ExecutableDiagnosis {
+                program: tool.probe.program.clone(),
+                probe_args: tool.probe.args.clone(),
+                candidates: Vec::new(),
+            },
+            updater: None,
+        };
+    }
     let target = diagnose_executable_cached(
-        &target_program,
+        &tool.probe.program,
+        &tool.probe.args,
         working_directory,
         path_directories,
         extensions,
         cache,
     );
     let updater_program = executable_name(&tool.program);
-    let target_name = executable_name(&target_program);
+    let target_name = executable_name(&tool.probe.program);
     let updater =
         (updater_program != target_name && !is_shell_wrapper(&updater_program)).then(|| {
             diagnose_executable_cached(
                 &tool.program,
+                &["--version".to_owned()],
                 working_directory,
                 path_directories,
                 extensions,
@@ -136,7 +201,7 @@ fn diagnose_tool(
         });
     ToolDiagnosis {
         name,
-        supported: tool.supports_current_platform(),
+        supported,
         target,
         updater,
     }
@@ -144,44 +209,134 @@ fn diagnose_tool(
 
 fn diagnose_executable_cached(
     program: &str,
+    probe_args: &[String],
     working_directory: &Path,
     path_directories: &[PathBuf],
     extensions: &[String],
     cache: &mut HashMap<String, ExecutableDiagnosis>,
 ) -> ExecutableDiagnosis {
-    let key = program.to_ascii_lowercase();
+    let key = format!(
+        "{}\0{}",
+        program.to_ascii_lowercase(),
+        probe_args.join("\0")
+    );
     if let Some(diagnosis) = cache.get(&key) {
         return diagnosis.clone();
     }
-    let candidates =
-        executable_candidates(program, working_directory, path_directories, extensions)
-            .into_iter()
-            .map(|path| ExecutableCandidate {
-                source: installation_source(&path),
-                version: probe_version(&path, working_directory),
-                path,
-            })
-            .collect();
+    let candidates = collapse_installation_families(
+        program,
+        executable_candidates(program, working_directory, path_directories, extensions),
+    )
+    .into_iter()
+    .map(|path| ExecutableCandidate {
+        source: installation_source(&path),
+        version: None,
+        path,
+    })
+    .collect();
     let diagnosis = ExecutableDiagnosis {
         program: program.to_owned(),
+        probe_args: probe_args.to_vec(),
         candidates,
     };
     cache.insert(key, diagnosis.clone());
     diagnosis
 }
 
-fn diagnostic_program(name: &str, tool: &Tool) -> String {
-    let updater = executable_name(&tool.program);
-    let known_tool = matches!(
-        name.to_ascii_lowercase().as_str(),
-        "brew" | "bun" | "codex" | "rustup" | "scoop" | "uv"
-    );
-    let package_manager = matches!(updater.as_str(), "brew" | "bun" | "npm" | "pnpm" | "scoop");
-    if known_tool || package_manager {
-        name.to_owned()
-    } else {
-        tool.program.clone()
+fn resolve_diagnosis_versions(diagnoses: &mut [ToolDiagnosis], working_directory: &Path) {
+    resolve_diagnosis_versions_with(diagnoses, working_directory, &probe_version);
+}
+
+fn resolve_diagnosis_versions_with<F>(
+    diagnoses: &mut [ToolDiagnosis],
+    working_directory: &Path,
+    probe: &F,
+) where
+    F: Fn(&Path, &[String], &Path) -> Option<String> + Sync,
+{
+    let mut tasks = Vec::new();
+    let mut seen = HashSet::new();
+    for diagnosis in diagnoses.iter() {
+        collect_version_probe_tasks(&diagnosis.target, &mut tasks, &mut seen);
+        if let Some(updater) = &diagnosis.updater {
+            collect_version_probe_tasks(updater, &mut tasks, &mut seen);
+        }
     }
+
+    let versions = run_version_probe_tasks(&tasks, working_directory, probe);
+    for diagnosis in diagnoses {
+        apply_probe_versions(&mut diagnosis.target, &versions);
+        if let Some(updater) = &mut diagnosis.updater {
+            apply_probe_versions(updater, &versions);
+        }
+    }
+}
+
+fn collect_version_probe_tasks(
+    diagnosis: &ExecutableDiagnosis,
+    tasks: &mut Vec<VersionProbeTask>,
+    seen: &mut HashSet<String>,
+) {
+    for candidate in &diagnosis.candidates {
+        let key = version_probe_key(&candidate.path, &diagnosis.probe_args);
+        if seen.insert(key.clone()) {
+            tasks.push(VersionProbeTask {
+                key,
+                path: candidate.path.clone(),
+                args: diagnosis.probe_args.clone(),
+            });
+        }
+    }
+}
+
+fn run_version_probe_tasks<F>(
+    tasks: &[VersionProbeTask],
+    working_directory: &Path,
+    probe: &F,
+) -> HashMap<String, Option<String>>
+where
+    F: Fn(&Path, &[String], &Path) -> Option<String> + Sync,
+{
+    if tasks.is_empty() {
+        return HashMap::new();
+    }
+    let worker_count = tasks.len().min(MAX_CONCURRENT_VERSION_PROBES);
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let tx = tx.clone();
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(task) = tasks.get(index) else {
+                        break;
+                    };
+                    let version = probe(&task.path, &task.args, working_directory);
+                    if tx.send((task.key.clone(), version)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        rx.into_iter().collect()
+    })
+}
+
+fn apply_probe_versions(
+    diagnosis: &mut ExecutableDiagnosis,
+    versions: &HashMap<String, Option<String>>,
+) {
+    for candidate in &mut diagnosis.candidates {
+        let key = version_probe_key(&candidate.path, &diagnosis.probe_args);
+        candidate.version = versions.get(&key).cloned().flatten();
+    }
+}
+
+fn version_probe_key(path: &Path, args: &[String]) -> String {
+    format!("{}\0{}", path_key(path), args.join("\0"))
 }
 
 fn is_shell_wrapper(program: &str) -> bool {
@@ -189,6 +344,106 @@ fn is_shell_wrapper(program: &str) -> bool {
         program,
         "bash" | "sh" | "powershell" | "pwsh" | "invoke-expression"
     )
+}
+
+fn deduplicate_candidates(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen_targets = HashSet::new();
+    let mut seen_locations = HashSet::new();
+    for candidate in paths {
+        if !is_executable_file(&candidate) {
+            continue;
+        }
+        let canonical = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        let location = candidate.parent().unwrap_or(&candidate);
+        let canonical_location =
+            fs::canonicalize(location).unwrap_or_else(|_| location.to_path_buf());
+        if !seen_locations.insert(path_key(&canonical_location)) {
+            continue;
+        }
+        if seen_targets.insert(path_key(&canonical)) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn collapse_installation_families(program: &str, candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let current_executable = env::current_exe().ok();
+    collapse_installation_families_with_current(program, candidates, current_executable.as_deref())
+}
+
+fn collapse_installation_families_with_current(
+    program: &str,
+    candidates: Vec<PathBuf>,
+    current_executable: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut seen_families = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            installation_family_key(program, candidate, current_executable)
+                .is_none_or(|family| seen_families.insert(family))
+        })
+        .collect()
+}
+
+fn installation_family_key(
+    program: &str,
+    candidate: &Path,
+    current_executable: Option<&Path>,
+) -> Option<String> {
+    cargo_build_family_key(program, candidate, current_executable)
+        .or_else(|| rustup_family_key(program, candidate))
+}
+
+fn cargo_build_family_key(
+    program: &str,
+    candidate: &Path,
+    current_executable: Option<&Path>,
+) -> Option<String> {
+    let current_executable = current_executable?;
+    let current_name = current_executable.file_name()?.to_string_lossy();
+    if executable_name(program) != executable_name(&current_name) {
+        return None;
+    }
+    let current =
+        fs::canonicalize(current_executable).unwrap_or_else(|_| current_executable.to_path_buf());
+    let candidate = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    let profile_directory = current.parent()?;
+    let is_current = path_key(&candidate) == path_key(&current);
+    let is_profile_deps = candidate.parent().is_some_and(|parent| {
+        parent
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("deps"))
+            && parent
+                .parent()
+                .is_some_and(|profile| path_key(profile) == path_key(profile_directory))
+    }) && candidate
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&current_name));
+    (is_current || is_profile_deps).then(|| format!("cargo-build:{}", path_key(profile_directory)))
+}
+
+fn rustup_family_key(program: &str, candidate: &Path) -> Option<String> {
+    let candidate_name = candidate.file_name()?.to_string_lossy();
+    let executable = executable_name(program);
+    if executable_name(&candidate_name) != executable {
+        return None;
+    }
+    let normalized = candidate
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let root = normalized
+        .split_once("/.cargo/bin/")
+        .map(|(root, _)| root)
+        .or_else(|| {
+            normalized
+                .split_once("/.rustup/toolchains/")
+                .map(|(root, _)| root)
+        })?;
+    Some(format!("rustup:{root}:{executable}"))
 }
 
 fn executable_candidates(
@@ -215,11 +470,8 @@ fn executable_candidates(
             .map(|directory| directory.join(path))
             .collect()
     };
-    let mut candidates = Vec::new();
-    let mut seen_targets = HashSet::new();
-    let mut seen_locations = HashSet::new();
-    for base in bases {
-        let paths = if base.extension().is_some() {
+    let paths = bases.into_iter().flat_map(|base| {
+        if base.extension().is_some() {
             vec![base]
         } else {
             extensions
@@ -232,24 +484,9 @@ fn executable_candidates(
                     }
                 })
                 .collect()
-        };
-        for candidate in paths {
-            if !is_executable_file(&candidate) {
-                continue;
-            }
-            let canonical = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-            let location = candidate.parent().unwrap_or(&candidate);
-            let canonical_location =
-                fs::canonicalize(location).unwrap_or_else(|_| location.to_path_buf());
-            if !seen_locations.insert(path_key(&canonical_location)) {
-                continue;
-            }
-            if seen_targets.insert(path_key(&canonical)) {
-                candidates.push(candidate);
-            }
         }
-    }
-    candidates
+    });
+    deduplicate_candidates(paths)
 }
 
 #[cfg(unix)]
@@ -279,23 +516,15 @@ fn path_key(path: &Path) -> String {
 
 #[cfg(windows)]
 fn executable_extensions() -> Vec<String> {
-    let mut extensions = env::var_os("PATHEXT")
-        .map(|value| {
-            value
-                .to_string_lossy()
-                .split(';')
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| extension.to_ascii_lowercase())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            vec![
-                ".com".to_owned(),
-                ".exe".to_owned(),
-                ".bat".to_owned(),
-                ".cmd".to_owned(),
-            ]
-        });
+    let mut extensions = match env::var_os("PATHEXT") {
+        Some(value) => value
+            .to_string_lossy()
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| extension.to_ascii_lowercase())
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
     // Commands are executed through PowerShell on Windows, where a .ps1
     // launcher takes precedence over application launchers in the same PATH
     // directory.
@@ -323,18 +552,39 @@ fn executable_name(program: &str) -> String {
         .to_owned()
 }
 
-fn probe_version(path: &Path, working_directory: &Path) -> Option<String> {
-    let result = command::run(&CommandSpec {
+fn probe_version(path: &Path, args: &[String], working_directory: &Path) -> Option<String> {
+    let spec = CommandSpec {
         program: path.to_string_lossy().into_owned(),
-        args: vec!["--version".to_owned()],
+        args: args.to_vec(),
         working_directory: working_directory.to_path_buf(),
-    })
+    };
+    let result = if probe_uses_direct_execution(path) {
+        command::run_direct(&spec)
+    } else {
+        command::run(&spec)
+    }
     .ok()?;
     result
         .status
         .success()
         .then(|| compact_version(&result.stdout, &result.stderr))
         .flatten()
+}
+
+fn probe_uses_direct_execution(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 fn compact_version(stdout: &[u8], stderr: &[u8]) -> Option<String> {
@@ -403,7 +653,9 @@ fn installation_source(path: &Path) -> &'static str {
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    if normalized.contains("/.cargo/bin/") {
+    if is_current_cargo_build_path(path) {
+        "cargo-build"
+    } else if normalized.contains("/.cargo/bin/") {
         "rustup/cargo"
     } else if normalized.contains("/.bun/bin/") {
         "bun"
@@ -424,6 +676,22 @@ fn installation_source(path: &Path) -> &'static str {
     } else {
         "PATH"
     }
+}
+
+fn is_current_cargo_build_path(path: &Path) -> bool {
+    let Some(current) = env::current_exe().ok() else {
+        return false;
+    };
+    let Some(profile_directory) = current.parent() else {
+        return false;
+    };
+    if !profile_directory.join("deps").is_dir() {
+        return false;
+    }
+    let Some(program) = current.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    cargo_build_family_key(program, path, Some(&current)).is_some()
 }
 
 fn render_report(diagnoses: &[ToolDiagnosis]) -> String {
@@ -547,14 +815,14 @@ mod tests {
         fs::create_dir_all(&first).expect("first PATH directory");
         fs::create_dir_all(&second).expect("second PATH directory");
         create_executable(&first.join("example.primary"));
-        create_executable(&first.join("example.fallback"));
+        create_executable(&first.join("example.secondary"));
         create_executable(&second.join("example.primary"));
 
         let candidates = executable_candidates(
             "example",
             temporary.path(),
             &[first.clone(), second.clone()],
-            &[".primary".to_owned(), ".fallback".to_owned()],
+            &[".primary".to_owned(), ".secondary".to_owned()],
         );
 
         assert_eq!(
@@ -566,6 +834,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn groups_current_cargo_build_and_deps_artifacts_as_one_installation() {
+        let current = PathBuf::from("workspace/target/debug/dvup.exe");
+        let installed = PathBuf::from("home/.cargo/bin/dvup.exe");
+        let candidates = vec![
+            current.clone(),
+            PathBuf::from("workspace/target/debug/deps/dvup.exe"),
+            installed.clone(),
+        ];
+
+        let grouped =
+            collapse_installation_families_with_current("dvup", candidates, Some(&current));
+
+        assert_eq!(grouped, [current, installed]);
+    }
+
+    #[test]
+    fn groups_rustup_proxy_and_managed_toolchain_as_one_installation() {
+        let proxy = PathBuf::from("home/.cargo/bin/cargo.exe");
+        let candidates = vec![
+            proxy.clone(),
+            PathBuf::from("home/.rustup/toolchains/stable/bin/cargo.exe"),
+        ];
+
+        let grouped = collapse_installation_families_with_current("cargo", candidates, None);
+
+        assert_eq!(grouped, [proxy]);
+    }
+
+    #[test]
+    fn keeps_unrelated_same_version_installations_separate() {
+        let first = PathBuf::from("manager-a/bin/uv.exe");
+        let second = PathBuf::from("home/.local/bin/uv.exe");
+
+        let grouped = collapse_installation_families_with_current(
+            "uv",
+            vec![first.clone(), second.clone()],
+            None,
+        );
+
+        assert_eq!(grouped, [first, second]);
+    }
+
     #[cfg(windows)]
     #[test]
     fn checks_powershell_launcher_before_pathext_applications() {
@@ -575,6 +886,119 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn runs_native_windows_candidates_without_starting_powershell() {
+        assert!(probe_uses_direct_execution(Path::new("tool.exe")));
+        assert!(probe_uses_direct_execution(Path::new("tool.COM")));
+        assert!(!probe_uses_direct_execution(Path::new("tool.ps1")));
+        assert!(!probe_uses_direct_execution(Path::new("tool.cmd")));
+    }
+
+    #[test]
+    fn probes_versions_concurrently_with_a_bounded_worker_count() {
+        let mut diagnoses = (0..12)
+            .map(|index| ToolDiagnosis {
+                name: format!("tool-{index}"),
+                supported: true,
+                target: ExecutableDiagnosis {
+                    program: format!("tool-{index}"),
+                    probe_args: vec!["--version".to_owned()],
+                    candidates: vec![ExecutableCandidate {
+                        path: PathBuf::from(format!("bin/tool-{index}")),
+                        source: "PATH",
+                        version: None,
+                    }],
+                },
+                updater: None,
+            })
+            .collect::<Vec<_>>();
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+
+        resolve_diagnosis_versions_with(&mut diagnoses, Path::new("."), &|path, _, _| {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(now_active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            active.fetch_sub(1, Ordering::SeqCst);
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+
+        assert!((2..=MAX_CONCURRENT_VERSION_PROBES).contains(&max_active.load(Ordering::SeqCst)));
+        for (index, diagnosis) in diagnoses.iter().enumerate() {
+            assert_eq!(
+                diagnosis.target.candidates[0].version.as_deref(),
+                Some(format!("tool-{index}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn probes_an_identical_candidate_only_once() {
+        let executable = ExecutableDiagnosis {
+            program: "shared".to_owned(),
+            probe_args: vec!["--version".to_owned()],
+            candidates: vec![ExecutableCandidate {
+                path: PathBuf::from("bin/shared"),
+                source: "PATH",
+                version: None,
+            }],
+        };
+        let mut diagnoses = [
+            ToolDiagnosis {
+                name: "first".to_owned(),
+                supported: true,
+                target: executable.clone(),
+                updater: None,
+            },
+            ToolDiagnosis {
+                name: "second".to_owned(),
+                supported: true,
+                target: executable,
+                updater: None,
+            },
+        ];
+        let calls = AtomicUsize::new(0);
+
+        resolve_diagnosis_versions_with(&mut diagnoses, Path::new("."), &|_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("1.0.0".to_owned())
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(diagnoses.iter().all(|diagnosis| {
+            diagnosis.target.candidates[0].version.as_deref() == Some("1.0.0")
+        }));
+    }
+
+    #[test]
+    fn concurrent_diagnosis_preserves_requested_tool_order() {
+        let excluded_platform = match std::env::consts::OS {
+            "windows" => "linux",
+            _ => "windows",
+        };
+        let tools = ["zeta", "alpha", "middle"]
+            .into_iter()
+            .map(|name| {
+                let mut tool = Tool::custom(name, name.to_owned(), vec!["update".to_owned()]);
+                tool.platforms = vec![excluded_platform.to_owned()];
+                (name.to_owned(), tool)
+            })
+            .collect::<Vec<_>>();
+
+        let diagnoses = diagnose_tools(&tools, Path::new("."), &[], &[String::new()]);
+
+        assert_eq!(
+            diagnoses
+                .iter()
+                .map(|diagnosis| diagnosis.name.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta", "alpha", "middle"]
+        );
+        assert!(diagnoses.iter().all(|diagnosis| !diagnosis.supported));
+    }
+
     #[test]
     fn report_calls_out_shadowed_different_versions() {
         let diagnosis = ToolDiagnosis {
@@ -582,6 +1006,7 @@ mod tests {
             supported: true,
             target: ExecutableDiagnosis {
                 program: "codex".to_owned(),
+                probe_args: vec!["--version".to_owned()],
                 candidates: vec![
                     ExecutableCandidate {
                         path: PathBuf::from("first/codex"),

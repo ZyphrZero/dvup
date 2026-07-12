@@ -18,6 +18,9 @@ pub enum Error {
     #[error("job `{0}` was not found")]
     JobNotFound(String),
 
+    #[error("job is invalid: {0}")]
+    InvalidJob(String),
+
     #[error("refusing to overwrite existing file {0}; pass --force to replace it")]
     FileExists(PathBuf),
 

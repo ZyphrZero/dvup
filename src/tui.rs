@@ -11,8 +11,9 @@ use std::{
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -20,7 +21,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -31,16 +32,23 @@ use ratatui::{
 
 use crate::{
     cli, command,
-    config::{Config, Tool},
+    config::{UserConfig, UserTool},
     datetime, detach, doctor,
     error::{Error, Result},
     job::{CommandSpec, JobStatus, JobStore},
+    settings::TuiSettings,
     state::StateDirs,
     worker,
 };
 
+#[cfg(test)]
+use crate::config::{Config, Tool};
+
 const TICK_RATE: Duration = Duration::from_millis(100);
+const MOUSE_WHEEL_ROWS: isize = 1;
 const MAX_ACTIVITY_LINES: usize = 1_000;
+const TOML_HISTORY_LIMIT: usize = 100;
+const TOML_HISTORY_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 const ACCENT: Color = Color::Rgb(103, 232, 249);
 const DIM: Color = Color::Rgb(153, 153, 153);
 const SUBTLE: Color = Color::Rgb(110, 110, 120);
@@ -52,9 +60,19 @@ const BACKDROP_BG: Color = Color::Rgb(12, 12, 16);
 const SUCCESS: Color = Color::Rgb(78, 186, 101);
 const ERROR_COLOR: Color = Color::Rgb(255, 107, 128);
 const WARNING_COLOR: Color = Color::Rgb(255, 193, 7);
+const TOML_KEY: Color = ACCENT;
+const TOML_STRING: Color = Color::Rgb(134, 239, 172);
+const TOML_NUMBER: Color = Color::Rgb(251, 191, 36);
+const TOML_BOOLEAN: Color = Color::Rgb(232, 121, 249);
+const TOML_DATE_TIME: Color = Color::Rgb(96, 165, 250);
+const TOML_COMMENT: Color = SUBTLE;
 
 /// Runs the interactive terminal interface.
-pub fn run(state: StateDirs, config_path: Option<PathBuf>) -> Result<u8> {
+pub fn run(
+    state: StateDirs,
+    config_path: Option<PathBuf>,
+    editor_path: Option<PathBuf>,
+) -> Result<u8> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(Error::Message(
             "the TUI requires an interactive terminal; use `dvup list` or `dvup update` in scripts"
@@ -65,14 +83,22 @@ pub fn run(state: StateDirs, config_path: Option<PathBuf>) -> Result<u8> {
     enable_raw_mode()?;
     let mut restore = TerminalRestore { armed: true };
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let app_result = terminal
-        .clear()
-        .map_err(Error::from)
-        .and_then(|()| App::new(state, config_path))
-        .and_then(|mut app| run_app(&mut terminal, &mut app));
+    let app_result = terminal.clear().map_err(Error::from).and_then(|()| {
+        let direct_editor = editor_path.is_some();
+        let mut app = App::new(state, if direct_editor { None } else { config_path })?;
+        if let Some(path) = editor_path {
+            app.open_toml_file(path)?;
+        }
+        run_app(&mut terminal, &mut app)
+    });
 
     drop(terminal);
     let restore_result = restore_terminal();
@@ -101,7 +127,13 @@ impl Drop for TerminalRestore {
 fn restore_terminal() -> io::Result<()> {
     let raw_result = disable_raw_mode();
     let mut stdout = io::stdout();
-    let screen_result = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen, Show);
+    let screen_result = execute!(
+        stdout,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
     raw_result.and(screen_result)
 }
 
@@ -109,6 +141,7 @@ fn restore_terminal() -> io::Result<()> {
 enum Availability {
     Installed,
     Missing,
+    UpdaterMissing,
     Unsupported,
 }
 
@@ -119,6 +152,8 @@ impl Availability {
             (Self::Installed, Language::Chinese) => "已安装",
             (Self::Missing, Language::English) => "missing",
             (Self::Missing, Language::Chinese) => "未安装",
+            (Self::UpdaterMissing, Language::English) => "no updater",
+            (Self::UpdaterMissing, Language::Chinese) => "缺少更新器",
             (Self::Unsupported, Language::English) => "unsupported",
             (Self::Unsupported, Language::Chinese) => "不支持",
         }
@@ -128,6 +163,7 @@ impl Availability {
         match self {
             Self::Installed => Style::default().fg(SUCCESS),
             Self::Missing => Style::default().fg(SUBTLE),
+            Self::UpdaterMissing => Style::default().fg(ERROR_COLOR),
             Self::Unsupported => Style::default().fg(WARNING_COLOR),
         }
     }
@@ -342,6 +378,23 @@ impl VersionState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolKind {
+    BuiltIn,
+    Custom,
+}
+
+impl ToolKind {
+    fn label(self, language: Language) -> &'static str {
+        match (self, language) {
+            (Self::BuiltIn, Language::English) => "built-in",
+            (Self::BuiltIn, Language::Chinese) => "内置",
+            (Self::Custom, Language::English) => "custom",
+            (Self::Custom, Language::Chinese) => "自定义",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ToolItem {
     name: String,
@@ -350,7 +403,7 @@ struct ToolItem {
     version_command: CommandSpec,
     version_probe_id: u64,
     availability: Availability,
-    custom: bool,
+    kind: ToolKind,
     selected: bool,
     run_state: RunState,
     elapsed: Option<Duration>,
@@ -372,12 +425,56 @@ struct ModalInputHitbox {
     visible_end: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TomlEditorHitbox {
+    area: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ListViewport {
+    area: Option<Rect>,
+    length: usize,
+    offset: usize,
+}
+
+impl ListViewport {
+    fn offset(self) -> usize {
+        self.offset
+    }
+
+    fn update(&mut self, area: Rect, length: usize, offset: usize) {
+        let maximum = length.saturating_sub(usize::from(area.height));
+        self.area = Some(area);
+        self.length = length;
+        self.offset = offset.min(maximum);
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn scroll_at(&mut self, column: u16, row: u16, delta: isize) -> Option<usize> {
+        let area = self.area.filter(|area| {
+            contains(Some(*area), column, row) && area.height > 0 && self.length > 0
+        })?;
+        let maximum = self.length.saturating_sub(usize::from(area.height));
+        self.offset = self.offset.saturating_add_signed(delta).min(maximum);
+        let slot = usize::from(row.saturating_sub(area.y));
+        Some(
+            self.offset
+                .saturating_add(slot)
+                .min(self.length.saturating_sub(1)),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
     Tools,
     Activity,
     Jobs,
     Doctor,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -423,16 +520,18 @@ impl Tab {
             Self::Tools => Self::Activity,
             Self::Activity => Self::Jobs,
             Self::Jobs => Self::Doctor,
-            Self::Doctor => Self::Tools,
+            Self::Doctor => Self::Settings,
+            Self::Settings => Self::Tools,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Tools => Self::Doctor,
+            Self::Tools => Self::Settings,
             Self::Activity => Self::Tools,
             Self::Jobs => Self::Activity,
             Self::Doctor => Self::Jobs,
+            Self::Settings => Self::Doctor,
         }
     }
 
@@ -442,6 +541,7 @@ impl Tab {
             Self::Activity => 1,
             Self::Jobs => 2,
             Self::Doctor => 3,
+            Self::Settings => 4,
         }
     }
 
@@ -451,6 +551,7 @@ impl Tab {
             1 => Some(Self::Activity),
             2 => Some(Self::Jobs),
             3 => Some(Self::Doctor),
+            4 => Some(Self::Settings),
             _ => None,
         }
     }
@@ -606,6 +707,554 @@ impl TextInput {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TomlHighlight {
+    start: usize,
+    end: usize,
+    style: Style,
+}
+
+#[derive(Clone, Debug)]
+struct TomlEditorSnapshot {
+    text: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TomlCommentAction {
+    Commented,
+    Uncommented,
+}
+
+#[derive(Clone, Debug)]
+struct TomlEditor {
+    path: PathBuf,
+    text: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+    scroll_y: usize,
+    scroll_x: usize,
+    preferred_column: Option<usize>,
+    follow_cursor: bool,
+    dirty: bool,
+    saved_text: String,
+    revision: u64,
+    highlighted_revision: u64,
+    highlights: Vec<TomlHighlight>,
+    undo_stack: Vec<TomlEditorSnapshot>,
+    redo_stack: Vec<TomlEditorSnapshot>,
+}
+
+impl TomlEditor {
+    fn new(path: PathBuf, text: String) -> Self {
+        let saved_text = text.clone();
+        Self {
+            path,
+            text,
+            cursor: 0,
+            selection_anchor: None,
+            scroll_y: 0,
+            scroll_x: 0,
+            preferred_column: None,
+            follow_cursor: true,
+            dirty: false,
+            saved_text,
+            revision: 0,
+            highlighted_revision: u64::MAX,
+            highlights: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+
+    fn snapshot(&self) -> TomlEditorSnapshot {
+        TomlEditorSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    fn push_history(stack: &mut Vec<TomlEditorSnapshot>, snapshot: TomlEditorSnapshot) {
+        stack.push(snapshot);
+        let mut total_bytes = stack
+            .iter()
+            .map(|snapshot| snapshot.text.len())
+            .sum::<usize>();
+        while stack.len() > TOML_HISTORY_LIMIT
+            || (stack.len() > 1 && total_bytes > TOML_HISTORY_BYTE_LIMIT)
+        {
+            total_bytes = total_bytes.saturating_sub(stack[0].text.len());
+            stack.remove(0);
+        }
+    }
+
+    fn begin_edit(&mut self) {
+        let snapshot = self.snapshot();
+        Self::push_history(&mut self.undo_stack, snapshot);
+        self.redo_stack.clear();
+    }
+
+    fn finish_edit(&mut self) {
+        self.preferred_column = None;
+        self.follow_cursor = true;
+        self.dirty = self.text != self.saved_text;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn restore_snapshot(&mut self, snapshot: TomlEditorSnapshot) {
+        self.text = snapshot.text;
+        self.cursor = snapshot.cursor;
+        self.selection_anchor = snapshot.selection_anchor;
+        self.dirty = self.text != self.saved_text;
+        self.preferred_column = None;
+        self.follow_cursor = true;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.undo_stack.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        Self::push_history(&mut self.redo_stack, current);
+        self.restore_snapshot(snapshot);
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(snapshot) = self.redo_stack.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        Self::push_history(&mut self.undo_stack, current);
+        self.restore_snapshot(snapshot);
+        true
+    }
+
+    fn mark_saved(&mut self) {
+        self.saved_text.clone_from(&self.text);
+        self.dirty = false;
+    }
+
+    fn line_ranges(&self) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        for (index, character) in self.text.char_indices() {
+            if character == '\n' {
+                ranges.push((start, index));
+                start = index + 1;
+            }
+        }
+        ranges.push((start, self.text.len()));
+        ranges
+    }
+
+    fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        (anchor != self.cursor).then_some(if anchor < self.cursor {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        })
+    }
+
+    fn selected_text(&self) -> Option<&str> {
+        self.selection().map(|(start, end)| &self.text[start..end])
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn select_all(&mut self) {
+        self.selection_anchor = (!self.text.is_empty()).then_some(0);
+        self.cursor = self.text.len();
+        self.preferred_column = None;
+        self.follow_cursor = true;
+    }
+
+    fn cursor_line_column(&self) -> (usize, usize) {
+        let ranges = self.line_ranges();
+        let line = ranges
+            .iter()
+            .position(|(_, end)| self.cursor <= *end)
+            .unwrap_or_else(|| ranges.len().saturating_sub(1));
+        let (start, end) = ranges[line];
+        let cursor = self.cursor.min(end);
+        (line, display_width(&self.text[start..cursor]))
+    }
+
+    fn byte_at_column(&self, line: usize, column: usize) -> usize {
+        let ranges = self.line_ranges();
+        let (start, end) = ranges[line.min(ranges.len().saturating_sub(1))];
+        let mut width = 0;
+        for (offset, character) in self.text[start..end].char_indices() {
+            let character_width = display_width(&character.to_string());
+            if column < width + character_width.div_ceil(2) {
+                return start + offset;
+            }
+            width += character_width;
+            if column < width {
+                return start + offset + character.len_utf8();
+            }
+        }
+        end
+    }
+
+    fn move_to(&mut self, target: usize, extend_selection: bool) {
+        if extend_selection {
+            self.selection_anchor.get_or_insert(self.cursor);
+        } else {
+            self.clear_selection();
+        }
+        self.cursor = target;
+        self.follow_cursor = true;
+        if self.selection_anchor == Some(self.cursor) {
+            self.clear_selection();
+        }
+    }
+
+    fn move_left(&mut self, extend_selection: bool) {
+        self.preferred_column = None;
+        if !extend_selection && let Some((start, _)) = self.selection() {
+            self.move_to(start, false);
+            return;
+        }
+        let target = self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.move_to(target, extend_selection);
+    }
+
+    fn move_right(&mut self, extend_selection: bool) {
+        self.preferred_column = None;
+        if !extend_selection && let Some((_, end)) = self.selection() {
+            self.move_to(end, false);
+            return;
+        }
+        let target = self.text[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| self.cursor + offset)
+            .unwrap_or(self.text.len());
+        self.move_to(target, extend_selection);
+    }
+
+    fn move_vertical(&mut self, delta: isize, extend_selection: bool) {
+        let (line, column) = self.cursor_line_column();
+        let column = *self.preferred_column.get_or_insert(column);
+        let last_line = self.line_ranges().len().saturating_sub(1);
+        let target_line = line.saturating_add_signed(delta).min(last_line);
+        let target = self.byte_at_column(target_line, column);
+        self.move_to(target, extend_selection);
+    }
+
+    fn move_home(&mut self, document: bool, extend_selection: bool) {
+        self.preferred_column = None;
+        let target = if document {
+            0
+        } else {
+            let (line, _) = self.cursor_line_column();
+            self.line_ranges()[line].0
+        };
+        self.move_to(target, extend_selection);
+    }
+
+    fn move_end(&mut self, document: bool, extend_selection: bool) {
+        self.preferred_column = None;
+        let target = if document {
+            self.text.len()
+        } else {
+            let (line, _) = self.cursor_line_column();
+            self.line_ranges()[line].1
+        };
+        self.move_to(target, extend_selection);
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            return false;
+        };
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+        self.clear_selection();
+        true
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        self.begin_edit();
+        self.delete_selection();
+        self.text.insert_str(self.cursor, &normalized);
+        self.cursor += normalized.len();
+        self.finish_edit();
+    }
+
+    fn backspace(&mut self) {
+        self.preferred_column = None;
+        if self.selection().is_some() {
+            self.begin_edit();
+            self.delete_selection();
+            self.finish_edit();
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        self.begin_edit();
+        let start = self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.finish_edit();
+    }
+
+    fn delete(&mut self) {
+        self.preferred_column = None;
+        if self.selection().is_some() {
+            self.begin_edit();
+            self.delete_selection();
+            self.finish_edit();
+            return;
+        }
+        if self.cursor == self.text.len() {
+            return;
+        }
+        self.begin_edit();
+        let end = self.text[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| self.cursor + offset)
+            .unwrap_or(self.text.len());
+        self.text.replace_range(self.cursor..end, "");
+        self.finish_edit();
+    }
+
+    fn toggle_line_comments(&mut self) -> Option<TomlCommentAction> {
+        let ranges = self.line_ranges();
+        let selection = self.selection();
+        let (selection_start, selection_end) = selection.unwrap_or((self.cursor, self.cursor));
+        let first_line = ranges
+            .iter()
+            .position(|(_, end)| selection_start <= *end)
+            .unwrap_or_else(|| ranges.len().saturating_sub(1));
+        let end_probe = if selection.is_some() && selection_end > selection_start {
+            selection_end.saturating_sub(1)
+        } else {
+            selection_end
+        };
+        let last_line = ranges
+            .iter()
+            .position(|(_, end)| end_probe <= *end)
+            .unwrap_or_else(|| ranges.len().saturating_sub(1));
+        let selected_ranges = &ranges[first_line..=last_line];
+
+        let line_info = selected_ranges
+            .iter()
+            .map(|&(start, end)| {
+                let line = &self.text[start..end];
+                let indentation = line
+                    .char_indices()
+                    .take_while(|(_, character)| matches!(character, ' ' | '\t'))
+                    .map(|(offset, character)| offset + character.len_utf8())
+                    .last()
+                    .unwrap_or(0);
+                let content = &line[indentation..];
+                (start, end, indentation, content)
+            })
+            .collect::<Vec<_>>();
+        let has_nonblank = line_info
+            .iter()
+            .any(|(_, _, _, content)| !content.is_empty());
+        let uncomment = has_nonblank
+            && line_info
+                .iter()
+                .filter(|(_, _, _, content)| !content.is_empty())
+                .all(|(_, _, _, content)| content.starts_with('#'));
+        let comment_single_blank = line_info.len() == 1;
+
+        let mut edits = Vec::new();
+        for &(start, _, indentation, content) in &line_info {
+            let marker = start + indentation;
+            if uncomment {
+                if let Some(after_hash) = content.strip_prefix('#') {
+                    let remove = if after_hash.starts_with(' ') { 2 } else { 1 };
+                    edits.push((marker, marker + remove, String::new()));
+                }
+            } else if !content.is_empty() || comment_single_blank {
+                edits.push((marker, marker, "# ".to_owned()));
+            }
+        }
+        if edits.is_empty() {
+            return None;
+        }
+
+        let original_cursor = self.cursor;
+        let original_anchor = self.selection_anchor;
+        let block_start = selected_ranges[0].0;
+        let block_end = selected_ranges[selected_ranges.len() - 1].1;
+        let delta = edits
+            .iter()
+            .fold(0isize, |total, (start, end, replacement)| {
+                total + replacement.len() as isize - (*end - *start) as isize
+            });
+        let mapped_cursor = map_toml_edit_position(original_cursor, &edits);
+
+        self.begin_edit();
+        for (start, end, replacement) in edits.iter().rev() {
+            self.text.replace_range(*start..*end, replacement);
+        }
+        if let Some(anchor) = original_anchor {
+            let new_block_end = block_end.saturating_add_signed(delta);
+            if anchor <= original_cursor {
+                self.selection_anchor = Some(block_start);
+                self.cursor = new_block_end;
+            } else {
+                self.selection_anchor = Some(new_block_end);
+                self.cursor = block_start;
+            }
+        } else {
+            self.selection_anchor = None;
+            self.cursor = mapped_cursor;
+        }
+        self.finish_edit();
+
+        Some(if uncomment {
+            TomlCommentAction::Uncommented
+        } else {
+            TomlCommentAction::Commented
+        })
+    }
+
+    fn ensure_cursor_visible(&mut self, height: usize, width: usize) {
+        if height == 0 || width == 0 {
+            return;
+        }
+        let (line, column) = self.cursor_line_column();
+        if line < self.scroll_y {
+            self.scroll_y = line;
+        } else if line >= self.scroll_y + height {
+            self.scroll_y = line + 1 - height;
+        }
+        if column < self.scroll_x {
+            self.scroll_x = column;
+        } else if column >= self.scroll_x + width {
+            self.scroll_x = column + 1 - width;
+        }
+    }
+
+    fn scroll_vertical(&mut self, delta: isize, height: usize) {
+        let max_scroll = self.line_ranges().len().saturating_sub(height.max(1));
+        self.scroll_y = self.scroll_y.saturating_add_signed(delta).min(max_scroll);
+        self.follow_cursor = false;
+    }
+
+    fn refresh_highlights(&mut self) {
+        if self.highlighted_revision == self.revision {
+            return;
+        }
+
+        let syntax = taplo::parser::parse(&self.text).into_syntax();
+        self.highlights = syntax
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .map(|token| {
+                use taplo::syntax::SyntaxKind;
+
+                let kind = token.kind();
+                let is_key = token.parent().is_some_and(|parent| {
+                    parent
+                        .ancestors()
+                        .any(|ancestor| ancestor.kind() == SyntaxKind::KEY)
+                });
+                let style = toml_token_style(kind, is_key);
+                let range = token.text_range();
+                TomlHighlight {
+                    start: u32::from(range.start()) as usize,
+                    end: u32::from(range.end()) as usize,
+                    style,
+                }
+            })
+            .collect();
+        self.highlighted_revision = self.revision;
+    }
+}
+
+fn map_toml_edit_position(position: usize, edits: &[(usize, usize, String)]) -> usize {
+    let mut delta = 0isize;
+    for (start, end, replacement) in edits {
+        if position < *start {
+            break;
+        }
+        if position <= *end {
+            return start
+                .saturating_add_signed(delta)
+                .saturating_add(replacement.len());
+        }
+        delta += replacement.len() as isize - (*end - *start) as isize;
+    }
+    position.saturating_add_signed(delta)
+}
+
+fn toml_token_style(kind: taplo::syntax::SyntaxKind, is_key: bool) -> Style {
+    use taplo::syntax::SyntaxKind;
+
+    let base = Style::default().fg(Color::White).bg(SURFACE);
+    if is_key
+        && matches!(
+            kind,
+            SyntaxKind::IDENT
+                | SyntaxKind::IDENT_WITH_GLOB
+                | SyntaxKind::STRING
+                | SyntaxKind::MULTI_LINE_STRING
+                | SyntaxKind::STRING_LITERAL
+                | SyntaxKind::MULTI_LINE_STRING_LITERAL
+                | SyntaxKind::PERIOD
+        )
+    {
+        return base.fg(TOML_KEY).add_modifier(Modifier::BOLD);
+    }
+
+    match kind {
+        SyntaxKind::COMMENT => base.fg(TOML_COMMENT).add_modifier(Modifier::ITALIC),
+        SyntaxKind::STRING
+        | SyntaxKind::MULTI_LINE_STRING
+        | SyntaxKind::STRING_LITERAL
+        | SyntaxKind::MULTI_LINE_STRING_LITERAL => base.fg(TOML_STRING),
+        SyntaxKind::INTEGER
+        | SyntaxKind::INTEGER_HEX
+        | SyntaxKind::INTEGER_OCT
+        | SyntaxKind::INTEGER_BIN
+        | SyntaxKind::FLOAT => base.fg(TOML_NUMBER),
+        SyntaxKind::BOOL => base.fg(TOML_BOOLEAN).add_modifier(Modifier::BOLD),
+        SyntaxKind::DATE_TIME_OFFSET
+        | SyntaxKind::DATE_TIME_LOCAL
+        | SyntaxKind::DATE
+        | SyntaxKind::TIME => base.fg(TOML_DATE_TIME),
+        SyntaxKind::BRACKET_START
+        | SyntaxKind::BRACKET_END
+        | SyntaxKind::BRACE_START
+        | SyntaxKind::BRACE_END
+        | SyntaxKind::PERIOD
+        | SyntaxKind::COMMA
+        | SyntaxKind::EQ => base.fg(DIM),
+        SyntaxKind::ERROR => base
+            .fg(ERROR_COLOR)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        _ => base,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandFormMode {
     Add,
@@ -642,6 +1291,9 @@ enum Modal {
     },
     ConfirmDelete {
         name: String,
+    },
+    TomlEditor {
+        editor: TomlEditor,
     },
 }
 
@@ -753,10 +1405,13 @@ struct App {
     config_path: Option<PathBuf>,
     executable: PathBuf,
     tools: Vec<ToolItem>,
+    visible_tool_indices: Vec<usize>,
     tool_index: usize,
     tool_hitboxes: Vec<(Rect, usize)>,
+    tool_viewport: ListViewport,
     jobs: Vec<JobItem>,
     job_index: usize,
+    job_viewport: ListViewport,
     activity: Vec<String>,
     activity_timestamps: Vec<String>,
     activity_scroll: usize,
@@ -784,6 +1439,7 @@ struct App {
     doctor_diagnoses: Vec<doctor::ToolDiagnosis>,
     doctor_index: usize,
     doctor_hitboxes: Vec<(Rect, usize)>,
+    doctor_viewport: ListViewport,
     expanded_doctor: Option<String>,
     doctor_detail_scroll: usize,
     doctor_detail_area: Option<Rect>,
@@ -791,16 +1447,23 @@ struct App {
     doctor_probe_id: u64,
     next_doctor_probe_id: u64,
     doctor_checked_at: Option<String>,
+    settings: TuiSettings,
+    settings_index: usize,
+    settings_hitboxes: Vec<(Rect, usize)>,
     modal_input_hitboxes: Vec<ModalInputHitbox>,
     modal_drag: Option<(usize, usize)>,
+    toml_editor_hitbox: Option<TomlEditorHitbox>,
+    toml_editor_drag: Option<usize>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
+    ctrl_c_armed: bool,
     should_quit: bool,
 }
 
 impl App {
     fn new(state: StateDirs, config_path: Option<PathBuf>) -> Result<Self> {
         let executable = std::env::current_exe()?;
+        let settings = TuiSettings::load(&state.settings_path())?;
         let (tx, rx) = mpsc::channel();
         let started_at = datetime::now();
         let mut app = Self {
@@ -808,10 +1471,13 @@ impl App {
             config_path,
             executable,
             tools: Vec::new(),
+            visible_tool_indices: Vec::new(),
             tool_index: 0,
             tool_hitboxes: Vec::new(),
+            tool_viewport: ListViewport::default(),
             jobs: Vec::new(),
             job_index: 0,
+            job_viewport: ListViewport::default(),
             activity: vec![
                 "Welcome to dvup.".to_owned(),
                 "Select tools with Space and press Enter to update.".to_owned(),
@@ -842,6 +1508,7 @@ impl App {
             doctor_diagnoses: Vec::new(),
             doctor_index: 0,
             doctor_hitboxes: Vec::new(),
+            doctor_viewport: ListViewport::default(),
             expanded_doctor: None,
             doctor_detail_scroll: 0,
             doctor_detail_area: None,
@@ -849,18 +1516,28 @@ impl App {
             doctor_probe_id: 0,
             next_doctor_probe_id: 0,
             doctor_checked_at: None,
+            settings,
+            settings_index: 0,
+            settings_hitboxes: Vec::new(),
             modal_input_hitboxes: Vec::new(),
             modal_drag: None,
+            toml_editor_hitbox: None,
+            toml_editor_drag: None,
             tx,
             rx,
+            ctrl_c_armed: false,
             should_quit: false,
         };
         app.refresh_tools()?;
         app.refresh_jobs()?;
+        if app.settings.auto_diagnose_on_startup {
+            app.refresh_doctor()?;
+        }
         Ok(app)
     }
 
     fn refresh_tools(&mut self) -> Result<()> {
+        let focused_name = self.focused_tool().map(|tool| tool.name.clone());
         let previous: HashMap<_, _> = self
             .tools
             .iter()
@@ -873,22 +1550,17 @@ impl App {
             .collect();
         let (manifest, working_directory, _) =
             cli::load_manifest(self.config_path.clone(), &self.state)?;
-        let custom_names = load_custom_names(&self.state)?;
+        let tool_kinds = load_tool_kinds(&self.state, self.config_path.as_deref())?;
         self.tools = manifest
             .tools
             .into_iter()
             .map(|(name, tool)| {
-                let command_spec = CommandSpec {
-                    program: tool.program.clone(),
-                    args: tool.args.clone(),
-                    working_directory: working_directory.clone(),
-                };
-                let availability = if !tool.supports_current_platform() {
-                    Availability::Unsupported
-                } else if command::is_available(&command_spec) {
-                    Availability::Installed
-                } else {
-                    Availability::Missing
+                let probe_command = command::probe_spec(&tool, &working_directory);
+                let availability = match command::tool_readiness(&tool, &working_directory) {
+                    command::ToolReadiness::Unsupported => Availability::Unsupported,
+                    command::ToolReadiness::TargetMissing => Availability::Missing,
+                    command::ToolReadiness::UpdaterMissing => Availability::UpdaterMissing,
+                    command::ToolReadiness::Installed => Availability::Installed,
                 };
                 let (selected, run_state, elapsed) =
                     previous
@@ -896,11 +1568,9 @@ impl App {
                         .copied()
                         .unwrap_or((false, RunState::Idle, None));
                 let actual_command = format_command(&tool.program, &tool.args);
-                let version_command =
-                    version_command_for_tool(&name, &tool, working_directory.clone());
                 ToolItem {
                     command: cli::display_command(&name, &actual_command),
-                    custom: custom_names.contains(&name),
+                    kind: tool_kinds.get(&name).copied().unwrap_or(ToolKind::BuiltIn),
                     name,
                     availability,
                     version: if availability == Availability::Unsupported {
@@ -908,7 +1578,7 @@ impl App {
                     } else {
                         VersionState::Loading
                     },
-                    version_command,
+                    version_command: probe_command,
                     version_probe_id: 0,
                     selected,
                     run_state,
@@ -916,13 +1586,62 @@ impl App {
                 }
             })
             .collect();
-        self.tool_index = self.tool_index.min(self.tools.len().saturating_sub(1));
+        self.rebuild_visible_tool_indices(focused_name.as_deref());
         for index in 0..self.tools.len() {
-            if self.tools[index].availability != Availability::Unsupported {
+            if matches!(
+                self.tools[index].availability,
+                Availability::Installed | Availability::UpdaterMissing
+            ) {
                 self.start_version_probe(index);
             }
         }
         Ok(())
+    }
+
+    fn rebuild_visible_tool_indices(&mut self, preferred_name: Option<&str>) {
+        let previous_position = self.tool_index;
+        let hide_unavailable = self.settings.hide_unsupported_and_missing_tools;
+        self.visible_tool_indices = self
+            .tools
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tool)| {
+                let hidden = hide_unavailable
+                    && matches!(
+                        tool.availability,
+                        Availability::Unsupported | Availability::Missing
+                    );
+                (!hidden).then_some(index)
+            })
+            .collect();
+        self.tool_index = preferred_name
+            .and_then(|name| {
+                self.visible_tool_indices
+                    .iter()
+                    .position(|&index| self.tools[index].name == name)
+            })
+            .unwrap_or_else(|| {
+                previous_position.min(self.visible_tool_indices.len().saturating_sub(1))
+            });
+    }
+
+    fn focused_tool_index(&self) -> Option<usize> {
+        self.visible_tool_indices.get(self.tool_index).copied()
+    }
+
+    fn focused_tool(&self) -> Option<&ToolItem> {
+        self.focused_tool_index()
+            .and_then(|index| self.tools.get(index))
+    }
+
+    fn focus_tool_named(&mut self, name: &str) {
+        if let Some(position) = self
+            .visible_tool_indices
+            .iter()
+            .position(|&index| self.tools[index].name == name)
+        {
+            self.tool_index = position;
+        }
     }
 
     fn start_version_probe(&mut self, index: usize) {
@@ -943,7 +1662,10 @@ impl App {
 
     fn refresh_tool_version(&mut self, name: &str) {
         if let Some(index) = self.tools.iter().position(|tool| tool.name == name)
-            && self.tools[index].availability != Availability::Unsupported
+            && matches!(
+                self.tools[index].availability,
+                Availability::Installed | Availability::UpdaterMissing
+            )
         {
             self.start_version_probe(index);
         }
@@ -951,24 +1673,96 @@ impl App {
 
     fn select_tab(&mut self, tab: Tab) {
         self.tab = tab;
-        if tab == Tab::Doctor
-            && self.doctor_probe_id == 0
-            && let Err(error) = self.refresh_doctor()
-        {
-            self.message = match self.language {
-                Language::English => format!("Diagnostics failed: {error}"),
-                Language::Chinese => format!("诊断失败：{error}"),
-            };
+        if tab == Tab::Doctor && self.doctor_never_scanned() {
+            self.message = self
+                .language
+                .text(
+                    "Diagnostics have not been run. Press Enter to scan",
+                    "尚未运行诊断，按 Enter 开始扫描",
+                )
+                .to_owned();
         }
     }
 
+    fn doctor_never_scanned(&self) -> bool {
+        !self.doctor_loading && self.doctor_checked_at.is_none() && self.doctor_diagnoses.is_empty()
+    }
+
+    fn toggle_setting(&mut self, index: usize) {
+        match index {
+            0 => {
+                let previous = self.settings.auto_diagnose_on_startup;
+                self.settings.auto_diagnose_on_startup = !previous;
+                if let Err(error) = self.settings.save(&self.state.settings_path()) {
+                    self.settings.auto_diagnose_on_startup = previous;
+                    self.report_settings_save_error(error);
+                    return;
+                }
+                self.message = match (self.settings.auto_diagnose_on_startup, self.language) {
+                    (true, Language::English) => {
+                        "Automatic startup diagnostics enabled; applies next time TUI starts"
+                            .to_owned()
+                    }
+                    (true, Language::Chinese) => {
+                        "已启用启动自动诊断；下次进入 TUI 时生效".to_owned()
+                    }
+                    (false, Language::English) => {
+                        "Automatic startup diagnostics disabled".to_owned()
+                    }
+                    (false, Language::Chinese) => "已关闭启动自动诊断".to_owned(),
+                };
+            }
+            1 => {
+                let focused_name = self.focused_tool().map(|tool| tool.name.clone());
+                let previous = self.settings.hide_unsupported_and_missing_tools;
+                self.settings.hide_unsupported_and_missing_tools = !previous;
+                if let Err(error) = self.settings.save(&self.state.settings_path()) {
+                    self.settings.hide_unsupported_and_missing_tools = previous;
+                    self.report_settings_save_error(error);
+                    return;
+                }
+                self.rebuild_visible_tool_indices(focused_name.as_deref());
+                self.message = match (
+                    self.settings.hide_unsupported_and_missing_tools,
+                    self.language,
+                ) {
+                    (true, Language::English) => {
+                        "Unsupported and uninstalled tools are now hidden".to_owned()
+                    }
+                    (true, Language::Chinese) => "已隐藏不支持或未安装的工具".to_owned(),
+                    (false, Language::English) => "All configured tools are now shown".to_owned(),
+                    (false, Language::Chinese) => "已显示全部配置工具".to_owned(),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn report_settings_save_error(&mut self, error: Error) {
+        self.message = match self.language {
+            Language::English => format!("Could not save settings: {error}"),
+            Language::Chinese => format!("无法保存设置：{error}"),
+        };
+    }
+
     fn refresh_doctor(&mut self) -> Result<()> {
+        if self.doctor_loading {
+            self.message = self
+                .language
+                .text("Diagnostics are already running", "诊断正在进行中，请稍候")
+                .to_owned();
+            return Ok(());
+        }
         let (manifest, working_directory, _) =
             cli::load_manifest(self.config_path.clone(), &self.state)?;
         self.next_doctor_probe_id = self.next_doctor_probe_id.wrapping_add(1).max(1);
         let probe_id = self.next_doctor_probe_id;
         self.doctor_probe_id = probe_id;
         self.doctor_loading = true;
+        self.message = self
+            .language
+            .text("Scanning installation conflicts…", "正在扫描安装冲突…")
+            .to_owned();
         let tx = self.tx.clone();
         thread::spawn(move || {
             let (diagnoses, error) = match doctor::diagnose(&manifest, &working_directory, None) {
@@ -1022,7 +1816,6 @@ impl App {
             })
             .map(|job| job.name.clone())
             .collect::<HashSet<_>>();
-        let should_refresh_doctor = !completed_tools.is_empty() && self.doctor_probe_id > 0;
         self.jobs = jobs;
         self.job_index = self.job_index.min(self.jobs.len().saturating_sub(1));
         if let Some(id) = self.expanded_job.clone() {
@@ -1037,9 +1830,6 @@ impl App {
         }
         for name in completed_tools {
             self.refresh_tool_version(&name);
-        }
-        if should_refresh_doctor {
-            self.refresh_doctor()?;
         }
         self.last_job_refresh = Instant::now();
         Ok(())
@@ -1165,22 +1955,9 @@ impl App {
                             };
                             self.push_activity(line);
                         }
-                        if self.doctor_probe_id > 0
-                            && let Err(error) = self.refresh_doctor()
-                        {
-                            let line = match self.language {
-                                Language::English => {
-                                    format!("diagnostics refresh failed: {error}")
-                                }
-                                Language::Chinese => format!("诊断刷新失败：{error}"),
-                            };
-                            self.push_activity(line);
-                        }
                     }
                     if matches!(operation, Operation::Add | Operation::Edit) && success {
-                        if let Some(index) = self.tools.iter().position(|tool| tool.name == name) {
-                            self.tool_index = index;
-                        }
+                        self.focus_tool_named(&name);
                     }
                     self.message = operation.completion_message(
                         &name,
@@ -1281,6 +2058,10 @@ impl App {
             .iter()
             .filter(|tool| tool.run_state == RunState::Failed)
             .count();
+        let self_update_queued = self
+            .tools
+            .iter()
+            .any(|tool| tool.name == "dvup" && tool.run_state == RunState::Queued);
         let summary = match self.language {
             Language::English => format!(
                 "Complete: {updated} updated, {queued} queued, {failed} failed ({} total) in {:.1}s",
@@ -1294,7 +2075,14 @@ impl App {
             ),
         };
         self.push_activity(format!("\n=== {summary} ==="));
-        self.message = if failed == 0 {
+        self.message = if self_update_queued {
+            self.language
+                .text(
+                    "dvup self-update is queued; exit dvup to let the worker replace it",
+                    "dvup 自更新已排队；请退出 dvup，让后台任务完成替换",
+                )
+                .to_owned()
+        } else if failed == 0 {
             summary
         } else {
             match self.language {
@@ -1304,14 +2092,6 @@ impl App {
                 Language::Chinese => format!("{summary}。请在活动页查看命令输出和错误"),
             }
         };
-        if self.doctor_probe_id > 0
-            && let Err(error) = self.refresh_doctor()
-        {
-            self.push_activity(match self.language {
-                Language::English => format!("diagnostics refresh failed: {error}"),
-                Language::Chinese => format!("诊断刷新失败：{error}"),
-            });
-        }
     }
 
     fn push_activity(&mut self, line: String) {
@@ -1351,8 +2131,7 @@ impl App {
         if !selected.is_empty() {
             return selected;
         }
-        self.tools
-            .get(self.tool_index)
+        self.focused_tool()
             .filter(|tool| {
                 tool.availability == Availability::Installed && tool.run_state != RunState::Running
             })
@@ -1432,17 +2211,20 @@ impl App {
                 .to_owned();
             return;
         }
-        let Some(selected) = self.tools.get(self.tool_index).cloned() else {
+        let Some(selected) = self.focused_tool().cloned() else {
             return;
         };
-        if !selected.custom {
-            self.message = self
-                .language
-                .text("Built-in tools cannot be edited", "不能编辑内置工具")
-                .to_owned();
-            return;
+        match selected.kind {
+            ToolKind::BuiltIn => {
+                self.message = self
+                    .language
+                    .text("Built-in tools cannot be edited", "不能编辑内置工具")
+                    .to_owned();
+                return;
+            }
+            ToolKind::Custom => {}
         }
-        let custom = match Config::load(&self.state.custom_config_path()) {
+        let custom = match UserConfig::load(&self.state.custom_config_path()) {
             Ok(custom) => custom,
             Err(error) => {
                 self.message = match self.language {
@@ -1459,12 +2241,88 @@ impl App {
                 .to_owned();
             return;
         };
+        let (program, args) = tool
+            .update
+            .split_first()
+            .expect("validated user update command");
         self.modal = Modal::AddCommand {
             mode: CommandFormMode::Edit,
             original_name: Some(selected.name.clone()),
             field: 1,
             name: TextInput::new(selected.name),
-            command: TextInput::new(format_editable_command(&tool.program, &tool.args)),
+            command: TextInput::new(format_editable_command(program, args)),
+        };
+    }
+
+    fn toml_editor_path(&self) -> Result<PathBuf> {
+        if let Some(path) = &self.config_path {
+            return Ok(path.clone());
+        }
+        Ok(self.state.custom_config_path())
+    }
+
+    fn toml_editor_text(&self, path: &Path) -> Result<String> {
+        if path.is_file() {
+            return Ok(std::fs::read_to_string(path)?);
+        }
+
+        let selected_name = self
+            .focused_tool()
+            .map(|tool| tool.name.clone())
+            .ok_or_else(|| Error::Message("no tool is selected".to_owned()))?;
+        let (manifest, _, _) = cli::load_manifest(self.config_path.clone(), &self.state)?;
+        let selected = manifest
+            .tools
+            .get(&selected_name)
+            .cloned()
+            .ok_or_else(|| Error::ToolNotFound(selected_name.clone()))?;
+        let mut seed = UserConfig::empty();
+        seed.tools.insert(
+            selected_name.clone(),
+            UserTool::from_tool(&selected_name, &selected),
+        );
+        Ok(toml::to_string(&seed)?)
+    }
+
+    fn open_toml_editor(&mut self) {
+        if self.running > 0 {
+            self.message = self
+                .language
+                .text(
+                    "Wait for the current operation before editing TOML",
+                    "请等待当前操作完成后再编辑 TOML",
+                )
+                .to_owned();
+            return;
+        }
+        let result = self
+            .toml_editor_path()
+            .and_then(|path| self.toml_editor_text(&path).map(|text| (path, text)));
+        match result {
+            Ok((path, text)) => self.show_toml_editor(path, text),
+            Err(error) => {
+                self.message = match self.language {
+                    Language::English => format!("Could not open TOML editor: {error}"),
+                    Language::Chinese => format!("无法打开 TOML 编辑器：{error}"),
+                };
+            }
+        }
+    }
+
+    fn open_toml_file(&mut self, path: PathBuf) -> Result<()> {
+        let text = std::fs::read_to_string(&path)?;
+        self.config_path = Some(path.clone());
+        self.show_toml_editor(path, text);
+        Ok(())
+    }
+
+    fn show_toml_editor(&mut self, path: PathBuf, text: String) {
+        self.message = match self.language {
+            Language::English => format!("Editing {}", path.display()),
+            Language::Chinese => format!("正在编辑 {}", path.display()),
+        };
+        self.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(path, text),
         };
     }
 
@@ -1612,15 +2470,76 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(TICK_RATE)? {
-            let event = event::read()?;
-            match event {
-                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key),
-                Event::Mouse(mouse) => handle_mouse(app, mouse),
-                _ => {}
+            let mut events = vec![event::read()?];
+            while event::poll(Duration::ZERO)? {
+                events.push(event::read()?);
             }
+            handle_event_batch(app, events);
         }
     }
     Ok(0)
+}
+
+fn handle_event_batch(app: &mut App, events: impl IntoIterator<Item = Event>) {
+    let mut pending_editor_text = String::new();
+
+    for event in events {
+        if matches!(&event, Event::Key(key) if key.kind == KeyEventKind::Release) {
+            continue;
+        }
+        if matches!(app.modal, Modal::TomlEditor { .. })
+            && let Some(character) = toml_editor_input_character(&event)
+        {
+            pending_editor_text.push(character);
+            continue;
+        }
+        flush_toml_editor_input(app, &mut pending_editor_text);
+        dispatch_event(app, event);
+    }
+
+    flush_toml_editor_input(app, &mut pending_editor_text);
+}
+
+fn toml_editor_input_character(event: &Event) -> Option<char> {
+    let Event::Key(key) = event else {
+        return None;
+    };
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(character) => Some(character),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
+    }
+}
+
+fn flush_toml_editor_input(app: &mut App, pending: &mut String) {
+    if pending.is_empty() {
+        return;
+    }
+    if let Modal::TomlEditor { editor } = &mut app.modal {
+        editor.insert_text(pending);
+    }
+    pending.clear();
+}
+
+fn dispatch_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
+        Event::Paste(text) => handle_paste(app, &text),
+        Event::Mouse(mouse) => handle_mouse(app, mouse),
+        Event::Resize(_, _) => {
+            if let Modal::TomlEditor { editor } = &mut app.modal {
+                editor.follow_cursor = true;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -1629,9 +2548,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     if is_ctrl_c(&key) {
-        request_quit(app);
+        request_ctrl_c_quit(app);
         return;
     }
+    app.ctrl_c_armed = false;
     if is_shift_tab(&key) {
         toggle_process_strategy(app);
         return;
@@ -1693,6 +2613,10 @@ fn handle_text_input_key(input: &mut TextInput, key: KeyEvent) -> bool {
 }
 
 fn handle_modal_key(app: &mut App, key: KeyEvent) {
+    if matches!(app.modal, Modal::TomlEditor { .. }) {
+        handle_toml_editor_key(app, key);
+        return;
+    }
     let key = if is_ctrl_c(&key) {
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
     } else {
@@ -1819,8 +2743,190 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 command,
             };
         }
+        Modal::TomlEditor { .. } => unreachable!("TOML editor keys are handled first"),
         Modal::None => {}
     }
+}
+
+fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
+    let mut editor = match std::mem::replace(&mut app.modal, Modal::None) {
+        Modal::TomlEditor { editor } => editor,
+        modal => {
+            app.modal = modal;
+            return;
+        }
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let extend_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    match key.code {
+        KeyCode::Esc => {
+            app.modal = Modal::None;
+            app.toml_editor_hitbox = None;
+            app.toml_editor_drag = None;
+            app.message = app
+                .language
+                .text("TOML editor closed", "已关闭 TOML 编辑器")
+                .to_owned();
+            return;
+        }
+        KeyCode::Char('z' | 'Z') if ctrl && extend_selection => {
+            app.message = if editor.redo() {
+                app.language
+                    .text("Redid TOML edit", "已重做 TOML 编辑")
+                    .to_owned()
+            } else {
+                app.language
+                    .text("Nothing to redo", "没有可重做的编辑")
+                    .to_owned()
+            };
+        }
+        KeyCode::Char('z' | 'Z') if ctrl => {
+            app.message = if editor.undo() {
+                app.language
+                    .text("Undid TOML edit", "已撤销 TOML 编辑")
+                    .to_owned()
+            } else {
+                app.language
+                    .text("Nothing to undo", "没有可撤销的编辑")
+                    .to_owned()
+            };
+        }
+        KeyCode::Char('y' | 'Y') if ctrl => {
+            app.message = if editor.redo() {
+                app.language
+                    .text("Redid TOML edit", "已重做 TOML 编辑")
+                    .to_owned()
+            } else {
+                app.language
+                    .text("Nothing to redo", "没有可重做的编辑")
+                    .to_owned()
+            };
+        }
+        KeyCode::Char('/') if ctrl => {
+            app.message = match editor.toggle_line_comments() {
+                Some(TomlCommentAction::Commented) => app
+                    .language
+                    .text("Commented TOML line(s)", "已注释 TOML 行")
+                    .to_owned(),
+                Some(TomlCommentAction::Uncommented) => app
+                    .language
+                    .text("Uncommented TOML line(s)", "已取消 TOML 行注释")
+                    .to_owned(),
+                None => app
+                    .language
+                    .text("No TOML line to comment", "没有可注释的 TOML 行")
+                    .to_owned(),
+            };
+        }
+        KeyCode::Char('s' | 'S') if ctrl => match UserConfig::save_text(&editor.path, &editor.text)
+        {
+            Ok(()) => {
+                editor.mark_saved();
+                app.message = match app.refresh_tools() {
+                    Ok(()) => match app.language {
+                        Language::English => format!("Saved {}", editor.path.display()),
+                        Language::Chinese => format!("已保存 {}", editor.path.display()),
+                    },
+                    Err(error) => match app.language {
+                        Language::English => format!("TOML saved but refresh failed: {error}"),
+                        Language::Chinese => format!("TOML 已保存，但刷新失败：{error}"),
+                    },
+                };
+            }
+            Err(error) => {
+                app.message = match app.language {
+                    Language::English => format!("TOML was not saved: {error}"),
+                    Language::Chinese => format!("TOML 未保存：{error}"),
+                };
+            }
+        },
+        KeyCode::Char('c' | 'C') if ctrl => {
+            let Some(selected) = editor.selected_text() else {
+                app.message = app
+                    .language
+                    .text(
+                        "Select TOML text before copying",
+                        "请先选择要复制的 TOML 文本",
+                    )
+                    .to_owned();
+                app.modal = Modal::TomlEditor { editor };
+                return;
+            };
+            match arboard::Clipboard::new()
+                .and_then(|mut clipboard| clipboard.set_text(selected.to_owned()))
+            {
+                Ok(()) => {
+                    app.message = app
+                        .language
+                        .text("Copied selection", "已复制选区")
+                        .to_owned()
+                }
+                Err(error) => {
+                    app.message = match app.language {
+                        Language::English => format!("Could not copy selection: {error}"),
+                        Language::Chinese => format!("无法复制选区：{error}"),
+                    }
+                }
+            }
+        }
+        KeyCode::Char('v' | 'V') if ctrl => {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(text) => {
+                    editor.insert_text(&text);
+                    app.message = app
+                        .language
+                        .text("Pasted clipboard text", "已粘贴剪贴板文本")
+                        .to_owned();
+                }
+                Err(error) => {
+                    app.message = match app.language {
+                        Language::English => format!("Could not paste clipboard text: {error}"),
+                        Language::Chinese => format!("无法粘贴剪贴板文本：{error}"),
+                    }
+                }
+            }
+        }
+        KeyCode::Char('a' | 'A') if ctrl => editor.select_all(),
+        KeyCode::Left => editor.move_left(extend_selection),
+        KeyCode::Right => editor.move_right(extend_selection),
+        KeyCode::Up => editor.move_vertical(-1, extend_selection),
+        KeyCode::Down => editor.move_vertical(1, extend_selection),
+        KeyCode::Home => editor.move_home(ctrl, extend_selection),
+        KeyCode::End => editor.move_end(ctrl, extend_selection),
+        KeyCode::PageUp => {
+            if let Some(hitbox) = app.toml_editor_hitbox {
+                let page = usize::from(hitbox.area.height).saturating_sub(1).max(1);
+                editor.move_vertical(-(page as isize), extend_selection);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(hitbox) = app.toml_editor_hitbox {
+                let page = usize::from(hitbox.area.height).saturating_sub(1).max(1);
+                editor.move_vertical(page as isize, extend_selection);
+            }
+        }
+        KeyCode::Backspace => editor.backspace(),
+        KeyCode::Delete => editor.delete(),
+        KeyCode::Enter => editor.insert_text("\n"),
+        KeyCode::Tab => editor.insert_text("\t"),
+        KeyCode::Char(character) if !ctrl && !alt => editor.insert_text(&character.to_string()),
+        _ => {}
+    }
+
+    app.modal = Modal::TomlEditor { editor };
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    let Modal::TomlEditor { editor } = &mut app.modal else {
+        return;
+    };
+    editor.insert_text(text);
+    app.message = app
+        .language
+        .text("Pasted terminal text", "已粘贴终端文本")
+        .to_owned();
 }
 
 fn handle_normal_key(app: &mut App, key: KeyEvent) {
@@ -1832,12 +2938,11 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => request_quit(app),
         KeyCode::Char('r') | KeyCode::Char('R') => {
+            if app.tab == Tab::Doctor {
+                request_doctor_refresh(app);
+                return;
+            }
             let refresh = app.refresh_tools().and_then(|_| app.refresh_jobs());
-            let refresh = if refresh.is_ok() && app.doctor_probe_id > 0 {
-                app.refresh_doctor()
-            } else {
-                refresh
-            };
             if let Err(error) = refresh {
                 app.message = match app.language {
                     Language::English => format!("Refresh failed: {error}"),
@@ -1852,7 +2957,17 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
             Tab::Activity => handle_activity_key(app, key),
             Tab::Jobs => handle_jobs_key(app, key),
             Tab::Doctor => handle_doctor_key(app, key),
+            Tab::Settings => handle_settings_key(app, key),
         },
+    }
+}
+
+fn request_doctor_refresh(app: &mut App) {
+    if let Err(error) = app.refresh_doctor() {
+        app.message = match app.language {
+            Language::English => format!("Diagnostics failed: {error}"),
+            Language::Chinese => format!("诊断失败：{error}"),
+        };
     }
 }
 
@@ -1940,17 +3055,27 @@ fn request_quit(app: &mut App) {
     } else {
         app.message = match app.language {
             Language::English => format!(
-                "Wait for {} running operation(s) before quitting with q or Ctrl+C",
+                "Wait for {} running operation(s) before quitting with q",
                 app.running
             ),
             Language::Chinese => {
-                format!(
-                    "请等待 {} 项运行中的操作结束后再按 q 或 Ctrl+C 退出",
-                    app.running
-                )
+                format!("请等待 {} 项运行中的操作结束后再按 q 退出", app.running)
             }
         };
     }
+}
+
+fn request_ctrl_c_quit(app: &mut App) {
+    if app.ctrl_c_armed {
+        app.should_quit = true;
+        return;
+    }
+
+    app.ctrl_c_armed = true;
+    app.message = app
+        .language
+        .text("Press Ctrl+C again to quit", "再次按 Ctrl+C 退出")
+        .to_owned();
 }
 
 fn navigated_tab(tab: Tab, code: &KeyCode) -> Option<Tab> {
@@ -1964,10 +3089,10 @@ fn navigated_tab(tab: Tab, code: &KeyCode) -> Option<Tab> {
 fn handle_tools_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
-            app.tool_index = previous_index(app.tool_index, app.tools.len());
+            app.tool_index = previous_index(app.tool_index, app.visible_tool_indices.len());
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.tool_index = next_index(app.tool_index, app.tools.len());
+            app.tool_index = next_index(app.tool_index, app.visible_tool_indices.len());
         }
         KeyCode::Char(' ') => {
             toggle_tool_selection(app, app.tool_index);
@@ -2032,6 +3157,7 @@ fn handle_tools_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('e') | KeyCode::Char('E') => app.open_edit_command(),
+        KeyCode::Char('t') | KeyCode::Char('T') => app.open_toml_editor(),
         KeyCode::Char('d') | KeyCode::Char('D') => {
             if app.running > 0 {
                 app.message = app
@@ -2043,16 +3169,29 @@ fn handle_tools_key(app: &mut App, key: KeyEvent) {
                     .to_owned();
                 return;
             }
-            if let Some(tool) = app.tools.get(app.tool_index) {
-                if tool.custom {
-                    app.modal = Modal::ConfirmDelete {
-                        name: tool.name.clone(),
-                    };
-                } else {
-                    app.message = app
-                        .language
-                        .text("Built-in tools cannot be deleted", "不能删除内置工具")
-                        .to_owned();
+            if app.config_path.is_some() {
+                app.message = app
+                    .language
+                    .text(
+                        "Delete custom tools from the explicit TOML editor (t)",
+                        "请在显式 TOML 编辑器（t）中删除自定义工具",
+                    )
+                    .to_owned();
+                return;
+            }
+            if let Some(tool) = app.focused_tool() {
+                match tool.kind {
+                    ToolKind::Custom => {
+                        app.modal = Modal::ConfirmDelete {
+                            name: tool.name.clone(),
+                        };
+                    }
+                    ToolKind::BuiltIn => {
+                        app.message = app
+                            .language
+                            .text("Built-in tools cannot be deleted", "不能删除内置工具")
+                            .to_owned();
+                    }
                 }
             }
         }
@@ -2061,7 +3200,10 @@ fn handle_tools_key(app: &mut App, key: KeyEvent) {
 }
 
 fn toggle_tool_selection(app: &mut App, index: usize) {
-    let Some(tool) = app.tools.get_mut(index) else {
+    let Some(tool_index) = app.visible_tool_indices.get(index).copied() else {
+        return;
+    };
+    let Some(tool) = app.tools.get_mut(tool_index) else {
         return;
     };
     if tool.availability == Availability::Installed {
@@ -2130,6 +3272,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         app.doctor_index = index;
                     }
                 }
+                Tab::Settings => {
+                    if let Some(index) =
+                        hitbox_target(&app.settings_hitboxes, mouse.column, mouse.row)
+                    {
+                        app.settings_index = index;
+                    }
+                }
             }
         }
         MouseEventKind::Down(MouseButton::Left) => match app.tab {
@@ -2159,32 +3308,129 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     app.toggle_doctor_detail();
                 }
             }
+            Tab::Settings => {
+                if let Some(index) = hitbox_target(&app.settings_hitboxes, mouse.column, mouse.row)
+                {
+                    app.settings_index = index;
+                    app.toggle_setting(index);
+                }
+            }
         },
         MouseEventKind::ScrollUp => match app.tab {
-            Tab::Activity => app.activity_scroll = app.activity_scroll.saturating_sub(3),
-            Tab::Jobs if contains(app.job_detail_area, mouse.column, mouse.row) => {
-                app.job_log_scroll = app.job_log_scroll.saturating_sub(3);
+            Tab::Activity => {
+                app.activity_scroll = app
+                    .activity_scroll
+                    .saturating_sub(MOUSE_WHEEL_ROWS as usize);
             }
-            Tab::Doctor if contains(app.doctor_detail_area, mouse.column, mouse.row) => {
-                app.doctor_detail_scroll = app.doctor_detail_scroll.saturating_sub(3);
+            Tab::Tools => {
+                app.tool_index = app
+                    .tool_viewport
+                    .scroll_at(mouse.column, mouse.row, -MOUSE_WHEEL_ROWS)
+                    .unwrap_or_else(|| {
+                        scrolled_index(
+                            app.tool_index,
+                            app.visible_tool_indices.len(),
+                            -MOUSE_WHEEL_ROWS,
+                        )
+                    });
             }
-            _ => {}
+            Tab::Jobs => {
+                if contains(app.job_detail_area, mouse.column, mouse.row) {
+                    app.job_log_scroll =
+                        app.job_log_scroll.saturating_sub(MOUSE_WHEEL_ROWS as usize);
+                } else {
+                    app.job_index = app
+                        .job_viewport
+                        .scroll_at(mouse.column, mouse.row, -MOUSE_WHEEL_ROWS)
+                        .unwrap_or_else(|| {
+                            scrolled_index(app.job_index, app.jobs.len(), -MOUSE_WHEEL_ROWS)
+                        });
+                }
+            }
+            Tab::Doctor => {
+                if contains(app.doctor_detail_area, mouse.column, mouse.row) {
+                    app.doctor_detail_scroll = app
+                        .doctor_detail_scroll
+                        .saturating_sub(MOUSE_WHEEL_ROWS as usize);
+                } else {
+                    app.doctor_index = app
+                        .doctor_viewport
+                        .scroll_at(mouse.column, mouse.row, -MOUSE_WHEEL_ROWS)
+                        .unwrap_or_else(|| {
+                            scrolled_index(
+                                app.doctor_index,
+                                app.doctor_diagnoses.len(),
+                                -MOUSE_WHEEL_ROWS,
+                            )
+                        });
+                }
+            }
+            Tab::Settings => {
+                app.settings_index = scrolled_index(app.settings_index, 2, -1);
+            }
         },
         MouseEventKind::ScrollDown => match app.tab {
-            Tab::Activity => app.activity_scroll = app.activity_scroll.saturating_add(3),
-            Tab::Jobs if contains(app.job_detail_area, mouse.column, mouse.row) => {
-                app.job_log_scroll = app.job_log_scroll.saturating_add(3);
+            Tab::Activity => {
+                app.activity_scroll = app
+                    .activity_scroll
+                    .saturating_add(MOUSE_WHEEL_ROWS as usize);
             }
-            Tab::Doctor if contains(app.doctor_detail_area, mouse.column, mouse.row) => {
-                app.doctor_detail_scroll = app.doctor_detail_scroll.saturating_add(3);
+            Tab::Tools => {
+                app.tool_index = app
+                    .tool_viewport
+                    .scroll_at(mouse.column, mouse.row, MOUSE_WHEEL_ROWS)
+                    .unwrap_or_else(|| {
+                        scrolled_index(
+                            app.tool_index,
+                            app.visible_tool_indices.len(),
+                            MOUSE_WHEEL_ROWS,
+                        )
+                    });
             }
-            _ => {}
+            Tab::Jobs => {
+                if contains(app.job_detail_area, mouse.column, mouse.row) {
+                    app.job_log_scroll =
+                        app.job_log_scroll.saturating_add(MOUSE_WHEEL_ROWS as usize);
+                } else {
+                    app.job_index = app
+                        .job_viewport
+                        .scroll_at(mouse.column, mouse.row, MOUSE_WHEEL_ROWS)
+                        .unwrap_or_else(|| {
+                            scrolled_index(app.job_index, app.jobs.len(), MOUSE_WHEEL_ROWS)
+                        });
+                }
+            }
+            Tab::Doctor => {
+                if contains(app.doctor_detail_area, mouse.column, mouse.row) {
+                    app.doctor_detail_scroll = app
+                        .doctor_detail_scroll
+                        .saturating_add(MOUSE_WHEEL_ROWS as usize);
+                } else {
+                    app.doctor_index = app
+                        .doctor_viewport
+                        .scroll_at(mouse.column, mouse.row, MOUSE_WHEEL_ROWS)
+                        .unwrap_or_else(|| {
+                            scrolled_index(
+                                app.doctor_index,
+                                app.doctor_diagnoses.len(),
+                                MOUSE_WHEEL_ROWS,
+                            )
+                        });
+                }
+            }
+            Tab::Settings => {
+                app.settings_index = scrolled_index(app.settings_index, 2, 1);
+            }
         },
         _ => {}
     }
 }
 
 fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
+    if matches!(app.modal, Modal::TomlEditor { .. }) {
+        handle_toml_editor_mouse(app, mouse);
+        return;
+    }
     let hitbox = app
         .modal_input_hitboxes
         .iter()
@@ -2253,6 +3499,85 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
+fn handle_toml_editor_mouse(app: &mut App, mouse: MouseEvent) {
+    let Some(hitbox) = app.toml_editor_hitbox else {
+        return;
+    };
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if contains(Some(hitbox.area), mouse.column, mouse.row)
+                && let Modal::TomlEditor { editor } = &mut app.modal
+            {
+                editor.scroll_vertical(-MOUSE_WHEEL_ROWS, usize::from(hitbox.area.height));
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if contains(Some(hitbox.area), mouse.column, mouse.row)
+                && let Modal::TomlEditor { editor } = &mut app.modal
+            {
+                editor.scroll_vertical(MOUSE_WHEEL_ROWS, usize::from(hitbox.area.height));
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !contains(Some(hitbox.area), mouse.column, mouse.row) {
+                app.toml_editor_drag = None;
+                return;
+            }
+            let Some(target) = toml_editor_cursor_at(app, hitbox, mouse.column, mouse.row) else {
+                return;
+            };
+            if let Modal::TomlEditor { editor } = &mut app.modal {
+                editor.move_to(target, false);
+                editor.preferred_column = None;
+                app.toml_editor_drag = Some(target);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(anchor) = app.toml_editor_drag else {
+                return;
+            };
+            let column = mouse
+                .column
+                .clamp(hitbox.area.x, hitbox.area.right().saturating_sub(1));
+            let row = mouse
+                .row
+                .clamp(hitbox.area.y, hitbox.area.bottom().saturating_sub(1));
+            let Some(target) = toml_editor_cursor_at(app, hitbox, column, row) else {
+                return;
+            };
+            if let Modal::TomlEditor { editor } = &mut app.modal {
+                editor.cursor = target;
+                editor.selection_anchor = (target != anchor).then_some(anchor);
+                editor.preferred_column = None;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => app.toml_editor_drag = None,
+        _ => {}
+    }
+}
+
+fn toml_editor_cursor_at(
+    app: &App,
+    hitbox: TomlEditorHitbox,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let Modal::TomlEditor { editor } = &app.modal else {
+        return None;
+    };
+    if hitbox.area.is_empty() {
+        return None;
+    }
+    let line = editor
+        .scroll_y
+        .saturating_add(usize::from(row.saturating_sub(hitbox.area.y)))
+        .min(editor.line_ranges().len().saturating_sub(1));
+    let display_column = editor
+        .scroll_x
+        .saturating_add(usize::from(column.saturating_sub(hitbox.area.x)));
+    Some(editor.byte_at_column(line, display_column))
+}
+
 fn modal_field_is_editable(modal: &Modal, _field: usize) -> bool {
     matches!(modal, Modal::AddCommand { .. })
 }
@@ -2293,6 +3618,15 @@ fn hitbox_target(hitboxes: &[(Rect, usize)], column: u16, row: u16) -> Option<us
         .find_map(|(area, target)| contains(Some(*area), column, row).then_some(*target))
 }
 
+fn scrolled_index(current: usize, length: usize, delta: isize) -> usize {
+    if length == 0 {
+        return 0;
+    }
+    current
+        .saturating_add_signed(delta)
+        .min(length.saturating_sub(1))
+}
+
 fn handle_jobs_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -2320,6 +3654,9 @@ fn handle_doctor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => {
             app.doctor_index = next_index(app.doctor_index, app.doctor_diagnoses.len());
         }
+        KeyCode::Enter if app.doctor_loading || app.doctor_never_scanned() => {
+            request_doctor_refresh(app);
+        }
         KeyCode::Enter => app.toggle_doctor_detail(),
         KeyCode::PageUp if app.expanded_doctor.is_some() => {
             app.doctor_detail_scroll = app.doctor_detail_scroll.saturating_sub(5);
@@ -2327,6 +3664,19 @@ fn handle_doctor_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageDown if app.expanded_doctor.is_some() => {
             app.doctor_detail_scroll = app.doctor_detail_scroll.saturating_add(5);
         }
+        _ => {}
+    }
+}
+
+fn handle_settings_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.settings_index = previous_index(app.settings_index, 2);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.settings_index = next_index(app.settings_index, 2);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => app.toggle_setting(app.settings_index),
         _ => {}
     }
 }
@@ -2343,8 +3693,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     let titles = match app.language {
-        Language::English => ["Tools", "Activity", "Jobs", "Doctor"],
-        Language::Chinese => ["工具", "活动", "任务", "诊断"],
+        Language::English => ["Tools", "Activity", "Jobs", "Doctor", "Settings"],
+        Language::Chinese => ["工具", "活动", "任务", "诊断", "设置"],
     }
     .into_iter()
     .map(Line::from)
@@ -2401,40 +3751,49 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Activity => draw_activity(frame, app, chunks[1]),
         Tab::Jobs => draw_jobs(frame, app, chunks[1]),
         Tab::Doctor => draw_doctor(frame, app, chunks[1]),
+        Tab::Settings => draw_settings(frame, app, chunks[1]),
     }
 
     let help = match (app.tab, app.language) {
         (Tab::Tools, Language::English) => [
             "↑↓/hover move · click/Space select · a all · Enter update",
-            "c add · e edit · d del · r refresh · L 中/EN · ←/→ or click tab · Shift+Tab policy · q quit",
+            "q / Ctrl+C quit · t TOML · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab · Shift+Tab policy",
         ],
         (Tab::Tools, Language::Chinese) => [
             "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 更新",
-            "c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 或点击页签 · Shift+Tab 策略 · q 退出",
+            "q / Ctrl+C 退出 · t 编辑 TOML · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 页签 · Shift+Tab 策略",
         ],
         (Tab::Activity, Language::English) => [
             "↑↓ scroll · click execution to expand · Home/End · r refresh",
-            "←/→ or click tab · L 中/EN · Shift+Tab policy · q quit",
+            "q / Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
         ],
         (Tab::Activity, Language::Chinese) => [
             "↑↓ 滚动 · 点击执行展开 · Home/End · r 刷新",
-            "←/→ 或点击页签 · L 中/EN · Shift+Tab 策略 · q 退出",
+            "q / Ctrl+C 退出 · ←/→ 或点击页签 · L 中/EN · Shift+Tab 策略",
         ],
         (Tab::Jobs, Language::English) => [
             "↑↓/hover move · click/Enter expand result · PgUp/PgDn scroll · r refresh",
-            "←/→ or click tab · L 中/EN · Shift+Tab policy · q quit",
+            "q / Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
         ],
         (Tab::Jobs, Language::Chinese) => [
             "↑↓/悬停 移动 · 点击/Enter 展开结果 · PgUp/PgDn 滚动 · r 刷新",
-            "←/→ 或点击页签 · L 中/EN · Shift+Tab 策略 · q 退出",
+            "q / Ctrl+C 退出 · ←/→ 或点击页签 · L 中/EN · Shift+Tab 策略",
         ],
         (Tab::Doctor, Language::English) => [
-            "↑↓/hover move · click/Enter expand diagnosis · PgUp/PgDn scroll · r rescan",
-            "active wins PATH · shadowed is hidden · ←/→ or click tab · L 中/EN · q quit",
+            "Enter scan/expand · r rescan · ↑↓/hover move · PgUp/PgDn scroll",
+            "q / Ctrl+C quit · active wins PATH · shadowed is hidden · ←/→ or click tab · L 中/EN",
         ],
         (Tab::Doctor, Language::Chinese) => [
-            "↑↓/悬停 移动 · 点击/Enter 展开诊断 · PgUp/PgDn 滚动 · r 重新扫描",
-            "active 为当前生效项 · shadowed 为被遮蔽项 · ←/→ 或点击页签 · q 退出",
+            "Enter 扫描/展开 · r 重新扫描 · ↑↓/悬停 移动 · PgUp/PgDn 滚动",
+            "q / Ctrl+C 退出 · active 为当前生效项 · shadowed 为被遮蔽项 · ←/→ 或点击页签",
+        ],
+        (Tab::Settings, Language::English) => [
+            "↑↓/hover move · click/Space/Enter toggle setting",
+            "q / Ctrl+C quit · settings save immediately · ←/→ or click tab · L 中/EN",
+        ],
+        (Tab::Settings, Language::Chinese) => [
+            "↑↓/悬停 移动 · 点击/Space/Enter 切换设置",
+            "q / Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击页签 · L 中/EN",
         ],
     };
     let footer = Paragraph::new(vec![
@@ -2481,15 +3840,11 @@ fn tab_hitboxes(area: Rect, titles: &[Line<'_>]) -> Vec<(Rect, usize)> {
 }
 
 fn draw_tools(frame: &mut Frame, app: &mut App, area: Rect) {
-    let rows = app.tools.iter().map(|tool| {
+    let rows = app.visible_tool_indices.iter().filter_map(|&index| {
+        let tool = app.tools.get(index)?;
         let checked = if tool.selected { "[x]" } else { "[ ]" };
-        let kind = match (tool.custom, app.language) {
-            (true, Language::English) => "custom",
-            (true, Language::Chinese) => "自定义",
-            (false, Language::English) => "built-in",
-            (false, Language::Chinese) => "内置",
-        };
-        Row::new(vec![
+        let kind = tool.kind.label(app.language);
+        Some(Row::new(vec![
             Cell::from(checked),
             Cell::from(tool.name.clone()),
             Cell::from(tool.availability.label(app.language)).style(tool.availability.style()),
@@ -2498,7 +3853,7 @@ fn draw_tools(frame: &mut Frame, app: &mut App, area: Rect) {
                 .style(tool.run_state.style()),
             Cell::from(kind),
             Cell::from(tool.command.clone()),
-        ])
+        ]))
     });
     let header = Row::new(match app.language {
         Language::English => [
@@ -2543,27 +3898,49 @@ fn draw_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("› ");
-    let mut state = TableState::default().with_selected(Some(app.tool_index));
+    let mut state = TableState::default()
+        .with_offset(app.tool_viewport.offset())
+        .with_selected((!app.visible_tool_indices.is_empty()).then_some(app.tool_index));
     frame.render_stateful_widget(table, area, &mut state);
 
     let first_row = area.y.saturating_add(3);
     let visible_rows = area.height.saturating_sub(4) as usize;
     let offset = state.offset();
-    app.tool_hitboxes = (offset..app.tools.len().min(offset.saturating_add(visible_rows)))
+    app.tool_viewport.update(
+        Rect::new(
+            area.x.saturating_add(1),
+            first_row,
+            area.width.saturating_sub(2),
+            u16::try_from(visible_rows).unwrap_or(u16::MAX),
+        ),
+        app.visible_tool_indices.len(),
+        offset,
+    );
+    app.tool_hitboxes = (offset
+        ..app
+            .visible_tool_indices
+            .len()
+            .min(offset.saturating_add(visible_rows)))
         .enumerate()
-        .map(|(visible_index, tool_index)| {
+        .map(|(rendered_index, visible_position)| {
             (
                 Rect {
                     x: area.x.saturating_add(1),
-                    y: first_row.saturating_add(visible_index as u16),
+                    y: first_row.saturating_add(rendered_index as u16),
                     width: area.width.saturating_sub(2),
                     height: 1,
                 },
-                tool_index,
+                visible_position,
             )
         })
         .collect();
-    render_scrollbar(frame, area, app.tools.len(), visible_rows, offset);
+    render_scrollbar(
+        frame,
+        area,
+        app.visible_tool_indices.len(),
+        visible_rows,
+        offset,
+    );
 }
 
 fn draw_activity(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -2782,12 +4159,24 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("› ");
-    let mut state = TableState::default().with_selected(Some(app.job_index));
+    let mut state = TableState::default()
+        .with_offset(app.job_viewport.offset())
+        .with_selected(Some(app.job_index));
     frame.render_stateful_widget(table, table_area, &mut state);
 
     let first_row = table_area.y.saturating_add(3);
     let visible_rows = table_area.height.saturating_sub(4) as usize;
     let offset = state.offset();
+    app.job_viewport.update(
+        Rect::new(
+            table_area.x.saturating_add(1),
+            first_row,
+            table_area.width.saturating_sub(2),
+            u16::try_from(visible_rows).unwrap_or(u16::MAX),
+        ),
+        app.jobs.len(),
+        offset,
+    );
     app.job_hitboxes = (offset..app.jobs.len().min(offset.saturating_add(visible_rows)))
         .enumerate()
         .map(|(visible_index, job_index)| {
@@ -2915,15 +4304,17 @@ fn doctor_status(diagnosis: &doctor::ToolDiagnosis) -> DoctorStatus {
 }
 
 fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
-    let (table_area, detail_area) = if app.expanded_doctor.is_some() && area.height >= 10 {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
-            .split(area);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (area, None)
-    };
+    let never_scanned = app.doctor_never_scanned();
+    let (table_area, detail_area) =
+        if !never_scanned && app.expanded_doctor.is_some() && area.height >= 10 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+                .split(area);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (area, None)
+        };
     let rows = app.doctor_diagnoses.iter().map(|diagnosis| {
         let status = doctor_status(diagnosis);
         let marker = if app.expanded_doctor.as_deref() == Some(&diagnosis.name) {
@@ -2962,32 +4353,42 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .filter(|diagnosis| diagnosis.has_conflict())
         .count();
+    let (scan_status, scan_status_style) = if app.doctor_loading {
+        (
+            app.language.text("● scanning", "● 扫描中"),
+            Style::default().fg(ACCENT),
+        )
+    } else if never_scanned {
+        (
+            app.language.text("● not scanned", "● 尚未诊断"),
+            Style::default().fg(WARNING_COLOR),
+        )
+    } else {
+        (
+            app.language.text("● ready", "● 已完成"),
+            Style::default().fg(SUCCESS),
+        )
+    };
+    let result_summary = if never_scanned {
+        String::new()
+    } else {
+        match app.language {
+            Language::English => {
+                format!("  {} tools · {conflicts} warn", app.doctor_diagnoses.len())
+            }
+            Language::Chinese => {
+                format!("  {} 工具 · {conflicts} 冲突", app.doctor_diagnoses.len())
+            }
+        }
+    };
     let title = Line::from(vec![
         Span::styled(
             app.language.text(" Doctor  ", " 安装诊断  "),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(scan_status, scan_status_style),
         Span::styled(
-            if app.doctor_loading {
-                app.language.text("● scanning", "● 扫描中")
-            } else {
-                app.language.text("● ready", "● 已完成")
-            },
-            if app.doctor_loading {
-                Style::default().fg(ACCENT)
-            } else {
-                Style::default().fg(SUCCESS)
-            },
-        ),
-        Span::styled(
-            match app.language {
-                Language::English => {
-                    format!("  {} tools · {conflicts} warn", app.doctor_diagnoses.len())
-                }
-                Language::Chinese => {
-                    format!("  {} 工具 · {conflicts} 冲突", app.doctor_diagnoses.len())
-                }
-            },
+            result_summary,
             Style::default().fg(if conflicts == 0 {
                 SUBTLE
             } else {
@@ -3034,12 +4435,65 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("› ");
-    let mut state = TableState::default().with_selected(Some(app.doctor_index));
+    let mut state = TableState::default()
+        .with_offset(app.doctor_viewport.offset())
+        .with_selected(if never_scanned {
+            None
+        } else {
+            Some(app.doctor_index)
+        });
     frame.render_stateful_widget(table, table_area, &mut state);
+
+    if never_scanned {
+        app.doctor_hitboxes.clear();
+        app.doctor_viewport.clear();
+        app.doctor_detail_area = None;
+        let prompt_height = table_area.height.saturating_sub(4).min(2);
+        let prompt_area = Rect {
+            x: table_area.x.saturating_add(2),
+            y: table_area
+                .y
+                .saturating_add(3)
+                .saturating_add(table_area.height.saturating_sub(4 + prompt_height) / 2),
+            width: table_area.width.saturating_sub(4),
+            height: prompt_height,
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    app.language.text(
+                        "Installation diagnostics have not been run.",
+                        "尚未运行安装冲突诊断。",
+                    ),
+                    Style::default().fg(DIM),
+                ),
+                Line::styled(
+                    app.language.text(
+                        "Press Enter to scan; press R to rescan later.",
+                        "按 Enter 开始扫描；之后可按 R 重新扫描。",
+                    ),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ])
+            .alignment(Alignment::Center),
+            prompt_area,
+        );
+        return;
+    }
 
     let first_row = table_area.y.saturating_add(3);
     let visible_rows = table_area.height.saturating_sub(4) as usize;
     let offset = state.offset();
+    app.doctor_viewport.update(
+        Rect::new(
+            table_area.x.saturating_add(1),
+            first_row,
+            table_area.width.saturating_sub(2),
+            u16::try_from(visible_rows).unwrap_or(u16::MAX),
+        ),
+        app.doctor_diagnoses.len(),
+        offset,
+    );
     app.doctor_hitboxes = (offset
         ..app
             .doctor_diagnoses
@@ -3124,6 +4578,146 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
         rendered_height,
         detail_height,
         app.doctor_detail_scroll,
+    );
+}
+
+fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(3)])
+        .split(area);
+    let options = [
+        (
+            app.settings.auto_diagnose_on_startup,
+            app.language.text(
+                "Run Doctor diagnostics when TUI starts",
+                "进入 TUI 时自动运行 Doctor 诊断",
+            ),
+        ),
+        (
+            app.settings.hide_unsupported_and_missing_tools,
+            app.language.text(
+                "Hide unsupported or uninstalled tools",
+                "隐藏不支持或未安装的工具",
+            ),
+        ),
+    ];
+    let rows = options.into_iter().map(|(enabled, option)| {
+        let marker = if enabled { "[x]" } else { "[ ]" };
+        let state_label = match (enabled, app.language) {
+            (true, Language::English) => "enabled",
+            (true, Language::Chinese) => "已启用",
+            (false, Language::English) => "disabled",
+            (false, Language::Chinese) => "已关闭",
+        };
+        Row::new([
+            Cell::from(format!("{marker} {option}")),
+            Cell::from(state_label).style(if enabled {
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(SUBTLE)
+            }),
+        ])
+    });
+    let table = Table::new(rows, [Constraint::Min(28), Constraint::Length(12)])
+        .header(
+            Row::new(match app.language {
+                Language::English => ["OPTION", "STATE"],
+                Language::Chinese => ["选项", "状态"],
+            })
+            .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
+            .bottom_margin(1),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(BORDER))
+                .title(Span::styled(
+                    app.language.text(" Settings ", " 设置 "),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(SELECTION_BG)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    let mut state = TableState::default().with_selected(Some(app.settings_index));
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    app.settings_hitboxes = (0..2)
+        .map(|index| {
+            (
+                Rect {
+                    x: sections[0].x.saturating_add(1),
+                    y: sections[0].y.saturating_add(3 + index as u16),
+                    width: sections[0].width.saturating_sub(2),
+                    height: 1,
+                },
+                index,
+            )
+        })
+        .collect();
+
+    let description = match app.language {
+        Language::English => vec![
+            Line::styled(
+                "When enabled, dvup starts one read-only installation conflict scan in the background as the TUI opens.",
+                Style::default().fg(DIM),
+            ),
+            Line::default(),
+            Line::styled(
+                "Changing this option does not scan immediately. It applies the next time the TUI starts; Doctor's Enter and R shortcuts remain available.",
+                Style::default().fg(SUBTLE),
+            ),
+            Line::default(),
+            Line::styled(
+                "The tool filter reuses cached statuses without rescanning PATH or restarting version probes; installed tools with a missing updater remain visible.",
+                Style::default().fg(SUBTLE),
+            ),
+            Line::default(),
+            Line::styled(
+                format!("Stored in {}", app.state.settings_path().display()),
+                Style::default().fg(SUBTLE),
+            ),
+        ],
+        Language::Chinese => vec![
+            Line::styled(
+                "启用后，dvup 会在进入 TUI 时于后台执行一次只读的安装冲突诊断。",
+                Style::default().fg(DIM),
+            ),
+            Line::default(),
+            Line::styled(
+                "切换此选项不会立即扫描，而是在下次进入 TUI 时生效；Doctor 页的 Enter 和 R 仍可手动扫描。",
+                Style::default().fg(SUBTLE),
+            ),
+            Line::default(),
+            Line::styled(
+                "工具过滤复用已有状态，不会重新扫描 PATH 或启动版本探测；目标已安装但缺少更新器的工具仍会显示。",
+                Style::default().fg(SUBTLE),
+            ),
+            Line::default(),
+            Line::styled(
+                format!("保存位置：{}", app.state.settings_path().display()),
+                Style::default().fg(SUBTLE),
+            ),
+        ],
+    };
+    frame.render_widget(
+        Paragraph::new(description)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(BORDER))
+                    .title(Span::styled(
+                        app.language.text(" Behavior ", " 行为说明 "),
+                        Style::default().fg(ACCENT),
+                    )),
+            )
+            .wrap(Wrap { trim: false }),
+        sections[1],
     );
 }
 
@@ -3281,10 +4875,16 @@ fn render_scrollbar(
 
 fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
     app.modal_input_hitboxes.clear();
+    app.toml_editor_hitbox = None;
     if matches!(app.modal, Modal::None) {
         return;
     }
     render_modal_backdrop(frame, area);
+
+    if matches!(app.modal, Modal::TomlEditor { .. }) {
+        draw_toml_editor(frame, app, area);
+        return;
+    }
 
     match &app.modal {
         Modal::None => {}
@@ -3473,7 +5073,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     *field == 1,
                     command_label,
                     command,
-                    "claude install",
+                    "claude update",
                     command_width,
                 ),
                 Line::raw(""),
@@ -3481,7 +5081,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     app.language.text("Examples", "示例"),
                     Style::default().fg(DIM).add_modifier(Modifier::BOLD),
                 ),
-                Line::styled("  claude install", Style::default().fg(SUBTLE)),
+                Line::styled("  claude update", Style::default().fg(SUBTLE)),
                 Line::styled(
                     "  npm install -g package@latest",
                     Style::default().fg(SUBTLE),
@@ -3545,7 +5145,223 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame.set_cursor_position(Position::new(cursor_x, inner.y.saturating_add(row)));
             }
         }
+        Modal::TomlEditor { .. } => unreachable!("TOML editor is rendered separately"),
     }
+}
+
+fn draw_toml_editor(frame: &mut Frame, app: &mut App, area: Rect) {
+    let language = app.language;
+    let status = app.message.clone();
+    let Modal::TomlEditor { editor } = &mut app.modal else {
+        return;
+    };
+    let title = if editor.dirty {
+        language.text("TOML editor — modified", "TOML 编辑器 — 已修改")
+    } else {
+        language.text("TOML editor", "TOML 编辑器")
+    };
+    let inner = modal_panel(
+        frame,
+        area,
+        title,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                language.text(" File  ", " 文件  "),
+                Style::default().fg(DIM),
+            ),
+            Span::styled(
+                editor.path.display().to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(PANEL_BG)),
+        chunks[0],
+    );
+
+    let editor_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(SURFACE));
+    let editor_inner = editor_block.inner(chunks[1]);
+    frame.render_widget(editor_block, chunks[1]);
+
+    editor.refresh_highlights();
+    let ranges = editor.line_ranges();
+    let gutter_width = ranges.len().max(1).to_string().len().saturating_add(2);
+    let editor_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(u16::try_from(gutter_width).unwrap_or(u16::MAX)),
+            Constraint::Min(1),
+        ])
+        .split(editor_inner);
+    let gutter_area = editor_columns[0];
+    let content_area = editor_columns[1];
+    if editor.follow_cursor {
+        editor.ensure_cursor_visible(
+            usize::from(content_area.height),
+            usize::from(content_area.width),
+        );
+        editor.follow_cursor = false;
+    }
+    app.toml_editor_hitbox = Some(TomlEditorHitbox { area: content_area });
+
+    let gutter_lines = (1..=ranges.len())
+        .map(|number| {
+            Line::styled(
+                format!("{number:>width$} ", width = gutter_width.saturating_sub(1)),
+                Style::default().fg(SUBTLE).bg(PANEL_BG),
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(gutter_lines)
+            .scroll((u16::try_from(editor.scroll_y).unwrap_or(u16::MAX), 0))
+            .style(Style::default().bg(PANEL_BG)),
+        gutter_area,
+    );
+
+    let content_lines = ranges
+        .iter()
+        .map(|&(start, end)| toml_editor_line(editor, start, end))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(content_lines)
+            .scroll((
+                u16::try_from(editor.scroll_y).unwrap_or(u16::MAX),
+                u16::try_from(editor.scroll_x).unwrap_or(u16::MAX),
+            ))
+            .style(Style::default().bg(SURFACE)),
+        content_area,
+    );
+
+    render_scrollbar(
+        frame,
+        chunks[1],
+        ranges.len(),
+        usize::from(content_area.height),
+        editor.scroll_y,
+    );
+
+    let (cursor_line, cursor_column) = editor.cursor_line_column();
+    if cursor_line >= editor.scroll_y
+        && cursor_line
+            < editor
+                .scroll_y
+                .saturating_add(usize::from(content_area.height))
+        && cursor_column >= editor.scroll_x
+        && cursor_column
+            < editor
+                .scroll_x
+                .saturating_add(usize::from(content_area.width))
+    {
+        frame.set_cursor_position(Position::new(
+            content_area
+                .x
+                .saturating_add(u16::try_from(cursor_column - editor.scroll_x).unwrap_or(u16::MAX)),
+            content_area
+                .y
+                .saturating_add(u16::try_from(cursor_line - editor.scroll_y).unwrap_or(u16::MAX)),
+        ));
+    }
+
+    let help = vec![
+        Line::styled(
+            format!(" {status}"),
+            Style::default()
+                .fg(WARNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            Span::styled("[Ctrl+S]", Style::default().fg(SUCCESS)),
+            Span::raw(language.text(" save  ", " 保存  ")),
+            Span::styled("[Esc]", Style::default().fg(ERROR_COLOR)),
+            Span::raw(language.text(" close  ", " 关闭  ")),
+            Span::styled("[Ctrl+C]", Style::default().fg(ACCENT)),
+            Span::raw(language.text(" copy  ", " 复制  ")),
+            Span::styled("[Ctrl+V]", Style::default().fg(ACCENT)),
+            Span::raw(language.text(" paste", " 粘贴")),
+        ]),
+        Line::styled(
+            language.text(
+                "Ctrl+/ comment · Ctrl+Z/Y undo/redo · arrows move · Shift/mouse drag selects · wheel scrolls",
+                "Ctrl+/ 注释 · Ctrl+Z/Y 撤销/重做 · 方向键移动 · Shift/鼠标拖选 · 滚轮滚动",
+            ),
+            Style::default().fg(DIM),
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(help).style(Style::default().bg(PANEL_BG)),
+        chunks[2],
+    );
+}
+
+fn toml_editor_line(editor: &TomlEditor, start: usize, end: usize) -> Line<'static> {
+    let base = Style::default().fg(Color::White).bg(SURFACE);
+    if start == end {
+        return Line::styled(String::new(), base);
+    }
+
+    let selection = editor.selection();
+    let mut boundaries = vec![start, end];
+    for highlight in &editor.highlights {
+        if highlight.start < end && highlight.end > start {
+            boundaries.push(highlight.start.max(start));
+            boundaries.push(highlight.end.min(end));
+        }
+    }
+    if let Some((selection_start, selection_end)) = selection
+        && selection_start < end
+        && selection_end > start
+    {
+        boundaries.push(selection_start.max(start));
+        boundaries.push(selection_end.min(end));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let selection_style = Style::default()
+        .fg(Color::Black)
+        .bg(ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let spans = boundaries
+        .windows(2)
+        .filter_map(|boundary| {
+            let segment_start = boundary[0];
+            let segment_end = boundary[1];
+            (segment_start < segment_end).then(|| {
+                let selected = selection.is_some_and(|(selection_start, selection_end)| {
+                    selection_start <= segment_start && segment_end <= selection_end
+                });
+                let style = if selected {
+                    selection_style
+                } else {
+                    editor
+                        .highlights
+                        .iter()
+                        .find(|highlight| {
+                            highlight.start <= segment_start && segment_start < highlight.end
+                        })
+                        .map_or(base, |highlight| highlight.style)
+                };
+                Span::styled(editor.text[segment_start..segment_end].to_owned(), style)
+            })
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 fn render_modal_backdrop(frame: &mut Frame, area: Rect) {
@@ -3741,60 +5557,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width,
         height,
     }
-}
-
-fn version_command_for_tool(name: &str, tool: &Tool, working_directory: PathBuf) -> CommandSpec {
-    let updater = executable_name(&tool.program);
-    if updater == "brew"
-        && tool
-            .args
-            .first()
-            .is_some_and(|argument| argument == "upgrade")
-        && let Some(package) = tool
-            .args
-            .iter()
-            .rev()
-            .find(|argument| argument.as_str() != "upgrade" && !argument.starts_with('-'))
-    {
-        let mut args = vec!["list".to_owned()];
-        if tool.args.iter().any(|argument| argument == "--cask") {
-            args.push("--cask".to_owned());
-        }
-        args.extend(["--versions".to_owned(), package.clone()]);
-        return CommandSpec {
-            program: tool.program.clone(),
-            args,
-            working_directory,
-        };
-    }
-
-    let known_tool = matches!(
-        name.to_ascii_lowercase().as_str(),
-        "brew" | "bun" | "codex" | "rustup" | "scoop" | "uv"
-    );
-    let package_manager = matches!(updater.as_str(), "brew" | "bun" | "npm" | "pnpm" | "scoop");
-    CommandSpec {
-        program: if known_tool || package_manager {
-            name.to_owned()
-        } else {
-            tool.program.clone()
-        },
-        args: vec!["--version".to_owned()],
-        working_directory,
-    }
-}
-
-fn executable_name(program: &str) -> String {
-    let executable = program
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(program)
-        .to_ascii_lowercase();
-    [".exe", ".cmd", ".ps1", ".bat"]
-        .into_iter()
-        .find_map(|suffix| executable.strip_suffix(suffix))
-        .unwrap_or(&executable)
-        .to_owned()
 }
 
 fn spawn_version_probe(
@@ -4088,12 +5850,21 @@ fn is_progress_artifact(line: &str) -> bool {
     only_progress_characters && has_progress_marker
 }
 
-fn load_custom_names(state: &StateDirs) -> Result<HashSet<String>> {
-    let path = state.custom_config_path();
+fn load_tool_kinds(
+    state: &StateDirs,
+    explicit_config: Option<&Path>,
+) -> Result<HashMap<String, ToolKind>> {
+    let path = explicit_config
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| state.custom_config_path());
     if !path.is_file() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
-    Ok(Config::load(&path)?.tools.into_keys().collect())
+    Ok(UserConfig::load(&path)?
+        .tools
+        .into_keys()
+        .map(|name| (name, ToolKind::Custom))
+        .collect())
 }
 
 fn format_command(program: &str, args: &[String]) -> String {
@@ -4190,6 +5961,14 @@ fn next_index(current: usize, length: usize) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tool_kinds_have_one_custom_category() {
+        assert_eq!(ToolKind::BuiltIn.label(Language::English), "built-in");
+        assert_eq!(ToolKind::BuiltIn.label(Language::Chinese), "内置");
+        assert_eq!(ToolKind::Custom.label(Language::English), "custom");
+        assert_eq!(ToolKind::Custom.label(Language::Chinese), "自定义");
+    }
+
     fn test_version_command(name: &str) -> CommandSpec {
         CommandSpec {
             program: name.to_owned(),
@@ -4204,6 +5983,7 @@ mod tests {
             supported: true,
             target: doctor::ExecutableDiagnosis {
                 program: name.to_owned(),
+                probe_args: vec!["--version".to_owned()],
                 candidates: paths
                     .iter()
                     .map(|(path, version)| doctor::ExecutableCandidate {
@@ -4266,10 +6046,10 @@ mod tests {
     }
 
     #[test]
-    fn builds_version_commands_for_builtins_and_homebrew_packages() {
+    fn builds_version_commands_from_explicit_probes() {
         let working_directory = PathBuf::from("workspace");
         let uv = Config::starter().tools.remove("uv").expect("uv preset");
-        let uv_version = version_command_for_tool("uv", &uv, working_directory.clone());
+        let uv_version = command::probe_spec(&uv, &working_directory);
         assert_eq!(uv_version.program, "uv");
         assert_eq!(uv_version.args, ["--version"]);
 
@@ -4278,18 +6058,17 @@ mod tests {
             "/opt/homebrew/bin/brew".to_owned(),
             vec!["upgrade".to_owned(), "ripgrep".to_owned()],
         );
-        let ripgrep_version =
-            version_command_for_tool("ripgrep", &ripgrep, working_directory.clone());
-        assert_eq!(ripgrep_version.program, "/opt/homebrew/bin/brew");
-        assert_eq!(ripgrep_version.args, ["list", "--versions", "ripgrep"]);
+        let ripgrep_version = command::probe_spec(&ripgrep, &working_directory);
+        assert_eq!(ripgrep_version.program, "ripgrep");
+        assert_eq!(ripgrep_version.args, ["--version"]);
 
         let claude = Tool::custom(
             "claude-custom",
             "claude".to_owned(),
             vec!["install".to_owned()],
         );
-        let claude_version = version_command_for_tool("claude-custom", &claude, working_directory);
-        assert_eq!(claude_version.program, "claude");
+        let claude_version = command::probe_spec(&claude, &working_directory);
+        assert_eq!(claude_version.program, "claude-custom");
         assert_eq!(claude_version.args, ["--version"]);
     }
 
@@ -4363,6 +6142,114 @@ mod tests {
         assert!(app.doctor_diagnoses[0].has_conflict());
         assert!(app.doctor_checked_at.is_some());
         assert!(app.message.contains("1 conflict"));
+    }
+
+    #[test]
+    fn entering_doctor_waits_for_an_explicit_scan() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+
+        app.select_tab(Tab::Doctor);
+
+        assert_eq!(app.tab, Tab::Doctor);
+        assert_eq!(app.doctor_probe_id, 0);
+        assert!(!app.doctor_loading);
+        assert!(app.doctor_checked_at.is_none());
+        assert!(app.message.contains("Enter"));
+    }
+
+    #[test]
+    fn doctor_enter_starts_the_first_scan_and_busy_keys_do_not_duplicate_it() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.tab = Tab::Doctor;
+
+        handle_doctor_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.doctor_loading);
+        assert_eq!(app.doctor_probe_id, 1);
+        assert_eq!(app.next_doctor_probe_id, 1);
+
+        handle_doctor_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_normal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.doctor_probe_id, 1);
+        assert_eq!(app.next_doctor_probe_id, 1);
+        assert!(app.message.contains("already running"));
+    }
+
+    #[test]
+    fn doctor_r_starts_the_first_scan_and_rescans_existing_results() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.tab = Tab::Doctor;
+
+        handle_normal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+        assert!(app.doctor_loading);
+        assert_eq!(app.doctor_probe_id, 1);
+        assert!(app.message.contains("Scanning installation conflicts"));
+
+        app.doctor_loading = false;
+        app.doctor_checked_at = Some("2026-07-12 20:00:00".to_owned());
+        app.doctor_diagnoses = vec![test_diagnosis("uv", &[("first/uv", Some("1.0.0"))])];
+        handle_normal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+        );
+        assert!(app.doctor_loading);
+        assert_eq!(app.doctor_probe_id, 2);
+        assert_eq!(app.doctor_diagnoses.len(), 1);
+    }
+
+    #[test]
+    fn doctor_view_prompts_before_the_first_scan_in_both_languages() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.tab = Tab::Doctor;
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render English Doctor prompt");
+        let english = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(english.contains("not scanned"), "screen: {english}");
+        assert!(english.contains("Press Enter to scan"), "screen: {english}");
+
+        app.language = Language::Chinese;
+        terminal.clear().expect("clear English Doctor prompt");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render Chinese Doctor prompt");
+        let chinese = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let compact_chinese = chinese.replace(' ', "");
+        assert!(compact_chinese.contains("尚未诊断"), "screen: {chinese}");
+        assert!(
+            compact_chinese.contains("按Enter开始扫描"),
+            "screen: {chinese}"
+        );
     }
 
     #[test]
@@ -4510,6 +6397,29 @@ mod tests {
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
         assert!(matches!(app.modal, Modal::None));
+        assert!(!app.ctrl_c_armed);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn queued_self_update_tells_the_user_to_exit() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let dvup = app
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == "dvup")
+            .expect("dvup preset");
+        dvup.run_state = RunState::Queued;
+        app.update_batch = Some(UpdateBatch {
+            started: Instant::now(),
+            total: 1,
+        });
+
+        app.finish_update_batch();
+
+        assert!(app.message.contains("exit dvup"));
     }
 
     #[test]
@@ -4524,11 +6434,12 @@ mod tests {
             version_command: test_version_command("available"),
             version_probe_id: 1,
             availability: Availability::Installed,
-            custom: false,
+            kind: ToolKind::BuiltIn,
             selected: false,
             run_state: RunState::Idle,
             elapsed: None,
         }];
+        app.rebuild_visible_tool_indices(None);
         app.tool_hitboxes = vec![(Rect::new(1, 4, 50, 1), 0)];
         app.tab_hitboxes = vec![(Rect::new(10, 1, 8, 1), Tab::Jobs.index())];
         app.modal = Modal::ConfirmDelete {
@@ -4757,10 +6668,10 @@ mod tests {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         state.ensure().expect("state directories");
-        let mut custom = Config::empty();
+        let mut custom = UserConfig::empty();
         custom.tools.insert(
             "example".to_owned(),
-            crate::config::Tool::custom(
+            UserTool::custom(
                 "example",
                 "example-cli".to_owned(),
                 vec!["update".to_owned(), "two words".to_owned()],
@@ -4770,11 +6681,11 @@ mod tests {
             .save(&state.custom_config_path())
             .expect("save custom command");
         let mut app = App::new(state, None).expect("app");
-        app.tool_index = app
-            .tools
-            .iter()
-            .position(|tool| tool.name == "example")
-            .expect("custom tool row");
+        app.focus_tool_named("example");
+        assert_eq!(
+            app.focused_tool().expect("global custom tool").kind,
+            ToolKind::Custom
+        );
 
         handle_tools_key(
             &mut app,
@@ -4919,7 +6830,7 @@ mod tests {
                 version_command: test_version_command("available"),
                 version_probe_id: 1,
                 availability: Availability::Installed,
-                custom: false,
+                kind: ToolKind::BuiltIn,
                 selected: false,
                 run_state: RunState::Idle,
                 elapsed: None,
@@ -4931,12 +6842,13 @@ mod tests {
                 version_command: test_version_command("missing"),
                 version_probe_id: 2,
                 availability: Availability::Missing,
-                custom: false,
+                kind: ToolKind::BuiltIn,
                 selected: false,
                 run_state: RunState::Idle,
                 elapsed: None,
             },
         ];
+        app.rebuild_visible_tool_indices(None);
         app.tab = Tab::Tools;
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -4982,6 +6894,87 @@ mod tests {
     }
 
     #[test]
+    fn filtered_tool_rows_map_to_the_canonical_tool_without_reprobing() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.tools = vec![
+            ToolItem {
+                name: "missing".to_owned(),
+                command: "missing update".to_owned(),
+                version: VersionState::Unavailable,
+                version_command: test_version_command("missing"),
+                version_probe_id: 11,
+                availability: Availability::Missing,
+                kind: ToolKind::BuiltIn,
+                selected: false,
+                run_state: RunState::Idle,
+                elapsed: None,
+            },
+            ToolItem {
+                name: "installed".to_owned(),
+                command: "installed update".to_owned(),
+                version: VersionState::Available("1.2.3".to_owned()),
+                version_command: test_version_command("installed"),
+                version_probe_id: 12,
+                availability: Availability::Installed,
+                kind: ToolKind::BuiltIn,
+                selected: false,
+                run_state: RunState::Idle,
+                elapsed: None,
+            },
+        ];
+        app.next_version_probe_id = 12;
+        app.settings.hide_unsupported_and_missing_tools = true;
+        app.rebuild_visible_tool_indices(Some("installed"));
+        app.tab = Tab::Tools;
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render filtered tools");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!screen.contains("missing update"), "screen: {screen}");
+        assert!(screen.contains("installed update"), "screen: {screen}");
+        assert_eq!(app.visible_tool_indices, [1]);
+        assert_eq!(app.tool_index, 0);
+        assert_eq!(
+            app.focused_tool().map(|tool| tool.name.as_str()),
+            Some("installed")
+        );
+
+        let area = app.tool_hitboxes[0].0;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(!app.tools[0].selected);
+        assert!(app.tools[1].selected);
+        assert_eq!(app.selected_for_update(), ["installed"]);
+        assert_eq!(app.next_version_probe_id, 12);
+        assert_eq!(app.tools[1].version_probe_id, 12);
+        assert!(matches!(
+            &app.tools[1].version,
+            VersionState::Available(version) if version == "1.2.3"
+        ));
+    }
+
+    #[test]
     fn mouse_movement_follows_focus_without_activating_items() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -4995,12 +6988,13 @@ mod tests {
                 version_command: test_version_command(name),
                 version_probe_id: 1,
                 availability: Availability::Installed,
-                custom: false,
+                kind: ToolKind::BuiltIn,
                 selected: false,
                 run_state: RunState::Idle,
                 elapsed: None,
             })
             .collect();
+        app.rebuild_visible_tool_indices(None);
         app.tool_hitboxes = vec![(Rect::new(1, 4, 50, 1), 0), (Rect::new(1, 5, 50, 1), 1)];
         app.tab_hitboxes = vec![(Rect::new(10, 1, 8, 1), Tab::Jobs.index())];
 
@@ -5206,6 +7200,193 @@ mod tests {
     }
 
     #[test]
+    fn settings_toggle_persists_and_enables_diagnostics_on_the_next_tui_start() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state.clone(), None).expect("app");
+        app.tab = Tab::Settings;
+
+        assert!(!app.settings.auto_diagnose_on_startup);
+        assert_eq!(app.doctor_probe_id, 0);
+        handle_settings_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+
+        assert!(app.settings.auto_diagnose_on_startup);
+        assert_eq!(app.doctor_probe_id, 0);
+        assert!(app.message.contains("next time TUI starts"));
+        assert!(
+            TuiSettings::load(&state.settings_path())
+                .expect("saved settings")
+                .auto_diagnose_on_startup
+        );
+
+        let restarted = App::new(state, None).expect("restarted app");
+        assert!(restarted.settings.auto_diagnose_on_startup);
+        assert!(restarted.doctor_loading);
+        assert_eq!(restarted.doctor_probe_id, 1);
+        assert!(
+            restarted
+                .message
+                .contains("Scanning installation conflicts")
+        );
+    }
+
+    #[test]
+    fn settings_view_supports_mouse_focus_and_click_toggle() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state.clone(), None).expect("app");
+        let unfiltered_count = app.tools.len();
+        let original_names = app
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        let original_probe_ids = app
+            .tools
+            .iter()
+            .map(|tool| tool.version_probe_id)
+            .collect::<Vec<_>>();
+        let original_versions = app
+            .tools
+            .iter()
+            .map(|tool| tool.version.label().to_owned())
+            .collect::<Vec<_>>();
+        let next_probe_id = app.next_version_probe_id;
+        assert!(app.tools.iter().any(|tool| matches!(
+            tool.availability,
+            Availability::Unsupported | Availability::Missing
+        )));
+        app.tab = Tab::Settings;
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render settings");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Settings"), "screen: {screen}");
+        assert!(
+            screen.contains("Run Doctor diagnostics when TUI starts"),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("Hide unsupported or uninstalled tools"),
+            "screen: {screen}"
+        );
+        assert_eq!(app.settings_hitboxes.len(), 2);
+        let area = app.settings_hitboxes[0].0;
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.settings_index, 0);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(app.settings.auto_diagnose_on_startup);
+        assert!(
+            TuiSettings::load(&state.settings_path())
+                .expect("mouse-saved settings")
+                .auto_diagnose_on_startup
+        );
+
+        let filter_area = app.settings_hitboxes[1].0;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: filter_area.x,
+                row: filter_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.settings_index, 1);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: filter_area.x,
+                row: filter_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(app.settings.hide_unsupported_and_missing_tools);
+        assert_eq!(app.tools.len(), unfiltered_count);
+        assert_eq!(
+            app.tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            original_names
+        );
+        assert_eq!(
+            app.tools
+                .iter()
+                .map(|tool| tool.version_probe_id)
+                .collect::<Vec<_>>(),
+            original_probe_ids
+        );
+        assert_eq!(app.next_version_probe_id, next_probe_id);
+        assert!(app.visible_tool_indices.len() < unfiltered_count);
+        assert!(app.visible_tool_indices.iter().all(|&index| !matches!(
+            app.tools[index].availability,
+            Availability::Unsupported | Availability::Missing
+        )));
+        assert_eq!(
+            app.tools
+                .iter()
+                .map(|tool| tool.version.label().to_owned())
+                .collect::<Vec<_>>(),
+            original_versions
+        );
+        assert!(
+            TuiSettings::load(&state.settings_path())
+                .expect("mouse-saved tool filter")
+                .hide_unsupported_and_missing_tools
+        );
+
+        app.toggle_setting(1);
+        assert!(!app.settings.hide_unsupported_and_missing_tools);
+        assert_eq!(
+            app.visible_tool_indices,
+            (0..app.tools.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(app.next_version_probe_id, next_probe_id);
+        assert_eq!(
+            app.tools
+                .iter()
+                .map(|tool| tool.version_probe_id)
+                .collect::<Vec<_>>(),
+            original_probe_ids
+        );
+    }
+
+    #[test]
     fn wraps_navigation_indices() {
         assert_eq!(previous_index(0, 3), 2);
         assert_eq!(next_index(2, 3), 0);
@@ -5215,11 +7396,13 @@ mod tests {
     #[test]
     fn tabs_move_in_both_directions() {
         assert_eq!(Tab::Tools.next(), Tab::Activity);
-        assert_eq!(Tab::Tools.previous(), Tab::Doctor);
+        assert_eq!(Tab::Tools.previous(), Tab::Settings);
         assert_eq!(Tab::Jobs.next(), Tab::Doctor);
         assert_eq!(Tab::Jobs.previous(), Tab::Activity);
-        assert_eq!(Tab::Doctor.next(), Tab::Tools);
+        assert_eq!(Tab::Doctor.next(), Tab::Settings);
         assert_eq!(Tab::Doctor.previous(), Tab::Jobs);
+        assert_eq!(Tab::Settings.next(), Tab::Tools);
+        assert_eq!(Tab::Settings.previous(), Tab::Doctor);
     }
 
     #[test]
@@ -5234,11 +7417,17 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("render tabs");
-        assert_eq!(app.tab_hitboxes.len(), 4);
+        assert_eq!(app.tab_hitboxes.len(), 5);
 
-        for (index, expected) in [Tab::Tools, Tab::Activity, Tab::Jobs, Tab::Doctor]
-            .into_iter()
-            .enumerate()
+        for (index, expected) in [
+            Tab::Tools,
+            Tab::Activity,
+            Tab::Jobs,
+            Tab::Doctor,
+            Tab::Settings,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let area = app.tab_hitboxes[index].0;
             handle_mouse(
@@ -5255,7 +7444,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_and_number_keys_do_not_switch_tabs() {
+    fn recognizes_ctrl_c_and_navigation_keys() {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
         let shift_backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
@@ -5273,7 +7462,10 @@ mod tests {
             navigated_tab(Tab::Tools, &KeyCode::Right),
             Some(Tab::Activity)
         );
-        assert_eq!(navigated_tab(Tab::Tools, &KeyCode::Left), Some(Tab::Doctor));
+        assert_eq!(
+            navigated_tab(Tab::Tools, &KeyCode::Left),
+            Some(Tab::Settings)
+        );
         for code in [
             KeyCode::Tab,
             KeyCode::BackTab,
@@ -5287,6 +7479,103 @@ mod tests {
         ] {
             assert_eq!(navigated_tab(Tab::Tools, &code), None);
         }
+    }
+
+    #[test]
+    fn ctrl_c_requires_two_consecutive_presses_to_quit() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(&mut app, ctrl_c);
+
+        assert!(!app.should_quit);
+        assert!(app.ctrl_c_armed);
+        assert_eq!(app.message, "Press Ctrl+C again to quit");
+
+        handle_key(&mut app, ctrl_c);
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn non_ctrl_c_key_cancels_the_quit_confirmation() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(&mut app, ctrl_c);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        handle_key(&mut app, ctrl_c);
+
+        assert!(!app.should_quit);
+        assert!(app.ctrl_c_armed);
+        assert_eq!(app.message, "Press Ctrl+C again to quit");
+    }
+
+    #[test]
+    fn ctrl_c_confirmation_is_localized_and_second_press_forces_exit() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.language = Language::Chinese;
+        app.running = 1;
+
+        handle_key(&mut app, ctrl_c);
+
+        assert!(!app.should_quit);
+        assert_eq!(app.message, "再次按 Ctrl+C 退出");
+
+        handle_key(&mut app, ctrl_c);
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn footer_shows_both_quit_shortcuts_in_both_languages() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let backend = TestBackend::new(140, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render English footer");
+        let english = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(english.contains("q / Ctrl+C quit"), "screen: {english}");
+        assert!(english.contains("t TOML"), "screen: {english}");
+
+        app.language = Language::Chinese;
+        terminal.clear().expect("clear English footer");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render Chinese footer");
+        let chinese = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(chinese.contains("q / Ctrl+C"), "screen: {chinese}");
+        assert!(chinese.contains("t "), "screen: {chinese}");
+        assert!(chinese.contains("TOML"), "screen: {chinese}");
+        assert!(chinese.contains("退 出"), "screen: {chinese}");
     }
 
     #[test]
@@ -5427,13 +7716,13 @@ mod tests {
     #[test]
     fn builds_update_subprocess_arguments() {
         assert_eq!(
-            update_arguments("claude", Some(Path::new("custom.toml")), false),
+            update_arguments("claude", Some(Path::new("dvup_custom.toml")), false),
             [
                 "update",
                 "--background",
                 "auto",
                 "--config",
-                "custom.toml",
+                "dvup_custom.toml",
                 "claude"
             ]
         );
@@ -5592,5 +7881,778 @@ mod tests {
             activity_outcome_label(true, true, Language::Chinese),
             "已排队"
         );
+    }
+
+    #[test]
+    fn toml_editor_moves_across_lines_and_replaces_the_selection() {
+        let mut editor = TomlEditor::new(
+            PathBuf::from("dvup_custom.toml"),
+            "abc\nde\nfghi".to_owned(),
+        );
+
+        editor.move_right(false);
+        editor.move_right(false);
+        editor.move_vertical(1, false);
+        assert_eq!(editor.cursor, 6);
+
+        editor.move_vertical(1, true);
+        assert_eq!(editor.selected_text(), Some("\nfg"));
+
+        editor.insert_text("中\r\n文");
+        assert_eq!(editor.text, "abc\nde中\n文hi");
+        assert!(editor.dirty);
+        assert!(editor.selection().is_none());
+    }
+
+    #[test]
+    fn toml_editor_toggles_selected_line_comments_and_undoes_as_one_action() {
+        let source = concat!(
+            "version = 1\n",
+            "[tools.example]\n",
+            "update = [\"example\", \"update\"]\n",
+            "probe = [\"example\", \"--version\"]\n",
+        );
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), source.to_owned());
+        let original_anchor = source.find("tools").expect("selection start");
+        let original_cursor = source.find("probe").expect("selection end");
+        editor.selection_anchor = Some(original_anchor);
+        editor.cursor = original_cursor;
+
+        assert_eq!(
+            editor.toggle_line_comments(),
+            Some(TomlCommentAction::Commented)
+        );
+        assert_eq!(
+            editor.text,
+            concat!(
+                "version = 1\n",
+                "# [tools.example]\n",
+                "# update = [\"example\", \"update\"]\n",
+                "probe = [\"example\", \"--version\"]\n",
+            )
+        );
+        assert_eq!(editor.revision, 1);
+        assert!(editor.dirty);
+        assert_eq!(editor.undo_stack.len(), 1);
+
+        assert!(editor.undo());
+        assert_eq!(editor.text, source);
+        assert_eq!(editor.selection_anchor, Some(original_anchor));
+        assert_eq!(editor.cursor, original_cursor);
+        assert!(!editor.dirty);
+
+        assert!(editor.redo());
+        assert!(editor.text.contains("# [tools.example]"));
+        assert!(editor.text.contains("# update ="));
+        assert_eq!(editor.revision, 3);
+        assert!(editor.dirty);
+    }
+
+    #[test]
+    fn toml_editor_uncomments_indented_lines_and_excludes_selection_end_line() {
+        let source = "  # first = 1\n  #second = 2\nthird = 3";
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), source.to_owned());
+        editor.selection_anchor = Some(2);
+        editor.cursor = source.find("third").expect("third line start");
+
+        assert_eq!(
+            editor.toggle_line_comments(),
+            Some(TomlCommentAction::Uncommented)
+        );
+
+        assert_eq!(editor.text, "  first = 1\n  second = 2\nthird = 3");
+        assert!(!editor.text.contains("# third"));
+    }
+
+    #[test]
+    fn toml_editor_undo_tracks_saved_text_and_new_edits_clear_redo() {
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), "a".to_owned());
+        editor.move_end(true, false);
+        editor.insert_text("b");
+        editor.mark_saved();
+        assert!(!editor.dirty);
+
+        assert!(editor.undo());
+        assert_eq!(editor.text, "a");
+        assert!(editor.dirty);
+        assert!(editor.redo());
+        assert_eq!(editor.text, "ab");
+        assert!(!editor.dirty);
+
+        assert!(editor.undo());
+        editor.insert_text("c");
+        assert_eq!(editor.text, "ac");
+        assert!(!editor.redo());
+    }
+
+    #[test]
+    fn queued_toml_paste_is_undone_in_one_step() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), String::new()),
+        };
+        let events =
+            (0..1_000).map(|_| Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+        handle_event_batch(&mut app, events);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor }
+                if editor.text.is_empty() && editor.revision == 2 && !editor.dirty
+        ));
+        assert_eq!(app.message, "Undid TOML edit");
+    }
+
+    #[test]
+    fn toml_editor_comment_and_redo_shortcuts_dispatch_to_the_editor() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), "value = 1".to_owned()),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor } if editor.text == "# value = 1"
+        ));
+        assert_eq!(app.message, "Commented TOML line(s)");
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor } if editor.text == "value = 1"
+        ));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        );
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor } if editor.text == "# value = 1"
+        ));
+        assert_eq!(app.message, "Redid TOML edit");
+    }
+
+    #[test]
+    fn toml_editor_history_is_bounded() {
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), String::new());
+
+        for _ in 0..(TOML_HISTORY_LIMIT + 25) {
+            editor.insert_text("x");
+        }
+
+        assert_eq!(editor.undo_stack.len(), TOML_HISTORY_LIMIT);
+        assert!(
+            editor
+                .undo_stack
+                .iter()
+                .map(|snapshot| snapshot.text.len())
+                .sum::<usize>()
+                <= TOML_HISTORY_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn toml_editor_seeds_a_valid_manifest_for_the_focused_tool() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let app = App::new(state.clone(), None).expect("app");
+        let path = state.custom_config_path();
+
+        let text = app.toml_editor_text(&path).expect("seed TOML");
+        let parsed = UserConfig::parse(&text).expect("valid seed TOML");
+
+        assert_eq!(parsed.tools.len(), 1);
+        assert!(
+            parsed
+                .tools
+                .contains_key(&app.focused_tool().expect("tool").name)
+        );
+        assert!(text.contains("update = ["));
+        assert!(text.contains("probe = ["));
+        assert!(!text.contains("program ="));
+        assert!(!text.contains("lock_timeout_secs"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn tools_t_opens_the_explicit_toml_file() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let path = temporary.path().join("manifest.toml");
+        let mut config = UserConfig::empty();
+        config.tools.insert(
+            "example".to_owned(),
+            UserTool::custom("example", "example".to_owned(), vec!["update".to_owned()]),
+        );
+        config.save(&path).expect("save manifest");
+        let expected = std::fs::read_to_string(&path).expect("read manifest");
+        let mut app = App::new(state, Some(path.clone())).expect("app");
+        assert_eq!(
+            app.tools
+                .iter()
+                .find(|tool| tool.name == "example")
+                .expect("explicit custom tool")
+                .kind,
+            ToolKind::Custom
+        );
+        assert_eq!(
+            app.tools
+                .iter()
+                .find(|tool| tool.name == "dvup")
+                .expect("built-in tool")
+                .kind,
+            ToolKind::BuiltIn
+        );
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor }
+                if editor.path == path && editor.text == expected && !editor.dirty
+        ));
+    }
+
+    #[test]
+    fn direct_toml_file_opens_even_when_the_source_is_invalid() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let path = temporary.path().join("broken.toml");
+        std::fs::write(&path, "invalid =").expect("write invalid TOML");
+        let mut app = App::new(state, None).expect("app");
+
+        app.open_toml_file(path.clone())
+            .expect("open invalid TOML source");
+
+        assert_eq!(app.config_path.as_deref(), Some(path.as_path()));
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor }
+                if editor.path == path && editor.text == "invalid =" && !editor.dirty
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_inside_toml_editor_never_arms_or_exits_the_tui() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), "version = 1".to_owned()),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(app.modal, Modal::TomlEditor { .. }));
+        assert!(!app.ctrl_c_armed);
+        assert!(!app.should_quit);
+        assert_eq!(app.message, "Select TOML text before copying");
+    }
+
+    #[test]
+    fn bracketed_paste_replaces_the_toml_editor_selection() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), "old value".to_owned());
+        editor.selection_anchor = Some(0);
+        editor.cursor = 3;
+        app.modal = Modal::TomlEditor { editor };
+
+        handle_paste(&mut app, "new\r\nline");
+
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor }
+                if editor.text == "new\nline value" && editor.dirty
+        ));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn queued_toml_character_events_are_inserted_as_one_batch() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), String::new()),
+        };
+        let initial_message = app.message.clone();
+        let events =
+            (0..1_000).map(|_| Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+
+        handle_event_batch(&mut app, events);
+
+        let Modal::TomlEditor { editor } = &app.modal else {
+            panic!("TOML editor");
+        };
+        assert_eq!(editor.text, "x".repeat(1_000));
+        assert_eq!(editor.revision, 1);
+        assert_eq!(app.message, initial_message);
+    }
+
+    #[test]
+    fn queued_toml_multiline_input_is_inserted_as_one_batch() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), String::new()),
+        };
+        let events = [
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+        ];
+
+        handle_event_batch(&mut app, events);
+
+        let Modal::TomlEditor { editor } = &app.modal else {
+            panic!("TOML editor");
+        };
+        assert_eq!(editor.text, "a\n\tb");
+        assert_eq!(editor.revision, 1);
+    }
+
+    #[test]
+    fn queued_toml_input_flushes_before_navigation() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), String::new()),
+        };
+        let events = [
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        ];
+
+        handle_event_batch(&mut app, events);
+
+        let Modal::TomlEditor { editor } = &app.modal else {
+            panic!("TOML editor");
+        };
+        assert_eq!(editor.text, "axb");
+        assert_eq!(editor.cursor, 2);
+        assert_eq!(editor.revision, 2);
+    }
+
+    #[test]
+    fn toml_highlights_preserve_source_and_distinguish_token_kinds() {
+        let source = concat!(
+            "# comment\n",
+            "enabled = true\n",
+            "count = 42\n",
+            "ratio = 1.5\n",
+            "name = \"dvup\"\n",
+            "released = 2026-07-12T12:30:00Z\n",
+            "\n",
+            "[tools.codex]\n",
+        );
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), source.to_owned());
+
+        editor.refresh_highlights();
+
+        let reconstructed = editor
+            .highlights
+            .iter()
+            .map(|highlight| &editor.text[highlight.start..highlight.end])
+            .collect::<String>();
+        assert_eq!(reconstructed, source);
+
+        let style_at = |needle: &str| {
+            let index = source.find(needle).expect("highlighted token");
+            editor
+                .highlights
+                .iter()
+                .find(|highlight| highlight.start <= index && index < highlight.end)
+                .expect("style at source offset")
+                .style
+        };
+        assert_eq!(style_at("# comment").fg, Some(TOML_COMMENT));
+        assert_eq!(style_at("enabled").fg, Some(TOML_KEY));
+        assert_eq!(style_at("true").fg, Some(TOML_BOOLEAN));
+        assert_eq!(style_at("42").fg, Some(TOML_NUMBER));
+        assert_eq!(style_at("1.5").fg, Some(TOML_NUMBER));
+        assert_eq!(style_at("\"dvup\"").fg, Some(TOML_STRING));
+        assert_eq!(style_at("2026-07-12T12:30:00Z").fg, Some(TOML_DATE_TIME));
+        assert_eq!(style_at("tools").fg, Some(TOML_KEY));
+    }
+
+    #[test]
+    fn toml_highlighting_handles_incomplete_source_without_losing_text() {
+        let source = "[tools.claude]\nprogram =";
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), source.to_owned());
+
+        editor.refresh_highlights();
+
+        assert_eq!(
+            editor
+                .highlights
+                .iter()
+                .map(|highlight| &editor.text[highlight.start..highlight.end])
+                .collect::<String>(),
+            source
+        );
+        assert_eq!(editor.highlighted_revision, editor.revision);
+    }
+
+    #[test]
+    fn toml_selection_style_overrides_syntax_highlighting() {
+        let source = "enabled = true # note";
+        let mut editor = TomlEditor::new(PathBuf::from("dvup_custom.toml"), source.to_owned());
+        editor.selection_anchor = Some(source.find("true").expect("boolean"));
+        editor.cursor = editor.selection_anchor.expect("anchor") + "true".len();
+        editor.refresh_highlights();
+
+        let line = toml_editor_line(&editor, 0, source.len());
+        let selected = line
+            .spans
+            .iter()
+            .find(|span| span.content == "true")
+            .expect("selected boolean span");
+        let key = line
+            .spans
+            .iter()
+            .find(|span| span.content == "enabled")
+            .expect("syntax-highlighted key span");
+
+        assert_eq!(selected.style.bg, Some(ACCENT));
+        assert_eq!(selected.style.fg, Some(Color::Black));
+        assert_eq!(key.style.fg, Some(TOML_KEY));
+        assert_eq!(key.style.bg, Some(SURFACE));
+    }
+
+    #[test]
+    fn toml_editor_renders_syntax_colors() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(
+                PathBuf::from("dvup_custom.toml"),
+                "# comment\nname = \"dvup\"\ncount = 42".to_owned(),
+            ),
+        };
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render highlighted TOML editor");
+
+        let area = app.toml_editor_hitbox.expect("TOML content hitbox").area;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(area.x, area.y)].fg, TOML_COMMENT);
+        assert_eq!(buffer[(area.x, area.y + 1)].fg, TOML_KEY);
+        assert_eq!(buffer[(area.x + 7, area.y + 1)].fg, TOML_STRING);
+        assert_eq!(buffer[(area.x + 8, area.y + 2)].fg, TOML_NUMBER);
+    }
+
+    #[test]
+    fn toml_editor_saves_valid_source_text_and_rejects_invalid_toml() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let path = temporary.path().join("manifest.toml");
+        let mut config = UserConfig::empty();
+        config.tools.insert(
+            "example".to_owned(),
+            UserTool::custom("example", "example".to_owned(), vec!["update".to_owned()]),
+        );
+        config.save(&path).expect("save manifest");
+        let mut app = App::new(state, Some(path.clone())).expect("app");
+        app.open_toml_editor();
+        let Modal::TomlEditor { editor } = &mut app.modal else {
+            panic!("TOML editor");
+        };
+        editor.text.insert_str(0, "# preserved comment\n");
+        editor.dirty = true;
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+
+        let saved = std::fs::read_to_string(&path).expect("saved TOML");
+        assert!(saved.starts_with("# preserved comment\n"));
+        assert!(matches!(&app.modal, Modal::TomlEditor { editor } if !editor.dirty));
+
+        let Modal::TomlEditor { editor } = &mut app.modal else {
+            panic!("TOML editor");
+        };
+        editor.text = "invalid =".to_owned();
+        editor.cursor = editor.text.len();
+        editor.dirty = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged TOML"),
+            saved
+        );
+        assert!(app.message.starts_with("TOML was not saved:"));
+        assert!(matches!(&app.modal, Modal::TomlEditor { editor } if editor.dirty));
+    }
+
+    #[test]
+    fn toml_editor_mouse_wheel_scrolls_and_drag_selects_source_text() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let text = (0..30)
+            .map(|index| format!("line{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), text),
+        };
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TOML editor");
+        let hitbox = app.toml_editor_hitbox.expect("editor hitbox");
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: hitbox.area.x,
+                row: hitbox.area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(matches!(&app.modal, Modal::TomlEditor { editor } if editor.scroll_y == 1));
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("redraw scrolled TOML editor");
+        assert!(matches!(&app.modal, Modal::TomlEditor { editor } if editor.scroll_y == 1));
+
+        for (kind, expected) in [
+            (MouseEventKind::ScrollDown, 2),
+            (MouseEventKind::ScrollUp, 1),
+        ] {
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind,
+                    column: hitbox.area.x,
+                    row: hitbox.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("redraw repeatedly scrolled TOML editor");
+            assert!(matches!(
+                &app.modal,
+                Modal::TomlEditor { editor } if editor.scroll_y == expected
+            ));
+        }
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hitbox.area.x,
+                row: hitbox.area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: hitbox.area.x.saturating_add(4),
+                row: hitbox.area.y.saturating_add(1),
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor }
+                if editor.selected_text().is_some_and(|text| text.contains("line01\nline"))
+        ));
+    }
+
+    #[test]
+    fn toml_editor_renders_copy_paste_and_mouse_help() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), "version = 1".to_owned()),
+        };
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TOML editor");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(screen.contains("TOML editor"), "screen: {screen}");
+        assert!(screen.contains("Ctrl+C"), "screen: {screen}");
+        assert!(screen.contains("Ctrl+V"), "screen: {screen}");
+        assert!(screen.contains("Ctrl+/"), "screen: {screen}");
+        assert!(screen.contains("Ctrl+Z/Y"), "screen: {screen}");
+        assert!(screen.contains("mouse drag selects"), "screen: {screen}");
+    }
+
+    #[test]
+    fn toml_editor_scrollbar_reaches_the_bottom_at_the_last_viewport() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let text = (0..40)
+            .map(|index| format!("line{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.modal = Modal::TomlEditor {
+            editor: TomlEditor::new(PathBuf::from("dvup_custom.toml"), text),
+        };
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render TOML editor");
+        let hitbox = app.toml_editor_hitbox.expect("editor hitbox");
+        let Modal::TomlEditor { editor } = &mut app.modal else {
+            panic!("TOML editor");
+        };
+        editor.scroll_y = editor
+            .line_ranges()
+            .len()
+            .saturating_sub(usize::from(hitbox.area.height));
+        editor.follow_cursor = false;
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render final TOML viewport");
+
+        let bottom = terminal
+            .backend()
+            .buffer()
+            .cell((hitbox.area.right(), hitbox.area.bottom().saturating_sub(1)))
+            .expect("scrollbar bottom cell");
+        assert_eq!(bottom.symbol(), "█");
+    }
+
+    #[test]
+    fn doctor_table_wheel_scrolls_after_the_terminal_height_shrinks() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.tab = Tab::Doctor;
+        app.doctor_checked_at = Some("2026-07-12 22:00:00".to_owned());
+        app.doctor_diagnoses = (0..20)
+            .map(|index| {
+                test_diagnosis(&format!("tool{index:02}"), &[("path/tool", Some("1.0.0"))])
+            })
+            .collect();
+
+        let large_backend = TestBackend::new(100, 30);
+        let mut large_terminal = Terminal::new(large_backend).expect("large terminal");
+        large_terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render large Doctor view");
+        drop(large_terminal);
+
+        let small_backend = TestBackend::new(100, 16);
+        let mut small_terminal = Terminal::new(small_backend).expect("small terminal");
+        small_terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render resized Doctor view");
+        let table_row = app.doctor_hitboxes.get(1).expect("second Doctor row").0;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: table_row.x,
+                row: table_row.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.doctor_index, 1);
+
+        for expected in [2, 3] {
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: table_row.x,
+                    row: table_row.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            small_terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("redraw scrolled Doctor view");
+            assert_eq!(app.doctor_index, expected);
+            assert_eq!(
+                hitbox_target(&app.doctor_hitboxes, table_row.x, table_row.y),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn list_scroll_keeps_focus_on_the_mouse_screen_row() {
+        let mut viewport = ListViewport::default();
+        viewport.update(Rect::new(10, 20, 30, 4), 10, 3);
+
+        assert_eq!(viewport.scroll_at(12, 21, 1), Some(5));
+        assert_eq!(viewport.offset(), 4);
+        assert_eq!(viewport.scroll_at(12, 21, -1), Some(4));
+        assert_eq!(viewport.offset(), 3);
     }
 }

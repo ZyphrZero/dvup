@@ -7,6 +7,7 @@ mod doctor;
 mod error;
 mod job;
 mod process;
+mod settings;
 mod state;
 mod tui;
 mod worker;

@@ -11,7 +11,10 @@ use fs2::FileExt;
 
 use crate::{
     command,
-    config::{self, Config, ProcessAction, ProcessRule, Tool},
+    config::{
+        self, Config, ProcessAction, ProcessRule, Tool, ToolBackground, ToolProbe, UserConfig,
+        UserTool,
+    },
     datetime, detach, doctor,
     error::{Error, Result},
     job::{Job, JobStatus, JobStore},
@@ -22,21 +25,40 @@ use crate::{
 
 /// Lock-aware, cross-platform toolchain updater.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version, about, subcommand_precedence_over_arg = true)]
 pub struct Cli {
     /// Override the per-user directory used for jobs and logs.
     #[arg(long, global = true, env = "DVUP_STATE_DIR")]
     state_dir: Option<PathBuf>,
 
+    /// Open an existing TOML file directly in the interactive editor.
+    #[arg(value_name = "TOML", value_parser = parse_toml_file)]
+    toml_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+fn parse_toml_file(value: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+    {
+        return Err("direct editor input must be a .toml file".to_owned());
+    }
+    if !path.is_file() {
+        return Err(format!("TOML file does not exist: {}", path.display()));
+    }
+    Ok(path)
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Launch the interactive terminal interface.
     Tui {
-        /// Custom manifest; otherwise use user customizations and built-ins.
+        /// Explicit user manifest layered on built-ins; otherwise use global dvup_custom.toml.
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -65,8 +87,9 @@ enum Commands {
     /// Remove a user-level custom update command.
     Remove { name: String },
 
-    /// Export the built-in presets to an editable .dvup.toml file.
+    /// Create a clean global user manifest without copying built-ins.
     Init {
+        /// Write to an explicit path instead of the global dvup_custom.toml.
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -84,16 +107,23 @@ enum Commands {
         /// Extra arguments appended to the tool command.
         #[arg(conflicts_with = "all")]
         extra_args: Vec<String>,
-        /// Custom manifest; otherwise use .dvup.toml when present, then built-ins.
+        /// Explicit user manifest layered on built-ins; otherwise use global dvup_custom.toml.
         #[arg(long)]
         config: Option<PathBuf>,
         #[command(flatten)]
         execution: ExecutionOptions,
     },
 
+    /// Update dvup itself from crates.io in a detached worker.
+    SelfUpdate {
+        /// Reinstall even when the installed version is already current.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Show built-in/configured tools and whether they are installed.
     List {
-        /// Custom manifest; otherwise use .dvup.toml when present, then built-ins.
+        /// Explicit user manifest layered on built-ins; otherwise use global dvup_custom.toml.
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -102,7 +132,7 @@ enum Commands {
     Doctor {
         /// Inspect only one configured tool.
         tool: Option<String>,
-        /// Custom manifest; otherwise use user customizations and built-ins.
+        /// Explicit user manifest layered on built-ins; otherwise use global dvup_custom.toml.
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -113,8 +143,8 @@ enum Commands {
         #[arg(long, default_value = "ad-hoc")]
         name: String,
         /// Process name that must exit before the command can run. Repeatable.
-        #[arg(long = "lock-process")]
-        lock_processes: Vec<String>,
+        #[arg(long = "wait-for")]
+        wait_for: Vec<String>,
         /// Process policy in `ACTION:NAME[:COMMAND_CONTAINS]` form. Repeatable.
         #[arg(long = "process-rule", value_name = "ACTION:NAME[:COMMAND_CONTAINS]")]
         process_rules: Vec<ProcessRule>,
@@ -142,7 +172,7 @@ enum Commands {
     Worker { job_id: String },
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum BackgroundMode {
     /// Defer only when a configured process is active or the command reports a lock.
     Auto,
@@ -164,15 +194,12 @@ struct ExecutionOptions {
 pub fn run(cli: Cli) -> Result<u8> {
     let state = match cli.state_dir {
         Some(root) => StateDirs::at_runtime(root),
-        None => match std::env::var_os("KVDEV_STATE_DIR") {
-            Some(root) => StateDirs::at_runtime(root.into()),
-            None => StateDirs::discover()?,
-        },
+        None => StateDirs::discover()?,
     };
 
     match cli.command {
-        None => crate::tui::run(state, None),
-        Some(Commands::Tui { config }) => crate::tui::run(state, config),
+        None => crate::tui::run(state, None, cli.toml_file),
+        Some(Commands::Tui { config }) => crate::tui::run(state, config, None),
         Some(Commands::Add {
             name,
             force,
@@ -184,7 +211,7 @@ pub fn run(cli: Cli) -> Result<u8> {
             command,
         }) => edit_custom_tool(state, &original_name, name, command),
         Some(Commands::Remove { name }) => remove_custom_tool(state, &name),
-        Some(Commands::Init { config, force }) => init(config, force),
+        Some(Commands::Init { config, force }) => init(&state, config, force),
         Some(Commands::Update {
             tool,
             all,
@@ -214,12 +241,27 @@ pub fn run(cli: Cli) -> Result<u8> {
                     std::env::consts::OS
                 )));
             }
+            ensure_tool_ready(&tool, &definition, &working_directory)?;
+            let background = effective_background(execution.background, definition.background);
             definition.args.extend(extra_args);
             let mut job = Job::from_tool(tool, definition, working_directory);
             if execution.terminate_locking_processes {
                 job.terminate_waiting_processes()?;
             }
-            execute(job, execution.background, state)
+            execute(job, background, state)
+        }
+        Some(Commands::SelfUpdate { force }) => {
+            let mut definition = Config::starter()
+                .tools
+                .remove("dvup")
+                .expect("bundled dvup self-update preset");
+            if force {
+                definition.args.push("--force".to_owned());
+            }
+            let working_directory = std::env::current_dir()?;
+            ensure_tool_ready("dvup", &definition, &working_directory)?;
+            let job = Job::from_tool("dvup".to_owned(), definition, working_directory);
+            execute(job, BackgroundMode::Always, state)
         }
         Some(Commands::List { config }) => {
             let (manifest, working_directory, source) = load_manifest(config, &state)?;
@@ -231,7 +273,7 @@ pub fn run(cli: Cli) -> Result<u8> {
         }
         Some(Commands::Run {
             name,
-            lock_processes,
+            wait_for,
             process_rules,
             lock_timeout_secs,
             retries,
@@ -242,11 +284,17 @@ pub fn run(cli: Cli) -> Result<u8> {
             let Some((program, args)) = command.split_first() else {
                 return Err(Error::EmptyCommand);
             };
+            let mut processes = process_rules;
+            processes.extend(wait_for.into_iter().map(ProcessRule::wait));
             let definition = Tool {
                 program: program.clone(),
                 args: args.to_vec(),
-                lock_processes,
-                processes: process_rules,
+                probe: ToolProbe {
+                    program: name.clone(),
+                    args: vec!["--version".to_owned()],
+                },
+                background: ToolBackground::Auto,
+                processes,
                 lock_timeout_secs,
                 retries,
                 retry_delay_secs,
@@ -272,11 +320,36 @@ fn should_update_all(explicit_all: bool, tool: &Option<String>) -> bool {
     explicit_all || tool.is_none()
 }
 
+fn ensure_tool_ready(name: &str, tool: &Tool, working_directory: &std::path::Path) -> Result<()> {
+    match command::tool_readiness(tool, working_directory) {
+        command::ToolReadiness::Installed => Ok(()),
+        command::ToolReadiness::TargetMissing => Err(Error::Message(format!(
+            "tool `{name}` is not installed or `{}` is not on PATH",
+            tool.probe.program
+        ))),
+        command::ToolReadiness::UpdaterMissing => Err(Error::Message(format!(
+            "tool `{name}` cannot be updated because `{}` is not installed or not on PATH",
+            tool.program
+        ))),
+        command::ToolReadiness::Unsupported => Err(Error::Message(format!(
+            "tool `{name}` is not enabled on {}",
+            std::env::consts::OS
+        ))),
+    }
+}
+
+fn effective_background(requested: BackgroundMode, configured: ToolBackground) -> BackgroundMode {
+    match configured {
+        ToolBackground::Auto => requested,
+        ToolBackground::Always => BackgroundMode::Always,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ManifestSource {
     BuiltIn,
     Customized,
-    File,
+    Explicit,
 }
 
 pub(crate) fn load_manifest(
@@ -285,36 +358,33 @@ pub(crate) fn load_manifest(
 ) -> Result<(Config, PathBuf, ManifestSource)> {
     if let Some(path) = config_path {
         let working_directory = config_working_directory(&path)?;
-        return Ok((
-            Config::load(&path)?,
-            working_directory,
-            ManifestSource::File,
-        ));
+        let mut manifest = Config::starter();
+        manifest
+            .tools
+            .extend(UserConfig::load(&path)?.resolve()?.tools);
+        manifest.validate()?;
+        return Ok((manifest, working_directory, ManifestSource::Explicit));
     }
 
     let mut manifest = Config::starter();
     let mut customized = false;
     let custom_path = state.custom_config_path();
     if custom_path.is_file() {
-        manifest.tools.extend(Config::load(&custom_path)?.tools);
+        manifest
+            .tools
+            .extend(UserConfig::load(&custom_path)?.resolve()?.tools);
         customized = true;
     }
 
-    let default_path = config::default_path()?;
-    let legacy_path = config::legacy_default_path()?;
-    let local_path = local_manifest_path(default_path, legacy_path);
-    if let Some(local_path) = local_path {
-        manifest.tools.extend(Config::load(&local_path)?.tools);
-        return Ok((
-            manifest,
-            config_working_directory(&local_path)?,
-            ManifestSource::Customized,
-        ));
-    }
-
+    manifest.validate()?;
+    let working_directory = if customized {
+        config_working_directory(&custom_path)?
+    } else {
+        std::env::current_dir()?
+    };
     Ok((
         manifest,
-        std::env::current_dir()?,
+        working_directory,
         if customized {
             ManifestSource::Customized
         } else {
@@ -331,24 +401,19 @@ fn list_tools(
     let source = match source {
         ManifestSource::BuiltIn => "built-in presets",
         ManifestSource::Customized => "built-in presets + user customization",
-        ManifestSource::File => ".dvup.toml/custom manifest",
+        ManifestSource::Explicit => "built-in presets + explicit user manifest",
     };
     println!("source: {source}\n");
     println!("{:<18} {:<12} COMMAND", "TOOL", "STATUS");
     for (name, tool) in &manifest.tools {
-        let command_spec = crate::job::CommandSpec {
-            program: tool.program.clone(),
-            args: tool.args.clone(),
-            working_directory: working_directory.to_path_buf(),
+        let update_command = command::update_spec(tool, working_directory);
+        let status = match command::tool_readiness(tool, working_directory) {
+            command::ToolReadiness::Unsupported => "unsupported",
+            command::ToolReadiness::TargetMissing => "missing",
+            command::ToolReadiness::UpdaterMissing => "no updater",
+            command::ToolReadiness::Installed => "installed",
         };
-        let status = if !tool.supports_current_platform() {
-            "unsupported"
-        } else if command::is_available(&command_spec) {
-            "installed"
-        } else {
-            "missing"
-        };
-        let actual_command = format_command(&command_spec);
+        let actual_command = format_command(&update_command);
         println!(
             "{name:<18} {status:<12} {}",
             display_command(name, &actual_command)
@@ -369,9 +434,9 @@ fn add_custom_tool(
     state.ensure()?;
     let path = state.custom_config_path();
     let mut custom = if path.is_file() {
-        Config::load(&path)?
+        UserConfig::load(&path)?
     } else {
-        Config::empty()
+        UserConfig::empty()
     };
     let conflicts = custom.tools.contains_key(&name) || Config::starter().tools.contains_key(&name);
     if conflicts && !force {
@@ -382,7 +447,7 @@ fn add_custom_tool(
 
     custom.tools.insert(
         name.clone(),
-        Tool::custom(&name, program.clone(), args.to_vec()),
+        UserTool::custom(&name, program.clone(), args.to_vec()),
     );
     custom.save(&path)?;
     println!("added {name}: {}", command.join(" "));
@@ -406,7 +471,7 @@ fn edit_custom_tool(
             "custom tool `{original_name}` does not exist"
         )));
     }
-    let mut custom = Config::load(&path)?;
+    let mut custom = UserConfig::load(&path)?;
     if !custom.tools.contains_key(original_name) {
         return Err(Error::Message(format!(
             "custom tool `{original_name}` does not exist"
@@ -421,7 +486,7 @@ fn edit_custom_tool(
     custom.tools.remove(original_name);
     custom.tools.insert(
         name.clone(),
-        Tool::custom(&name, program.clone(), args.to_vec()),
+        UserTool::custom(&name, program.clone(), args.to_vec()),
     );
     custom.save(&path)?;
     if name == original_name {
@@ -441,7 +506,7 @@ fn remove_custom_tool(state: StateDirs, name: &str) -> Result<u8> {
             "custom tool `{name}` does not exist"
         )));
     }
-    let mut custom = Config::load(&path)?;
+    let mut custom = UserConfig::load(&path)?;
     if custom.tools.remove(name).is_none() {
         return Err(Error::Message(format!(
             "custom tool `{name}` does not exist"
@@ -528,13 +593,15 @@ fn update_all(
     detach::cleanup_workers(store.dirs())?;
 
     for (index, (name, tool)) in manifest.tools.into_iter().enumerate() {
-        let supported = tool.supports_current_platform();
+        let readiness = command::tool_readiness(&tool, &working_directory);
+        let probe_program = tool.probe.program.clone();
+        let tool_mode = effective_background(mode, tool.background);
         let mut job = Job::from_tool(name.clone(), tool, working_directory.clone());
         if terminate_locking_processes {
             job.terminate_waiting_processes()?;
         }
         let command_text = format_command(&job.command);
-        if !supported {
+        if readiness == command::ToolReadiness::Unsupported {
             reports.push(BatchReport {
                 index,
                 name,
@@ -547,7 +614,7 @@ fn update_all(
             });
             continue;
         }
-        if !command::is_available(&job.command) {
+        if readiness == command::ToolReadiness::TargetMissing {
             reports.push(BatchReport {
                 index,
                 name,
@@ -555,12 +622,28 @@ fn update_all(
                 resource_group: job.resource_group,
                 elapsed: Duration::ZERO,
                 status: BatchStatus::Skipped {
-                    reason: format!("`{}` is not installed or not on PATH", job.command.program),
+                    reason: format!("`{probe_program}` is not installed or not on PATH"),
                 },
             });
             continue;
         }
-        candidates.push((index, name, command_text, job));
+        if readiness == command::ToolReadiness::UpdaterMissing {
+            reports.push(BatchReport {
+                index,
+                name,
+                command: command_text,
+                resource_group: job.resource_group,
+                elapsed: Duration::ZERO,
+                status: BatchStatus::Skipped {
+                    reason: format!(
+                        "update program `{}` is not installed or not on PATH",
+                        job.command.program
+                    ),
+                },
+            });
+            continue;
+        }
+        candidates.push((index, name, command_text, job, tool_mode));
     }
 
     println!(
@@ -570,7 +653,7 @@ fn update_all(
     );
 
     let mut handles = Vec::new();
-    for (index, name, command_text, job) in candidates {
+    for (index, name, command_text, job, tool_mode) in candidates {
         let state = state.clone();
         let thread_name = format!("update-{name}");
         let resource_group = job.resource_group.clone();
@@ -579,7 +662,7 @@ fn update_all(
         let error_resource_group = resource_group.clone();
         let handle = thread::Builder::new().name(thread_name).spawn(move || {
             let started = Instant::now();
-            let result = execute_inner(job, mode, state);
+            let result = execute_inner(job, tool_mode, state);
             let status = match result {
                 Ok(success) => match success.kind {
                     ExecutionKind::Updated => BatchStatus::Updated,
@@ -639,13 +722,16 @@ fn update_all(
     Ok(render_batch_report(&reports, started.elapsed()))
 }
 
-fn init(path: Option<PathBuf>, force: bool) -> Result<u8> {
-    let path = path.map(Ok).unwrap_or_else(config::default_path)?;
+fn init(state: &StateDirs, path: Option<PathBuf>, force: bool) -> Result<u8> {
+    let path = path.unwrap_or_else(|| state.custom_config_path());
     if path.exists() && !force {
         return Err(Error::FileExists(path));
     }
-    let template = config::starter_template();
-    let _validated_template = Config::starter();
+    let template = config::USER_TEMPLATE;
+    let _validated_template = UserConfig::parse(template)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(&path, template)?;
     println!("created {}", path.display());
     Ok(0)
@@ -1010,14 +1096,6 @@ fn config_working_directory(path: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
-fn local_manifest_path(default_path: PathBuf, legacy_path: PathBuf) -> Option<PathBuf> {
-    if default_path.is_file() {
-        Some(default_path)
-    } else {
-        legacy_path.is_file().then_some(legacy_path)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,7 +1144,7 @@ mod tests {
     #[test]
     fn relative_config_uses_current_directory() {
         assert_eq!(
-            config_working_directory(std::path::Path::new(".dvup.toml"))
+            config_working_directory(std::path::Path::new("dvup_custom.toml"))
                 .expect("working directory"),
             std::env::current_dir().expect("current directory")
         );
@@ -1075,26 +1153,10 @@ mod tests {
     #[test]
     fn nested_config_uses_its_parent() {
         assert_eq!(
-            config_working_directory(std::path::Path::new("config/.dvup.toml"))
+            config_working_directory(std::path::Path::new("config/tools.toml"))
                 .expect("working directory"),
             PathBuf::from("config")
         );
-    }
-
-    #[test]
-    fn local_manifest_prefers_dvup_and_falls_back_to_kvdev() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let current = temporary.path().join(".dvup.toml");
-        let legacy = temporary.path().join(".kvdev.toml");
-
-        std::fs::write(&legacy, "version = 1").expect("write legacy manifest");
-        assert_eq!(
-            local_manifest_path(current.clone(), legacy.clone()),
-            Some(legacy.clone())
-        );
-
-        std::fs::write(&current, "version = 1").expect("write current manifest");
-        assert_eq!(local_manifest_path(current.clone(), legacy), Some(current));
     }
 
     #[test]
@@ -1108,6 +1170,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_self_update_and_force() {
+        let regular = Cli::try_parse_from(["dvup", "self-update"]).expect("parse self-update");
+        assert!(matches!(
+            regular.command,
+            Some(Commands::SelfUpdate { force: false })
+        ));
+
+        let forced =
+            Cli::try_parse_from(["dvup", "self-update", "--force"]).expect("parse --force");
+        assert!(matches!(
+            forced.command,
+            Some(Commands::SelfUpdate { force: true })
+        ));
+    }
+
+    #[test]
+    fn configured_background_always_overrides_the_requested_mode() {
+        assert_eq!(
+            effective_background(BackgroundMode::Never, ToolBackground::Always),
+            BackgroundMode::Always
+        );
+        assert_eq!(
+            effective_background(BackgroundMode::Never, ToolBackground::Auto),
+            BackgroundMode::Never
+        );
+    }
+
+    #[test]
     fn parses_terminate_locking_processes_policy() {
         let cli = Cli::try_parse_from(["dvup", "update", "codex", "--terminate-locking-processes"])
             .expect("parse terminate policy");
@@ -1118,6 +1208,26 @@ mod tests {
             }
             _ => panic!("expected update command"),
         }
+    }
+
+    #[test]
+    fn parses_run_wait_for_processes() {
+        let cli = Cli::try_parse_from([
+            "dvup",
+            "run",
+            "--wait-for",
+            "example",
+            "--",
+            "updater",
+            "update",
+        ])
+        .expect("parse run wait rule");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Run { wait_for, command, .. })
+                if wait_for == ["example"] && command == ["updater", "update"]
+        ));
     }
 
     #[test]
@@ -1258,6 +1368,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_an_existing_toml_file_as_a_direct_editor_target() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let path = temporary.path().join("broken.toml");
+        std::fs::write(&path, "invalid =").expect("write TOML");
+
+        let cli = Cli::try_parse_from([std::ffi::OsStr::new("dvup"), path.as_os_str()])
+            .expect("parse direct TOML editor target");
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.toml_file.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn direct_editor_target_requires_an_existing_toml_file() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let text = temporary.path().join("notes.txt");
+        std::fs::write(&text, "text").expect("write text file");
+        let missing = temporary.path().join("missing.toml");
+
+        assert!(Cli::try_parse_from([std::ffi::OsStr::new("dvup"), text.as_os_str()]).is_err());
+        assert!(Cli::try_parse_from([std::ffi::OsStr::new("dvup"), missing.as_os_str()]).is_err());
+    }
+
+    #[test]
+    fn global_state_directory_still_combines_with_subcommands() {
+        let cli = Cli::try_parse_from(["dvup", "--state-dir", "state", "list"])
+            .expect("parse global state directory with subcommand");
+
+        assert_eq!(
+            cli.state_dir.as_deref(),
+            Some(std::path::Path::new("state"))
+        );
+        assert!(matches!(cli.command, Some(Commands::List { config: None })));
+        assert!(cli.toml_file.is_none());
+    }
+
+    #[test]
     fn adds_merges_and_removes_user_tool() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().join("state"));
@@ -1269,11 +1416,18 @@ mod tests {
             false,
         )
         .expect("add custom tool");
+        let stored = fs::read_to_string(state.custom_config_path()).expect("stored user manifest");
+        assert!(stored.contains("update = [\"claude\", \"install\"]"));
+        assert!(stored.contains("probe = [\"claude\", \"--version\"]"));
+        assert!(!stored.contains("program ="));
+        assert!(!stored.contains("background ="));
         let (manifest, _, source) = load_manifest(None, &state).expect("merged manifest");
         let claude = manifest.tools.get("claude").expect("custom tool");
         assert_eq!(claude.program, "claude");
         assert_eq!(claude.args, ["install"]);
-        assert_eq!(claude.lock_processes, ["claude"]);
+        assert_eq!(claude.processes.len(), 1);
+        assert_eq!(claude.processes[0].name, "claude");
+        assert_eq!(claude.processes[0].action, ProcessAction::Wait);
         assert!(matches!(source, ManifestSource::Customized));
 
         add_custom_tool(
@@ -1301,10 +1455,11 @@ mod tests {
             vec!["claude".to_owned(), "update".to_owned()],
         )
         .expect("rename custom tool");
-        let custom = Config::load(&state.custom_config_path()).expect("load renamed custom tool");
+        let custom =
+            UserConfig::load(&state.custom_config_path()).expect("load renamed custom tool");
         assert!(!custom.tools.contains_key("claude"));
-        assert_eq!(custom.tools["claude-code"].args, ["update"]);
-        assert_eq!(custom.tools["claude-code"].lock_processes, ["claude-code"]);
+        assert_eq!(custom.tools["claude-code"].update, ["claude", "update"]);
+        assert_eq!(custom.tools["claude-code"].wait_for, None);
 
         assert!(
             edit_custom_tool(
@@ -1315,11 +1470,49 @@ mod tests {
             )
             .is_err()
         );
-        let custom = Config::load(&state.custom_config_path()).expect("load after rejected rename");
+        let custom =
+            UserConfig::load(&state.custom_config_path()).expect("load after rejected rename");
         assert!(custom.tools.contains_key("claude-code"));
         assert!(!custom.tools.contains_key("brew"));
 
         remove_custom_tool(state.clone(), "claude-code").expect("remove custom tool");
         assert!(!state.custom_config_path().exists());
+    }
+
+    #[test]
+    fn explicit_user_manifest_layers_on_top_of_builtins() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let path = temporary.path().join("tools.toml");
+        let mut user = UserConfig::empty();
+        user.tools.insert(
+            "example".to_owned(),
+            UserTool::custom("example", "example".to_owned(), vec!["update".to_owned()]),
+        );
+        user.save(&path).expect("save explicit user manifest");
+
+        let (manifest, _, source) =
+            load_manifest(Some(path), &state).expect("load layered explicit manifest");
+
+        assert!(matches!(source, ManifestSource::Explicit));
+        assert!(manifest.tools.contains_key("dvup"));
+        assert!(manifest.tools.contains_key("rustup"));
+        assert!(!manifest.tools.contains_key("codex"));
+        assert_eq!(manifest.tools["example"].args, ["update"]);
+    }
+
+    #[test]
+    fn init_writes_only_the_clean_user_layer_template() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let path = temporary.path().join("tools.toml");
+
+        init(&state, Some(path.clone()), false).expect("initialize user manifest");
+
+        let contents = fs::read_to_string(path).expect("read initialized manifest");
+        assert_eq!(contents, config::USER_TEMPLATE);
+        assert!(!contents.contains("[tools.dvup]"));
+        assert!(!contents.contains("program ="));
+        UserConfig::parse(&contents).expect("valid initialized user manifest");
     }
 }
