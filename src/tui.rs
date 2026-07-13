@@ -1655,7 +1655,7 @@ impl CommandForm {
             update_version: TextInput::new(String::new()),
             background: ToolBackground::Auto,
             wait_for: TextInput::new(String::new()),
-            processes: TextInput::new(String::new()),
+            processes: TextInput::new("[]".to_owned()),
             lock_timeout_secs: TextInput::new(default_lock_timeout_secs().to_string()),
             retries: TextInput::new(default_retries().to_string()),
             retry_delay_secs: TextInput::new(default_retry_delay_secs().to_string()),
@@ -1689,12 +1689,10 @@ impl CommandForm {
             ),
             background: tool.background,
             wait_for: TextInput::new(format_optional_string_list(tool.wait_for.as_deref())),
-            processes: TextInput::new(if tool.processes.is_empty() {
-                String::new()
-            } else {
+            processes: TextInput::new(
                 serde_json::to_string(&tool.processes)
-                    .expect("serializing process rules cannot fail")
-            }),
+                    .expect("serializing process rules cannot fail"),
+            ),
             lock_timeout_secs: TextInput::new(tool.lock_timeout_secs.to_string()),
             retries: TextInput::new(tool.retries.to_string()),
             retry_delay_secs: TextInput::new(tool.retry_delay_secs.to_string()),
@@ -11911,7 +11909,7 @@ fn parse_csv(
     language: Language,
 ) -> std::result::Result<Vec<String>, String> {
     let trimmed = input.trim();
-    if trimmed.is_empty() || trimmed == "[]" {
+    if trimmed.is_empty() {
         return Ok(Vec::new());
     }
     let values = trimmed
@@ -11928,7 +11926,7 @@ fn parse_csv(
     Ok(values)
 }
 
-fn parse_optional_string_list(
+fn parse_optional_json_string_list(
     input: &str,
     field: &str,
     language: Language,
@@ -11936,15 +11934,13 @@ fn parse_optional_string_list(
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(None)
-    } else if trimmed.starts_with('[') {
+    } else {
         serde_json::from_str(trimmed)
             .map(Some)
             .map_err(|error| match language {
                 Language::English => format!("{field} must be a JSON string array: {error}"),
                 Language::Chinese => format!("{field} 必须是 JSON 字符串数组：{error}"),
             })
-    } else {
-        parse_csv(input, field, language).map(Some)
     }
 }
 
@@ -12017,21 +12013,16 @@ impl CommandForm {
                 repository: latest_value,
             }),
         };
-        let wait_for = parse_optional_string_list(
+        let wait_for = parse_optional_json_string_list(
             &self.wait_for.value,
             language.text("Wait for", "等待进程"),
             language,
         )?;
-        let processes = if self.processes.value.trim().is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str::<Vec<ProcessRule>>(self.processes.value.trim()).map_err(
-                |error| match language {
-                    Language::English => format!("Process rules must be a JSON array: {error}"),
-                    Language::Chinese => format!("进程规则必须是 JSON 数组：{error}"),
-                },
-            )?
-        };
+        let processes = serde_json::from_str::<Vec<ProcessRule>>(self.processes.value.trim())
+            .map_err(|error| match language {
+                Language::English => format!("Process rules must be a JSON array: {error}"),
+                Language::Chinese => format!("进程规则必须是 JSON 数组：{error}"),
+            })?;
         let platforms = parse_csv(
             &self.platforms.value,
             language.text("Platforms", "平台"),
@@ -13742,7 +13733,7 @@ mod tests {
         form.update_version =
             TextInput::new(r#"cargo install example-cli --version "{version}""#.to_owned());
         form.background = ToolBackground::Always;
-        form.wait_for = TextInput::new("example-cli, helper".to_owned());
+        form.wait_for = TextInput::new(r#"["example-cli","helper"]"#.to_owned());
         form.processes = TextInput::new(
             r#"[{"name":"example-cli","command_contains":"serve","action":"fail","terminate_grace_secs":3}]"#
                 .to_owned(),
@@ -13841,7 +13832,7 @@ mod tests {
         assert_eq!(submission.tool.wait_for, Some(Vec::new()));
 
         tool.wait_for = Some(vec!["process,with,commas".to_owned()]);
-        let form = CommandForm::from_user_tool(
+        let mut form = CommandForm::from_user_tool(
             CommandFormMode::Edit,
             Some("no-wait-example".to_owned()),
             "no-wait-example".to_owned(),
@@ -13852,6 +13843,32 @@ mod tests {
             .submission(Language::English)
             .expect("comma-containing process name");
         assert_eq!(submission.tool.wait_for, tool.wait_for);
+
+        form.wait_for = TextInput::new("process-a, process-b".to_owned());
+        let error = form
+            .submission(Language::English)
+            .err()
+            .expect("wait_for accepts only one strict JSON representation");
+        assert!(error.contains("JSON string array"), "error: {error}");
+
+        form.wait_for = TextInput::new(r#"["process-a"]"#.to_owned());
+        form.processes = TextInput::new(String::new());
+        let error = form
+            .submission(Language::English)
+            .err()
+            .expect("processes accepts only one strict JSON representation");
+        assert!(error.contains("Process rules must be a JSON array"));
+
+        form.processes = TextInput::new("[]".to_owned());
+        form.platforms = TextInput::new("[]".to_owned());
+        let error = form
+            .submission(Language::English)
+            .err()
+            .expect("platforms accepts only comma-separated platform names");
+        assert!(
+            error.contains("unsupported platform `[]`"),
+            "error: {error}"
+        );
     }
 
     #[test]
