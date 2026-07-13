@@ -6557,25 +6557,33 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Settings => draw_settings(frame, app, chunks[1]),
     }
 
+    let shared_tool_help = match app.language {
+        Language::English => {
+            "q / Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab"
+        }
+        Language::Chinese => {
+            "q / Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页"
+        }
+    };
     let help = match (app.tab, app.language) {
         (Tab::Tools, Language::English) => match app.tool_view {
             ToolView::Commands => [
                 "↑↓/hover move · click/Space select · a all · Enter latest · v choose version · Tab GitHub",
-                "q / Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab",
+                shared_tool_help,
             ],
             ToolView::Github => [
                 "↑↓/hover move · click/Space select · a all · Enter install · Tab command tools",
-                "q / Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab",
+                shared_tool_help,
             ],
         },
         (Tab::Tools, Language::Chinese) => match app.tool_view {
             ToolView::Commands => [
                 "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 更新 · v 指定版本 · Tab GitHub",
-                "q / Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页",
+                shared_tool_help,
             ],
             ToolView::Github => [
                 "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 安装 · Tab 命令工具",
-                "q / Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页",
+                shared_tool_help,
             ],
         },
         (Tab::Activity, Language::English) => [
