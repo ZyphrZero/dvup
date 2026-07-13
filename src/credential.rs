@@ -3,7 +3,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
-const SECRET_CONTEXT: &[u8] = b"dvup/github-api-key/v1";
+const GITHUB_SECRET_CONTEXT: &[u8] = b"dvup/github-api-key/v1";
+const AI_SECRET_CONTEXT: &[u8] = b"dvup/ai-api-key/v1";
 
 #[cfg(windows)]
 const ENCRYPTED_PREFIX: &str = "dpapi-v1:";
@@ -12,7 +13,7 @@ const ENCRYPTED_PREFIX: &str = "aead-v1:";
 
 pub(crate) fn encrypt_github_api_key(api_key: &str) -> Result<String> {
     validate_api_key(api_key)?;
-    encrypt_platform(api_key.as_bytes())
+    encrypt_platform(api_key.as_bytes(), GITHUB_SECRET_CONTEXT, "GitHub API key")
 }
 
 pub(crate) fn github_api_key(encrypted_api_key: Option<&str>) -> Result<Option<Zeroizing<String>>> {
@@ -20,7 +21,7 @@ pub(crate) fn github_api_key(encrypted_api_key: Option<&str>) -> Result<Option<Z
         return Ok(None);
     };
     validate_encrypted_github_api_key(encrypted_api_key)?;
-    let plaintext = decrypt_platform(encrypted_api_key)?;
+    let plaintext = decrypt_platform(encrypted_api_key, GITHUB_SECRET_CONTEXT, "GitHub API key")?;
     let api_key = String::from_utf8(plaintext).map_err(|_| {
         Error::InvalidConfig("encrypted GitHub API key is not valid UTF-8".to_owned())
     })?;
@@ -33,6 +34,31 @@ pub(crate) fn has_github_api_key(encrypted_api_key: Option<&str>) -> Result<bool
 }
 
 pub(crate) fn validate_encrypted_github_api_key(encrypted_api_key: &str) -> Result<()> {
+    validate_encrypted_api_key(encrypted_api_key)
+}
+
+pub(crate) fn encrypt_ai_api_key(api_key: &str) -> Result<String> {
+    validate_ai_api_key(api_key)?;
+    encrypt_platform(api_key.as_bytes(), AI_SECRET_CONTEXT, "AI API key")
+}
+
+pub(crate) fn ai_api_key(encrypted_api_key: Option<&str>) -> Result<Option<Zeroizing<String>>> {
+    let Some(encrypted_api_key) = encrypted_api_key else {
+        return Ok(None);
+    };
+    validate_encrypted_ai_api_key(encrypted_api_key)?;
+    let plaintext = decrypt_platform(encrypted_api_key, AI_SECRET_CONTEXT, "AI API key")?;
+    let api_key = String::from_utf8(plaintext)
+        .map_err(|_| Error::InvalidConfig("encrypted AI API key is not valid UTF-8".to_owned()))?;
+    validate_ai_api_key(&api_key)?;
+    Ok(Some(Zeroizing::new(api_key)))
+}
+
+pub(crate) fn validate_encrypted_ai_api_key(encrypted_api_key: &str) -> Result<()> {
+    validate_encrypted_api_key(encrypted_api_key)
+}
+
+fn validate_encrypted_api_key(encrypted_api_key: &str) -> Result<()> {
     if encrypted_api_key.trim() != encrypted_api_key {
         return Err(encrypted_error());
     }
@@ -47,6 +73,20 @@ pub(crate) fn validate_encrypted_github_api_key(encrypted_api_key: &str) -> Resu
     #[cfg(not(windows))]
     if decoded.len() <= 12 + 16 {
         return Err(encrypted_error());
+    }
+    Ok(())
+}
+
+fn validate_ai_api_key(api_key: &str) -> Result<()> {
+    if api_key.is_empty()
+        || api_key.trim() != api_key
+        || !api_key
+            .chars()
+            .all(|character| character.is_ascii_graphic())
+    {
+        return Err(Error::InvalidConfig(
+            "AI API key must contain visible ASCII characters without whitespace".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -66,11 +106,11 @@ fn validate_api_key(api_key: &str) -> Result<()> {
 }
 
 fn encrypted_error() -> Error {
-    Error::InvalidConfig("encrypted GitHub API key has an invalid format".to_owned())
+    Error::InvalidConfig("encrypted API key has an invalid format".to_owned())
 }
 
 #[cfg(windows)]
-fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
+fn encrypt_platform(plaintext: &[u8], context: &[u8], label: &str) -> Result<String> {
     use std::ptr;
 
     use windows_sys::Win32::{
@@ -79,15 +119,15 @@ fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
     };
 
     let input_length = u32::try_from(plaintext.len())
-        .map_err(|_| Error::InvalidConfig("GitHub API key is too long".to_owned()))?;
-    let entropy_length = u32::try_from(SECRET_CONTEXT.len()).expect("small DPAPI entropy");
+        .map_err(|_| Error::InvalidConfig(format!("{label} is too long")))?;
+    let entropy_length = u32::try_from(context.len()).expect("small DPAPI entropy");
     let input = CRYPT_INTEGER_BLOB {
         cbData: input_length,
         pbData: plaintext.as_ptr().cast_mut(),
     };
     let entropy = CRYPT_INTEGER_BLOB {
         cbData: entropy_length,
-        pbData: SECRET_CONTEXT.as_ptr().cast_mut(),
+        pbData: context.as_ptr().cast_mut(),
     };
     let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
@@ -109,7 +149,7 @@ fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
     };
     if succeeded == 0 {
         return Err(Error::Message(format!(
-            "Windows DPAPI encryption failed: {}",
+            "Windows DPAPI {label} encryption failed: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -125,7 +165,7 @@ fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
 }
 
 #[cfg(windows)]
-fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
+fn decrypt_platform(encrypted_api_key: &str, context: &[u8], label: &str) -> Result<Vec<u8>> {
     use std::ptr;
 
     use windows_sys::Win32::{
@@ -143,14 +183,14 @@ fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
         )
         .map_err(|_| encrypted_error())?;
     let input_length = u32::try_from(encrypted.len()).map_err(|_| encrypted_error())?;
-    let entropy_length = u32::try_from(SECRET_CONTEXT.len()).expect("small DPAPI entropy");
+    let entropy_length = u32::try_from(context.len()).expect("small DPAPI entropy");
     let input = CRYPT_INTEGER_BLOB {
         cbData: input_length,
         pbData: encrypted.as_mut_ptr(),
     };
     let entropy = CRYPT_INTEGER_BLOB {
         cbData: entropy_length,
-        pbData: SECRET_CONTEXT.as_ptr().cast_mut(),
+        pbData: context.as_ptr().cast_mut(),
     };
     let mut output = CRYPT_INTEGER_BLOB {
         cbData: 0,
@@ -172,7 +212,7 @@ fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
     };
     if succeeded == 0 {
         return Err(Error::Message(format!(
-            "Windows DPAPI decryption failed: {}",
+            "Windows DPAPI {label} decryption failed: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -190,7 +230,7 @@ fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(windows))]
-fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
+fn encrypt_platform(plaintext: &[u8], context: &[u8], label: &str) -> Result<String> {
     use aes_gcm::{
         Aes256Gcm, KeyInit, Nonce,
         aead::{Aead, Payload},
@@ -206,10 +246,10 @@ fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
             Nonce::from_slice(&nonce),
             Payload {
                 msg: plaintext,
-                aad: SECRET_CONTEXT,
+                aad: context,
             },
         )
-        .map_err(|_| Error::Message("GitHub API key encryption failed".to_owned()))?;
+        .map_err(|_| Error::Message(format!("{label} encryption failed")))?;
     let mut encrypted = Vec::with_capacity(nonce.len() + ciphertext.len());
     encrypted.extend_from_slice(&nonce);
     encrypted.extend_from_slice(&ciphertext);
@@ -217,7 +257,7 @@ fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
 }
 
 #[cfg(not(windows))]
-fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
+fn decrypt_platform(encrypted_api_key: &str, context: &[u8], label: &str) -> Result<Vec<u8>> {
     use aes_gcm::{
         Aes256Gcm, KeyInit, Nonce,
         aead::{Aead, Payload},
@@ -238,13 +278,19 @@ fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
             Nonce::from_slice(nonce),
             Payload {
                 msg: ciphertext,
-                aad: SECRET_CONTEXT,
+                aad: context,
             },
         )
-        .map_err(|_| Error::Message("GitHub API key decryption failed".to_owned()))
+        .map_err(|_| Error::Message(format!("{label} decryption failed")))
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
+fn wrapping_key(_create: bool) -> Result<Zeroizing<Vec<u8>>> {
+    const TEST_WRAPPING_KEY: [u8; 32] = [0xA5; 32];
+    Ok(Zeroizing::new(TEST_WRAPPING_KEY.to_vec()))
+}
+
+#[cfg(all(not(windows), not(test)))]
 fn wrapping_key(create: bool) -> Result<Zeroizing<Vec<u8>>> {
     use keyring::{Entry, Error as KeyringError};
 
@@ -281,7 +327,7 @@ fn wrapping_key(create: bool) -> Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(key))
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn keyring_error(error: impl std::fmt::Display) -> Error {
     Error::Message(format!(
         "operating-system settings encryption key failed: {error}"
@@ -313,11 +359,45 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn unit_tests_use_an_in_process_wrapping_key() {
+        assert_eq!(
+            wrapping_key(false).expect("test wrapping key").as_slice(),
+            &[0xA5; 32]
+        );
+    }
+
+    #[test]
+    fn encrypted_ai_api_key_round_trips_with_its_own_context() {
+        let token = "sk-ai.provider:test_123";
+        let encrypted = encrypt_ai_api_key(token).expect("encrypt AI API key");
+
+        assert!(encrypted.starts_with(ENCRYPTED_PREFIX));
+        assert!(!encrypted.contains(token));
+        assert_eq!(
+            ai_api_key(Some(&encrypted))
+                .expect("decrypt AI API key")
+                .expect("configured AI API key")
+                .as_str(),
+            token
+        );
+        assert!(github_api_key(Some(&encrypted)).is_err());
+    }
+
     #[test]
     fn github_api_keys_are_strictly_validated_without_echoing_them() {
         assert!(validate_api_key("github_pat_example_123").is_ok());
         assert!(validate_api_key(" secret").is_err());
         assert!(validate_api_key("secret value").is_err());
+    }
+
+    #[test]
+    fn ai_api_keys_accept_provider_punctuation_but_reject_whitespace() {
+        assert!(validate_ai_api_key("sk-provider.token:123").is_ok());
+        assert!(validate_ai_api_key(" secret").is_err());
+        assert!(validate_ai_api_key("secret value").is_err());
+        assert!(validate_ai_api_key("secret\nvalue").is_err());
     }
 
     #[test]

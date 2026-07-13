@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{self, Write},
+    net::IpAddr,
     path::Path,
 };
 
@@ -68,6 +69,119 @@ pub(crate) struct GithubSettings {
     pub(crate) poll_interval_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) encrypted_api_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AiSettings {
+    #[serde(default = "legacy_ai_enabled")]
+    pub(crate) enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) encrypted_api_key: Option<String>,
+}
+
+impl AiSettings {
+    fn is_empty(&self) -> bool {
+        !self.enabled
+            && self.base_url.is_none()
+            && self.model.is_none()
+            && self.encrypted_api_key.is_none()
+    }
+
+    pub(crate) fn configured(&self) -> bool {
+        self.enabled && self.connection_ready()
+    }
+
+    pub(crate) fn connection_ready(&self) -> bool {
+        self.base_url.is_some() && self.model.is_some()
+    }
+
+    pub(crate) fn validate_endpoint(&self) -> Result<()> {
+        let base_url = self
+            .base_url
+            .as_deref()
+            .ok_or_else(|| Error::InvalidConfig("AI base_url must be configured".to_owned()))?;
+        validate_ai_base_url(base_url)?;
+        if let Some(encrypted_api_key) = self.encrypted_api_key.as_deref() {
+            credential::validate_encrypted_ai_api_key(encrypted_api_key)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Some(base_url) = self.base_url.as_deref() {
+            validate_ai_base_url(base_url)?;
+        }
+        if let Some(model) = self.model.as_deref()
+            && (model.trim() != model || model.is_empty())
+        {
+            return Err(Error::InvalidConfig(
+                "AI model cannot be empty or contain surrounding whitespace".to_owned(),
+            ));
+        }
+        if self.base_url.is_none() && (self.model.is_some() || self.encrypted_api_key.is_some()) {
+            return Err(Error::InvalidConfig(
+                "AI model and API key require base_url".to_owned(),
+            ));
+        }
+        if self.enabled && !self.connection_ready() {
+            return Err(Error::InvalidConfig(
+                "enabled AI generation requires base_url and model".to_owned(),
+            ));
+        }
+        if let Some(encrypted_api_key) = self.encrypted_api_key.as_deref() {
+            credential::validate_encrypted_ai_api_key(encrypted_api_key)?;
+        }
+        Ok(())
+    }
+}
+
+fn legacy_ai_enabled() -> bool {
+    true
+}
+
+fn validate_ai_base_url(base_url: &str) -> Result<()> {
+    if base_url.trim() != base_url || base_url.is_empty() {
+        return Err(Error::InvalidConfig(
+            "AI base_url cannot be empty or contain surrounding whitespace".to_owned(),
+        ));
+    }
+    let uri = base_url
+        .parse::<ureq::http::Uri>()
+        .map_err(|error| Error::InvalidConfig(format!("invalid AI base_url: {error}")))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        return Err(Error::InvalidConfig(
+            "AI base_url must be an absolute http:// or https:// URL".to_owned(),
+        ));
+    }
+    let host = uri
+        .authority()
+        .map(|authority| authority.host())
+        .unwrap_or("");
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if uri.scheme_str() == Some("http") && !loopback {
+        return Err(Error::InvalidConfig(
+            "AI base_url must use https unless it targets a loopback host".to_owned(),
+        ));
+    }
+    if uri
+        .path_and_query()
+        .and_then(|value| value.query())
+        .is_some()
+    {
+        return Err(Error::InvalidConfig(
+            "AI base_url cannot contain a query string".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl Default for GithubSettings {
@@ -241,6 +355,8 @@ pub(crate) struct AppSettings {
     pub(crate) hide_unsupported_and_missing_tools: bool,
     pub(crate) network: NetworkSettings,
     pub(crate) github: GithubSettings,
+    #[serde(default, skip_serializing_if = "AiSettings::is_empty")]
+    pub(crate) ai: AiSettings,
 }
 
 impl Default for AppSettings {
@@ -251,6 +367,7 @@ impl Default for AppSettings {
             hide_unsupported_and_missing_tools: false,
             network: NetworkSettings::default(),
             github: GithubSettings::default(),
+            ai: AiSettings::default(),
         }
     }
 }
@@ -265,12 +382,14 @@ impl AppSettings {
         let settings: Self = toml::from_str(&contents)?;
         settings.network.validate()?;
         settings.github.validate()?;
+        settings.ai.validate()?;
         Ok(settings)
     }
 
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
         self.network.validate()?;
         self.github.validate()?;
+        self.ai.validate()?;
         let contents = toml::to_string_pretty(self)?;
         let parent = path
             .parent()
@@ -344,6 +463,7 @@ mod tests {
                 no_proxy: vec!["localhost".to_owned(), ".example.com".to_owned()],
             },
             github: GithubSettings::default(),
+            ai: AiSettings::default(),
         };
         enabled.save(&path).expect("save settings");
 
@@ -353,6 +473,101 @@ mod tests {
         assert!(serialized.contains("[network]"));
         assert!(serialized.contains("proxy_mode = \"explicit\""));
         assert!(!serialized.contains("api_key"));
+    }
+
+    #[test]
+    fn settings_without_ai_section_remain_backward_compatible() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let path = temporary.path().join("settings.toml");
+        let contents = concat!(
+            "language = \"english\"\n",
+            "auto_diagnose_on_startup = false\n",
+            "hide_unsupported_and_missing_tools = false\n",
+            "\n[network]\n",
+            "proxy_mode = \"environment\"\n",
+            "\n[github]\n",
+            "poll_interval_secs = 1800\n",
+        );
+        fs::write(&path, contents).expect("legacy settings");
+
+        let settings = AppSettings::load(&path).expect("load settings without AI");
+
+        assert_eq!(settings.ai, AiSettings::default());
+        settings.save(&path).expect("save settings without AI");
+        assert!(!fs::read_to_string(path).unwrap().contains("[ai]"));
+    }
+
+    #[test]
+    fn ai_switch_defaults_off_but_legacy_configured_sections_remain_on() {
+        assert!(!AiSettings::default().enabled);
+
+        let contents = concat!(
+            "language = \"english\"\n",
+            "auto_diagnose_on_startup = false\n",
+            "hide_unsupported_and_missing_tools = false\n",
+            "\n[network]\n",
+            "proxy_mode = \"environment\"\n",
+            "\n[github]\n",
+            "poll_interval_secs = 1800\n",
+            "\n[ai]\n",
+            "base_url = \"https://ai.example.com/v1\"\n",
+            "model = \"example-model\"\n",
+        );
+
+        let settings: AppSettings = toml::from_str(contents).expect("legacy AI settings");
+
+        assert!(settings.ai.enabled);
+        assert!(settings.ai.configured());
+    }
+
+    #[test]
+    fn ai_settings_require_a_valid_base_url_and_model_pair() {
+        let configured = AiSettings {
+            enabled: true,
+            base_url: Some("https://ai.example.com/v1".to_owned()),
+            model: Some("example-model".to_owned()),
+            encrypted_api_key: None,
+        };
+        assert!(configured.validate().is_ok());
+        assert!(
+            AiSettings {
+                enabled: true,
+                base_url: Some("http://127.0.0.1:11434/v1".to_owned()),
+                model: Some("local-model".to_owned()),
+                encrypted_api_key: None,
+            }
+            .validate()
+            .is_ok()
+        );
+
+        for invalid in [
+            AiSettings {
+                enabled: true,
+                base_url: Some("https://ai.example.com/v1".to_owned()),
+                model: None,
+                encrypted_api_key: None,
+            },
+            AiSettings {
+                enabled: true,
+                base_url: Some("file:///tmp/model".to_owned()),
+                model: Some("example-model".to_owned()),
+                encrypted_api_key: None,
+            },
+            AiSettings {
+                enabled: true,
+                base_url: Some("https://ai.example.com/v1".to_owned()),
+                model: Some(" model ".to_owned()),
+                encrypted_api_key: None,
+            },
+            AiSettings {
+                enabled: true,
+                base_url: Some("http://ai.example.com/v1".to_owned()),
+                model: Some("example-model".to_owned()),
+                encrypted_api_key: None,
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "invalid settings: {invalid:?}");
+        }
     }
 
     #[test]

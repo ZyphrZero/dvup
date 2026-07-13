@@ -156,7 +156,7 @@ pub(crate) struct GithubReleaseMonitor {
 }
 
 impl GithubReleaseMonitor {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.name.is_empty()
             || self.name.trim() != self.name
             || !self
