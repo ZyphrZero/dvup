@@ -9,6 +9,9 @@ use flate2::read::GzDecoder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "macos")]
+use std::process::Command;
+
 use crate::{
     config::{GithubReleaseMonitor, ReleaseAssetFormat},
     credential,
@@ -239,7 +242,9 @@ fn install_asset(
     agent: &ureq::Agent,
     asset: &GithubAsset,
 ) -> Result<()> {
-    fs::create_dir_all(&monitor.target_directory)?;
+    if monitor.format != ReleaseAssetFormat::Dmg {
+        fs::create_dir_all(&monitor.target_directory)?;
+    }
     let parent = monitor
         .target_directory
         .parent()
@@ -302,9 +307,267 @@ fn install_asset(
                 )
             },
         )?,
+        ReleaseAssetFormat::Dmg => {
+            #[cfg(target_os = "macos")]
+            install_dmg(
+                downloaded.path(),
+                &monitor.target_directory,
+                monitor.max_extracted_bytes,
+                monitor.max_extracted_files,
+            )?;
+            #[cfg(not(target_os = "macos"))]
+            return Err(Error::Message(
+                "macOS DMG installation is unavailable on this platform".to_owned(),
+            ));
+        }
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct MountedDmg {
+    mount_point: tempfile::TempDir,
+    attached: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl MountedDmg {
+    fn attach(image: &Path) -> Result<Self> {
+        let mount_point = tempfile::Builder::new().prefix("dvup-dmg-").tempdir()?;
+        let output = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-readonly", "-nobrowse", "-mountpoint"])
+            .arg(mount_point.path())
+            .arg(image)
+            .output()?;
+        if !output.status.success() {
+            let _ = Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force"])
+                .arg(mount_point.path())
+                .output();
+            return Err(command_error("hdiutil attach", &output));
+        }
+        Ok(Self {
+            mount_point,
+            attached: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.mount_point.path()
+    }
+
+    fn detach(&mut self) -> Result<()> {
+        if !self.attached {
+            return Ok(());
+        }
+        let output = Command::new("/usr/bin/hdiutil")
+            .arg("detach")
+            .arg(self.mount_point.path())
+            .output()?;
+        if !output.status.success() {
+            return Err(command_error("hdiutil detach", &output));
+        }
+        self.attached = false;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MountedDmg {
+    fn drop(&mut self) {
+        if self.attached {
+            let _ = Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force"])
+                .arg(self.mount_point.path())
+                .output();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_dmg(
+    image: &Path,
+    target: &Path,
+    max_extracted_bytes: u64,
+    max_extracted_files: usize,
+) -> Result<()> {
+    let parent = target.parent().ok_or_else(|| {
+        Error::Message(format!("DMG target `{}` has no parent", target.display()))
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let staging_owner = tempfile::Builder::new()
+        .prefix(".dvup-app-")
+        .tempdir_in(parent)?;
+    let target_name = target.file_name().ok_or_else(|| {
+        Error::Message(format!(
+            "DMG target `{}` has no file name",
+            target.display()
+        ))
+    })?;
+    let staged = staging_owner.path().join(target_name);
+    let mut mounted = MountedDmg::attach(image)?;
+    let prepare = (|| {
+        let source = unique_mounted_app(mounted.path())?;
+        validate_app_bundle_limits(&source, max_extracted_bytes, max_extracted_files)?;
+        let copy = Command::new("/usr/bin/ditto")
+            .arg(&source)
+            .arg(&staged)
+            .output()?;
+        if !copy.status.success() {
+            return Err(command_error("ditto", &copy));
+        }
+        let verify = Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict", "--verbose=2"])
+            .arg(&staged)
+            .output()?;
+        if !verify.status.success() {
+            return Err(command_error("codesign verification", &verify));
+        }
+        Ok(())
+    })();
+    combine_primary_and_cleanup(prepare, mounted.detach(), "unmount DMG")?;
+
+    replace_app_bundle(&staged, target)
+}
+
+#[cfg(target_os = "macos")]
+fn unique_mounted_app(mount_point: &Path) -> Result<PathBuf> {
+    let mut applications = Vec::new();
+    for entry in fs::read_dir(mount_point)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("app")
+        {
+            applications.push(path);
+        }
+    }
+    if applications.len() != 1 {
+        return Err(Error::Message(format!(
+            "DMG must contain exactly one top-level .app bundle, found {}",
+            applications.len()
+        )));
+    }
+    Ok(applications.pop().expect("one mounted application"))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_app_bundle_limits(
+    app: &Path,
+    max_extracted_bytes: u64,
+    max_extracted_files: usize,
+) -> Result<()> {
+    let mut pending = vec![app.to_path_buf()];
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return Err(Error::Message(format!(
+                    "DMG application contains unsupported entry `{}`",
+                    entry.path().display()
+                )));
+            }
+            files = files.saturating_add(1);
+            if files > max_extracted_files {
+                return Err(Error::Message(
+                    "DMG application exceeds max_extracted_files".to_owned(),
+                ));
+            }
+            if file_type.is_file() {
+                bytes = bytes.saturating_add(entry.metadata()?.len());
+                if bytes > max_extracted_bytes {
+                    return Err(Error::Message(
+                        "DMG application exceeds max_extracted_bytes".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn replace_app_bundle(staged: &Path, target: &Path) -> Result<()> {
+    let parent = target.parent().ok_or_else(|| {
+        Error::Message(format!(
+            "application target `{}` has no parent",
+            target.display()
+        ))
+    })?;
+    let backup_owner = tempfile::Builder::new()
+        .prefix(".dvup-app-backup-")
+        .tempdir_in(parent)?;
+    let backup = backup_owner.keep();
+    fs::remove_dir(&backup)?;
+    let had_target = match fs::symlink_metadata(target) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if had_target {
+        fs::rename(target, &backup)?;
+    }
+    if let Err(error) = fs::rename(staged, target) {
+        if had_target {
+            if let Err(rollback_error) = fs::rename(&backup, target) {
+                return Err(Error::Message(format!(
+                    "failed to install `{}`: {error}; rollback also failed: {rollback_error}; original application remains at `{}`",
+                    target.display(),
+                    backup.display()
+                )));
+            }
+        }
+        return Err(error.into());
+    }
+    if had_target {
+        let _ = remove_path(&backup);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_path(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn combine_primary_and_cleanup(
+    primary: Result<()>,
+    cleanup: Result<()>,
+    cleanup_name: &str,
+) -> Result<()> {
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(Error::Message(format!(
+            "{primary}; {cleanup_name} also failed: {cleanup}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn command_error(operation: &str, output: &std::process::Output) -> Error {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Error::Message(if detail.is_empty() {
+        format!("{operation} failed with {}", output.status)
+    } else {
+        format!("{operation} failed: {detail}")
+    })
 }
 
 fn github_get(
@@ -560,6 +823,92 @@ mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
 
+    #[cfg(target_os = "macos")]
+    fn create_signed_test_app(parent: &Path, name: &str, marker: &str) -> PathBuf {
+        use std::{os::unix::fs::PermissionsExt, process::Command};
+
+        let app = parent.join(format!("{name}.app"));
+        let contents = app.join("Contents");
+        let executable = contents.join("MacOS").join(name);
+        fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("create executable directory");
+        fs::create_dir_all(contents.join("Resources")).expect("create resources directory");
+        fs::write(
+            contents.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>{name}</string>
+<key>CFBundleIdentifier</key><string>dev.dvup.test.{}</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>1</string>
+</dict></plist>
+"#,
+                name.to_ascii_lowercase()
+            ),
+        )
+        .expect("write Info.plist");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("write executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        fs::write(contents.join("Resources/version.txt"), marker).expect("write marker");
+        let output = Command::new("/usr/bin/codesign")
+            .args(["--force", "--deep", "--sign", "-"])
+            .arg(&app)
+            .output()
+            .expect("run codesign");
+        assert!(
+            output.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        app
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_test_dmg(source: &Path, image: &Path) {
+        use std::process::Command;
+
+        let output = Command::new("/usr/bin/hdiutil")
+            .args(["create", "-quiet", "-format", "UDZO", "-srcfolder"])
+            .arg(source)
+            .arg(image)
+            .output()
+            .expect("create test DMG");
+        assert!(
+            output.status.success(),
+            "hdiutil create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_install_replaces_the_existing_app_with_the_signed_bundle() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let source = temporary.path().join("image-source");
+        fs::create_dir(&source).expect("image source");
+        create_signed_test_app(&source, "Reqable", "new release");
+        let image = temporary.path().join("reqable.dmg");
+        create_test_dmg(&source, &image);
+
+        let applications = temporary.path().join("Applications");
+        fs::create_dir(&applications).expect("applications directory");
+        let target = applications.join("Reqable.app");
+        fs::create_dir_all(target.join("Contents/Resources")).expect("old app");
+        fs::write(target.join("Contents/Resources/version.txt"), "old release")
+            .expect("old marker");
+
+        install_dmg(&image, &target, 10 * 1024 * 1024, 1_000).expect("install DMG app");
+
+        assert_eq!(
+            fs::read_to_string(target.join("Contents/Resources/version.txt"))
+                .expect("installed marker"),
+            "new release"
+        );
+    }
+
     #[test]
     fn asset_regex_supports_anchored_versions_platforms_and_extensions() {
         let asset_regex =
@@ -590,6 +939,7 @@ mod tests {
             asset_regex: r"^example\.zip$".to_owned(),
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
+            update_policy: crate::config::ReleaseUpdatePolicy::Manual,
             max_download_bytes: 1024,
             max_extracted_bytes: 2048,
             max_extracted_files: 10,

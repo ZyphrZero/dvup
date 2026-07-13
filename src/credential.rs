@@ -93,6 +93,9 @@ fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
         cbData: 0,
         pbData: ptr::null_mut(),
     };
+    // SAFETY: the input and entropy slices outlive the call, their lengths fit
+    // in u32, and output is a valid zero-initialized out parameter owned by
+    // the caller after CryptProtectData succeeds.
     let succeeded = unsafe {
         CryptProtectData(
             &input,
@@ -110,6 +113,8 @@ fn encrypt_platform(plaintext: &[u8]) -> Result<String> {
             std::io::Error::last_os_error()
         )));
     }
+    // SAFETY: a successful CryptProtectData call returns a readable LocalAlloc
+    // buffer of exactly cbData bytes. It remains live until LocalFree below.
     let encrypted = unsafe {
         let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
         let encoded = STANDARD.encode(bytes);
@@ -151,6 +156,9 @@ fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
         cbData: 0,
         pbData: ptr::null_mut(),
     };
+    // SAFETY: encrypted and SECRET_CONTEXT outlive the call, their lengths fit
+    // in u32, and output is a valid zero-initialized out parameter owned by
+    // the caller after CryptUnprotectData succeeds.
     let succeeded = unsafe {
         CryptUnprotectData(
             &input,
@@ -168,6 +176,9 @@ fn decrypt_platform(encrypted_api_key: &str) -> Result<Vec<u8>> {
             std::io::Error::last_os_error()
         )));
     }
+    // SAFETY: a successful CryptUnprotectData call returns a writable
+    // LocalAlloc buffer of exactly cbData bytes. Copy the plaintext, wipe the
+    // allocation while it is live, and release it exactly once.
     let plaintext = unsafe {
         let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
         let plaintext = bytes.to_vec();

@@ -112,6 +112,19 @@ pub(crate) enum ReleaseAssetFormat {
     File,
     Zip,
     TarGz,
+    Dmg,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReleaseUpdatePolicy {
+    #[default]
+    Manual,
+    Automatic,
+}
+
+fn is_manual_release_update_policy(value: &ReleaseUpdatePolicy) -> bool {
+    *value == ReleaseUpdatePolicy::Manual
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,6 +135,8 @@ pub(crate) struct GithubReleaseMonitor {
     pub(crate) asset_regex: String,
     pub(crate) target_directory: PathBuf,
     pub(crate) format: ReleaseAssetFormat,
+    #[serde(default, skip_serializing_if = "is_manual_release_update_policy")]
+    pub(crate) update_policy: ReleaseUpdatePolicy,
     pub(crate) max_download_bytes: u64,
     pub(crate) max_extracted_bytes: u64,
     pub(crate) max_extracted_files: usize,
@@ -182,6 +197,31 @@ impl GithubReleaseMonitor {
                 self.name
             )));
         }
+        if self.format == ReleaseAssetFormat::Dmg {
+            if self.strip_components != 0 {
+                return Err(Error::InvalidConfig(format!(
+                    "GitHub release monitor `{}` cannot strip components from a DMG",
+                    self.name
+                )));
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(Error::InvalidConfig(format!(
+                "GitHub release monitor `{}` uses DMG installation outside macOS",
+                self.name
+            )));
+            #[cfg(target_os = "macos")]
+            if self
+                .target_directory
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("app")
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "GitHub release monitor `{}` DMG target must be an absolute .app path",
+                    self.name
+                )));
+            }
+        }
         if self.max_download_bytes == 0 || self.max_download_bytes > 8 * 1024 * 1024 * 1024 {
             return Err(Error::InvalidConfig(format!(
                 "GitHub release monitor `{}` max_download_bytes must be between 1 and 8589934592",
@@ -197,7 +237,7 @@ impl GithubReleaseMonitor {
                     self.name
                 )));
             }
-            ReleaseAssetFormat::Zip | ReleaseAssetFormat::TarGz
+            ReleaseAssetFormat::Zip | ReleaseAssetFormat::TarGz | ReleaseAssetFormat::Dmg
                 if self.max_extracted_bytes == 0
                     || self.max_extracted_bytes > 16 * 1024 * 1024 * 1024
                     || self.max_extracted_files == 0
@@ -1315,6 +1355,46 @@ enabled = true
     }
 
     #[test]
+    fn github_release_update_policy_is_manual_by_default_and_can_be_automatic() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let target = toml::Value::String(temporary.path().join("example").display().to_string());
+        let input = format!(
+            r#"[[github.monitors]]
+name = "example"
+repository = "owner/repository"
+asset_regex = '^example\.zip$'
+target_directory = {target}
+format = "zip"
+max_download_bytes = 1024
+max_extracted_bytes = 2048
+max_extracted_files = 10
+enabled = true
+"#
+        );
+
+        let manual = UserConfig::parse(&input).expect("manual policy by default");
+        assert_eq!(
+            manual.github.monitors[0].update_policy,
+            ReleaseUpdatePolicy::Manual
+        );
+        assert!(
+            !toml::to_string(&manual)
+                .expect("serialize manual policy")
+                .contains("update_policy")
+        );
+
+        let automatic = UserConfig::parse(&input.replace(
+            "enabled = true",
+            "update_policy = \"automatic\"\nenabled = true",
+        ))
+        .expect("explicit automatic policy");
+        assert_eq!(
+            automatic.github.monitors[0].update_policy,
+            ReleaseUpdatePolicy::Automatic
+        );
+    }
+
+    #[test]
     fn user_manifest_rejects_legacy_github_asset_pattern() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let target = toml::Value::String(temporary.path().join("example").display().to_string());
@@ -1346,6 +1426,7 @@ enabled = true
             asset_regex: r"^tool-[0-9.]+-windows\.zip$".to_owned(),
             target_directory: temporary.path().join("tool"),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
             max_download_bytes: 100 * 1024 * 1024,
             max_extracted_bytes: 300 * 1024 * 1024,
             max_extracted_files: 1_000,
@@ -1367,6 +1448,57 @@ enabled = true
         github.monitors[0].asset_regex = "[unterminated".to_owned();
         let error = github.validate().expect_err("invalid regex must fail");
         assert!(error.to_string().contains("invalid asset_regex"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dmg_monitor_requires_an_app_target_and_archive_limits() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let mut monitor = GithubReleaseMonitor {
+            name: "reqable".to_owned(),
+            repository: "reqable/reqable-app".to_owned(),
+            asset_regex: r"^reqable-app-macos-arm64\.dmg$".to_owned(),
+            target_directory: temporary.path().join("Reqable.app"),
+            format: ReleaseAssetFormat::Dmg,
+            update_policy: ReleaseUpdatePolicy::Automatic,
+            max_download_bytes: 100 * 1024 * 1024,
+            max_extracted_bytes: 500 * 1024 * 1024,
+            max_extracted_files: 20_000,
+            strip_components: 0,
+            enabled: true,
+        };
+
+        assert!(monitor.validate().is_ok());
+
+        monitor.target_directory = temporary.path().join("Reqable");
+        assert!(monitor.validate().is_err());
+        monitor.target_directory = temporary.path().join("Reqable.app");
+        monitor.max_extracted_bytes = 0;
+        assert!(monitor.validate().is_err());
+        monitor.max_extracted_bytes = 500 * 1024 * 1024;
+        monitor.strip_components = 1;
+        assert!(monitor.validate().is_err());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn dmg_monitors_are_rejected_outside_macos() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let monitor = GithubReleaseMonitor {
+            name: "example".to_owned(),
+            repository: "owner/repository".to_owned(),
+            asset_regex: r"^example\.dmg$".to_owned(),
+            target_directory: temporary.path().join("Example.app"),
+            format: ReleaseAssetFormat::Dmg,
+            update_policy: ReleaseUpdatePolicy::Manual,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled: true,
+        };
+
+        assert!(monitor.validate().is_err());
     }
 
     #[test]

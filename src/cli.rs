@@ -1562,6 +1562,7 @@ mod tests {
             asset_regex: r"^example\.zip$".to_owned(),
             target_directory: temporary.path().join("installed"),
             format: config::ReleaseAssetFormat::Zip,
+            update_policy: config::ReleaseUpdatePolicy::Manual,
             max_download_bytes: 1024,
             max_extracted_bytes: 2048,
             max_extracted_files: 10,

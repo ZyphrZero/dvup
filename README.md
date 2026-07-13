@@ -82,9 +82,22 @@ no_proxy = ["localhost", "127.0.0.1", ".internal.example"]
 
 Settings 的 `GitHub API Key` 行使用遮罩输入。保存时只把 `encrypted_api_key` 密文写入 `settings.toml`，应用重启后自动解密，不需要重新输入；明文不会写入配置、任务日志、Activity、子进程环境或命令行。Windows 使用绑定当前 Windows 用户的原生 DPAPI 加密，因此复制密文到其他账号无法解密；macOS/Linux 使用 AES-256-GCM，随机加密密钥分别由 Keychain/Secret Service 保存。这里没有旧凭据迁移或明文兼容路径，格式错误、密文损坏或不属于当前用户都会直接报错。Windows 上如果编辑器、安全软件或其他进程短暂占用 `settings.toml`，原子替换会先进行有限重试；最终仍无法写入时，TUI 会显示被占用的精确配置路径并保留遮罩输入，释放占用后可直接按 `Enter` 重试，不会误报为凭据或加密配置错误。保存后 GitHub Release/Tag 最新版本查询会立即重新执行，以避免匿名 API 每小时 60 次的限额。TUI 顶部会通过一次后台 `/user` 请求同时显示 `@Token主人`、已用和剩余 API 配额，并用进度条按剩余比例切换绿/黄/红警示；状态每 5 分钟低频刷新，Token 不会进入显示文本或错误信息。
 
-GitHub Release 监控使用严格配置。在 Tools 页按 `Tab` 切到“GitHub 仓库”，表格会直接显示仓库、已安装 tag、最新 tag、更新状态和目标目录；`A` 新增、`E` 编辑、`D` 删除、`Space` 选择、`Enter` 确认并安装所选 Release，`R`/`C` 只刷新状态。新增和编辑表单会与自定义命令工具一起原子写入 `dvup_custom.toml`，校验失败会保留全部输入供直接修正；`settings.toml` 严格拒绝 `github.monitors`，Settings 只保留 GitHub API Key、轮询间隔和网络策略等全局设置。后台使用一个线程按间隔串行刷新 Release 元数据，不会自动下载或替换目录；只有用户在工具页明确确认安装后才会修改目标目录。`asset_regex` 使用 Rust `regex` 语法，推荐用 `^` 和 `$` 限定完整文件名；正则必须恰好匹配一个 Release asset。`target_directory` 必须是绝对路径。以下两项写入 `dvup_custom.toml`：
+GitHub Release 监控使用严格配置。在 Tools 页按 `Tab` 切到“GitHub 仓库”，表格会直接显示仓库、已安装 tag、最新 tag、更新状态、更新策略和目标目录；`A` 新增、`E` 编辑、`D` 删除、`Space` 选择、`Enter` 确认并安装所选 Release，`R`/`C` 刷新状态。新增和编辑表单会与自定义命令工具一起原子写入 `dvup_custom.toml`，校验失败会保留全部输入供直接修正；`settings.toml` 严格拒绝 `github.monitors`，Settings 只保留 GitHub API Key、轮询间隔和网络策略等全局设置。每项监控可选择 `update_policy = "manual"`（默认，需要逐次确认）或 `update_policy = "automatic"`（后台探测到新 tag 后立即安装）；停用项、探测失败项和已是最新版的项不会进入自动安装队列。`asset_regex` 使用 Rust `regex` 语法，推荐用 `^` 和 `$` 限定完整文件名；正则必须恰好匹配一个 Release asset。`target_directory` 必须是绝对路径。以下配置写入 `dvup_custom.toml`：
 
 ```toml
+[[github.monitors]]
+name = "reqable-macos-arm64"
+repository = "reqable/reqable-app"
+asset_regex = '^reqable-app-macos-arm64\.dmg$'
+target_directory = "/Applications/Reqable.app"
+format = "dmg"
+update_policy = "automatic"
+max_download_bytes = 104857600
+max_extracted_bytes = 536870912
+max_extracted_files = 20000
+strip_components = 0
+enabled = true
+
 [[github.monitors]]
 name = "reqable-windows-x64"
 repository = "reqable/reqable-app"
@@ -110,7 +123,7 @@ strip_components = 0
 enabled = true
 ```
 
-`format` 只能是 `file`、`zip` 或 `tar_gz`，不会在格式错误时猜测或尝试另一种解压方式。每个监控项必须明确限制下载字节数；压缩包还必须限制解压总字节数和文件数，从流式下载/解压阶段阻止超大资产和压缩炸弹。普通 `file` 的两个解压上限必须为 `0`。ZIP/TAR.GZ 会先下载和解压到目标目录同一文件系统中的临时目录，校验路径不能越界，拒绝 TAR 符号链接等非普通条目，再替换完整目标目录；失败时保留原目录。普通 `file` 会保存为 Release asset 的原始文件名。成功安装的 tag 单独记录在状态目录的 `github-releases.json`，其中不包含 API Key。
+`format` 只能是 `file`、`zip`、`tar_gz` 或 macOS 专用的 `dmg`，不会在格式错误时猜测或尝试另一种处理方式。每个监控项必须明确限制下载字节数；ZIP、TAR.GZ 和 DMG 还必须限制展开总字节数和文件数。普通 `file` 的两个展开上限必须为 `0`。ZIP/TAR.GZ 会先下载和解压到目标目录同一文件系统中的临时目录，校验路径不能越界，拒绝 TAR 符号链接等非普通条目，再替换完整目标目录；失败时保留原目录。DMG 目标必须是绝对 `.app` 路径：dvup 使用 `hdiutil` 只读挂载镜像，只接受唯一的顶层 `.app`，检查展开上限，使用 `ditto` 保留应用包元数据，通过 `codesign --verify --deep --strict` 后卸载镜像，最后在同一文件系统中原子替换旧应用；任何前置步骤失败都不会修改现有应用。普通 `file` 会保存为 Release asset 的原始文件名。成功安装的 tag 单独记录在状态目录的 `github-releases.json`，其中不包含 API Key。
 
 服务器最简单的配置方式是保留 `environment` 模式并在服务环境中注入标准变量，例如：
 

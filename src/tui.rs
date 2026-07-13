@@ -38,7 +38,8 @@ use zeroize::Zeroize;
 use crate::{
     cli, command,
     config::{
-        GithubReleaseMonitor, LatestVersionSource, ReleaseAssetFormat, Tool, UserConfig, UserTool,
+        GithubReleaseMonitor, LatestVersionSource, ReleaseAssetFormat, ReleaseUpdatePolicy, Tool,
+        UserConfig, UserTool,
     },
     credential, datetime, detach, doctor,
     error::{Error, Result},
@@ -60,7 +61,7 @@ const GITHUB_RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT_TUI_PROBES: usize = 2;
 const MOUSE_WHEEL_ROWS: isize = 1;
 const SETTINGS_ROW_COUNT: usize = 8;
-const GITHUB_MONITOR_FORM_FIELD_COUNT: usize = 10;
+const GITHUB_MONITOR_FORM_FIELD_COUNT: usize = 11;
 const DEFAULT_MONITOR_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MONITOR_MAX_EXTRACTED_BYTES: u64 = 2_048 * 1024 * 1024;
 const DEFAULT_MONITOR_MAX_EXTRACTED_FILES: usize = 10_000;
@@ -1582,6 +1583,7 @@ enum Modal {
         asset_regex: TextInput,
         target_directory: TextInput,
         format: ReleaseAssetFormat,
+        update_policy: ReleaseUpdatePolicy,
         max_download_bytes: TextInput,
         max_extracted_bytes: TextInput,
         max_extracted_files: TextInput,
@@ -2553,6 +2555,7 @@ impl App {
             format: monitor
                 .map(|value| value.format)
                 .unwrap_or(ReleaseAssetFormat::Zip),
+            update_policy: monitor.map(|value| value.update_policy).unwrap_or_default(),
             max_download_bytes: TextInput::new(
                 monitor
                     .map(|value| value.max_download_bytes.to_string())
@@ -3230,6 +3233,8 @@ impl App {
                     self.last_release_refresh = Instant::now();
                     match results {
                         Ok(statuses) => {
+                            let automatic =
+                                automatic_release_update_names(&self.github_monitors, &statuses);
                             let failed = statuses
                                 .iter()
                                 .filter(|status| status.error.is_some())
@@ -3250,6 +3255,9 @@ impl App {
                                     "GitHub 仓库刷新完成：{available} 项可更新，{failed} 项失败"
                                 ),
                             };
+                            if !automatic.is_empty() {
+                                self.start_release_updates(automatic);
+                            }
                         }
                         Err(error) => {
                             self.message = match self.language {
@@ -4153,6 +4161,7 @@ fn github_monitor_from_form(
     asset_regex: &TextInput,
     target_directory: &TextInput,
     format: ReleaseAssetFormat,
+    update_policy: ReleaseUpdatePolicy,
     max_download_bytes: &TextInput,
     max_extracted_bytes: &TextInput,
     max_extracted_files: &TextInput,
@@ -4165,6 +4174,7 @@ fn github_monitor_from_form(
         asset_regex: asset_regex.value.trim().to_owned(),
         target_directory: PathBuf::from(target_directory.value.trim()),
         format,
+        update_policy,
         max_download_bytes: parse_u64_input(max_download_bytes, "max download size")?,
         max_extracted_bytes: parse_u64_input(max_extracted_bytes, "max extracted size")?,
         max_extracted_files: parse_usize_input(max_extracted_files, "max extracted files")?,
@@ -4178,6 +4188,7 @@ fn release_format_label(format: ReleaseAssetFormat) -> &'static str {
         ReleaseAssetFormat::File => "file",
         ReleaseAssetFormat::Zip => "zip",
         ReleaseAssetFormat::TarGz => "tar_gz",
+        ReleaseAssetFormat::Dmg => "dmg",
     }
 }
 
@@ -4185,16 +4196,57 @@ fn next_release_format(format: ReleaseAssetFormat) -> ReleaseAssetFormat {
     match format {
         ReleaseAssetFormat::File => ReleaseAssetFormat::Zip,
         ReleaseAssetFormat::Zip => ReleaseAssetFormat::TarGz,
-        ReleaseAssetFormat::TarGz => ReleaseAssetFormat::File,
+        ReleaseAssetFormat::TarGz => ReleaseAssetFormat::Dmg,
+        ReleaseAssetFormat::Dmg => ReleaseAssetFormat::File,
     }
 }
 
 fn previous_release_format(format: ReleaseAssetFormat) -> ReleaseAssetFormat {
     match format {
-        ReleaseAssetFormat::File => ReleaseAssetFormat::TarGz,
+        ReleaseAssetFormat::File => ReleaseAssetFormat::Dmg,
         ReleaseAssetFormat::Zip => ReleaseAssetFormat::File,
         ReleaseAssetFormat::TarGz => ReleaseAssetFormat::Zip,
+        ReleaseAssetFormat::Dmg => ReleaseAssetFormat::TarGz,
     }
+}
+
+fn release_update_policy_label(policy: ReleaseUpdatePolicy, language: Language) -> &'static str {
+    match (policy, language) {
+        (ReleaseUpdatePolicy::Manual, Language::English) => "manual",
+        (ReleaseUpdatePolicy::Manual, Language::Chinese) => "手动确认",
+        (ReleaseUpdatePolicy::Automatic, Language::English) => "automatic",
+        (ReleaseUpdatePolicy::Automatic, Language::Chinese) => "自动安装",
+    }
+}
+
+fn next_release_update_policy(policy: ReleaseUpdatePolicy) -> ReleaseUpdatePolicy {
+    match policy {
+        ReleaseUpdatePolicy::Manual => ReleaseUpdatePolicy::Automatic,
+        ReleaseUpdatePolicy::Automatic => ReleaseUpdatePolicy::Manual,
+    }
+}
+
+fn automatic_release_update_names(
+    monitors: &[GithubReleaseMonitor],
+    statuses: &[MonitorStatus],
+) -> Vec<String> {
+    monitors
+        .iter()
+        .filter(|monitor| {
+            monitor.enabled && monitor.update_policy == ReleaseUpdatePolicy::Automatic
+        })
+        .filter(|monitor| {
+            statuses
+                .iter()
+                .find(|status| status.name == monitor.name)
+                .is_some_and(|status| {
+                    status.error.is_none()
+                        && status.latest_tag.is_some()
+                        && status.installed_tag != status.latest_tag
+                })
+        })
+        .map(|monitor| monitor.name.clone())
+        .collect()
 }
 
 fn update_monitor_status(
@@ -4564,6 +4616,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             mut asset_regex,
             mut target_directory,
             mut format,
+            mut update_policy,
             mut max_download_bytes,
             mut max_extracted_bytes,
             mut max_extracted_files,
@@ -4589,7 +4642,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Right | KeyCode::Char(' ') if field == 4 => {
                     format = next_release_format(format);
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if field == 9 => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if field == 5 => {
+                    update_policy = next_release_update_policy(update_policy);
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if field == 10 => {
                     enabled = !enabled;
                 }
                 _ if !save => {
@@ -4598,10 +4654,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         1 => Some(&mut repository),
                         2 => Some(&mut asset_regex),
                         3 => Some(&mut target_directory),
-                        5 => Some(&mut max_download_bytes),
-                        6 => Some(&mut max_extracted_bytes),
-                        7 => Some(&mut max_extracted_files),
-                        8 => Some(&mut strip_components),
+                        6 => Some(&mut max_download_bytes),
+                        7 => Some(&mut max_extracted_bytes),
+                        8 => Some(&mut max_extracted_files),
+                        9 => Some(&mut strip_components),
                         _ => None,
                     };
                     if let Some(input) = input {
@@ -4617,6 +4673,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     &asset_regex,
                     &target_directory,
                     format,
+                    update_policy,
                     &max_download_bytes,
                     &max_extracted_bytes,
                     &max_extracted_files,
@@ -4663,6 +4720,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 asset_regex,
                 target_directory,
                 format,
+                update_policy,
                 max_download_bytes,
                 max_extracted_bytes,
                 max_extracted_files,
@@ -5157,10 +5215,10 @@ fn handle_paste(app: &mut App, text: &str) {
                 1 => Some(repository),
                 2 => Some(asset_regex),
                 3 => Some(target_directory),
-                5 => Some(max_download_bytes),
-                6 => Some(max_extracted_bytes),
-                7 => Some(max_extracted_files),
-                8 => Some(strip_components),
+                6 => Some(max_download_bytes),
+                7 => Some(max_extracted_bytes),
+                8 => Some(max_extracted_files),
+                9 => Some(strip_components),
                 _ => None,
             };
             let Some(input) = input else {
@@ -5991,6 +6049,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
             if let Modal::GithubMonitorForm {
                 field,
                 format,
+                update_policy,
                 enabled,
                 ..
             } = &mut app.modal
@@ -6001,7 +6060,12 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     app.modal_drag = None;
                     return;
                 }
-                if hitbox.field == 9 {
+                if hitbox.field == 5 {
+                    *update_policy = next_release_update_policy(*update_policy);
+                    app.modal_drag = None;
+                    return;
+                }
+                if hitbox.field == 10 {
                     *enabled = !*enabled;
                     app.modal_drag = None;
                     return;
@@ -6045,10 +6109,10 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     1 => repository,
                     2 => asset_regex,
                     3 => target_directory,
-                    5 => max_download_bytes,
-                    6 => max_extracted_bytes,
-                    7 => max_extracted_files,
-                    8 => strip_components,
+                    6 => max_download_bytes,
+                    7 => max_extracted_bytes,
+                    8 => max_extracted_files,
+                    9 => strip_components,
                     _ => return,
                 };
                 input.cursor = target;
@@ -6118,10 +6182,10 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     1 => repository,
                     2 => asset_regex,
                     3 => target_directory,
-                    5 => max_download_bytes,
-                    6 => max_extracted_bytes,
-                    7 => max_extracted_files,
-                    8 => strip_components,
+                    6 => max_download_bytes,
+                    7 => max_extracted_bytes,
+                    8 => max_extracted_files,
+                    9 => strip_components,
                     _ => return,
                 };
                 input.cursor = target;
@@ -6261,10 +6325,10 @@ fn modal_cursor_at(app: &App, hitbox: ModalInputHitbox, column: u16) -> Option<u
             1 => repository,
             2 => asset_regex,
             3 => target_directory,
-            5 => max_download_bytes,
-            6 => max_extracted_bytes,
-            7 => max_extracted_files,
-            8 => strip_components,
+            6 => max_download_bytes,
+            7 => max_extracted_bytes,
+            8 => max_extracted_files,
+            9 => strip_components,
             _ => return None,
         },
         Modal::GithubPollInterval { seconds } => seconds,
@@ -6379,6 +6443,10 @@ fn handle_settings_key(app: &mut App, key: KeyEvent) {
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().fg(Color::White).bg(SURFACE)),
+        area,
+    );
     if let Some(progress) = app.initial_load {
         draw_initial_load(frame, app.language, progress, app.frame);
         return;
@@ -6885,6 +6953,10 @@ fn draw_github_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             Cell::from(installed.to_owned()),
             Cell::from(latest.to_owned()),
             Cell::from(result).style(result_style),
+            Cell::from(release_update_policy_label(
+                monitor.update_policy,
+                app.language,
+            )),
             Cell::from(monitor.target_directory.display().to_string()),
         ])
     });
@@ -6896,6 +6968,7 @@ fn draw_github_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             "INSTALLED",
             "LATEST",
             "STATUS",
+            "POLICY",
             "TARGET",
         ],
         Language::Chinese => [
@@ -6905,6 +6978,7 @@ fn draw_github_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             "已安装版本",
             "最新版本",
             "状态",
+            "策略",
             "目标目录",
         ],
     })
@@ -6914,11 +6988,12 @@ fn draw_github_tools(frame: &mut Frame, app: &mut App, area: Rect) {
         rows,
         [
             Constraint::Length(3),
+            Constraint::Length(16),
             Constraint::Length(22),
-            Constraint::Length(28),
-            Constraint::Length(16),
-            Constraint::Length(16),
-            Constraint::Length(16),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(14),
+            Constraint::Length(10),
             Constraint::Min(20),
         ],
     )
@@ -8448,6 +8523,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             asset_regex,
             target_directory,
             format,
+            update_policy,
             max_download_bytes,
             max_extracted_bytes,
             max_extracted_files,
@@ -8475,6 +8551,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.language.text("Asset regex", "资产正则"),
                 app.language.text("Target directory", "目标目录"),
                 app.language.text("Format", "格式"),
+                app.language.text("Update policy", "更新策略"),
                 app.language.text("Max download bytes", "最大下载字节数"),
                 app.language.text("Max extracted bytes", "最大解压字节数"),
                 app.language.text("Max extracted files", "最大文件数"),
@@ -8540,37 +8617,42 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     value_width,
                 ),
                 selector(*field == 4, labels[4], release_format_label(*format)),
-                modal_input_line(
+                selector(
                     *field == 5,
                     labels[5],
+                    release_update_policy_label(*update_policy, app.language),
+                ),
+                modal_input_line(
+                    *field == 6,
+                    labels[6],
                     max_download_bytes,
                     "536870912",
                     value_width,
                 ),
                 modal_input_line(
-                    *field == 6,
-                    labels[6],
+                    *field == 7,
+                    labels[7],
                     max_extracted_bytes,
                     "2147483648 (file: 0)",
                     value_width,
                 ),
                 modal_input_line(
-                    *field == 7,
-                    labels[7],
+                    *field == 8,
+                    labels[8],
                     max_extracted_files,
                     "10000 (file: 0)",
                     value_width,
                 ),
                 modal_input_line(
-                    *field == 8,
-                    labels[8],
+                    *field == 9,
+                    labels[9],
                     strip_components,
                     "0",
                     value_width,
                 ),
                 selector(
-                    *field == 9,
-                    labels[9],
+                    *field == 10,
+                    labels[10],
                     app.language.text(
                         if *enabled { "enabled" } else { "disabled" },
                         if *enabled { "已启用" } else { "已停用" },
@@ -8600,10 +8682,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 (1, labels[1], repository, 3),
                 (2, labels[2], asset_regex, 4),
                 (3, labels[3], target_directory, 5),
-                (5, labels[5], max_download_bytes, 7),
-                (6, labels[6], max_extracted_bytes, 8),
-                (7, labels[7], max_extracted_files, 9),
-                (8, labels[8], strip_components, 10),
+                (6, labels[6], max_download_bytes, 8),
+                (7, labels[7], max_extracted_bytes, 9),
+                (8, labels[8], max_extracted_files, 10),
+                (9, labels[9], strip_components, 11),
             ];
             for (input_field, label, input, row) in input_fields {
                 if inner.height <= row {
@@ -8642,7 +8724,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
             }
-            for (selector_field, row) in [(4, 6), (9, 11)] {
+            for (selector_field, row) in [(4, 6), (5, 7), (10, 12)] {
                 if inner.height > row {
                     app.modal_input_hitboxes.push(ModalInputHitbox {
                         area: Rect::new(inner.x, inner.y.saturating_add(row), inner.width, 1),
@@ -10105,6 +10187,29 @@ mod tests {
         );
         assert!(screen.contains("37%"), "screen: {screen}");
         assert!(app.tools.is_empty());
+    }
+
+    #[test]
+    fn main_view_paints_a_dark_background_across_the_entire_terminal() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render main view");
+
+        let buffer = terminal.backend().buffer();
+        for point in [(0, 4), (1, 12), (50, 18)] {
+            assert_eq!(
+                buffer[point].bg, SURFACE,
+                "main view did not paint its base background at {point:?}"
+            );
+        }
     }
 
     #[test]
@@ -13567,6 +13672,7 @@ mod tests {
             &TextInput::new(r"^example-.*\.zip$".to_owned()),
             &TextInput::new(temporary.path().join("example").display().to_string()),
             ReleaseAssetFormat::Zip,
+            ReleaseUpdatePolicy::Automatic,
             &TextInput::new("104857601".to_owned()),
             &TextInput::new("314572803".to_owned()),
             &TextInput::new("1001".to_owned()),
@@ -13579,6 +13685,7 @@ mod tests {
         assert_eq!(monitor.max_extracted_bytes, 314_572_803);
         assert_eq!(monitor.max_extracted_files, 1_001);
         assert_eq!(monitor.strip_components, 1);
+        assert_eq!(monitor.update_policy, ReleaseUpdatePolicy::Automatic);
     }
 
     #[test]
@@ -13605,6 +13712,7 @@ mod tests {
             asset_regex: r"^example\.zip$".to_owned(),
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
             max_download_bytes: 1024,
             max_extracted_bytes: 2048,
             max_extracted_files: 10,
@@ -13662,6 +13770,56 @@ mod tests {
     }
 
     #[test]
+    fn only_available_automatic_monitors_are_selected_after_a_probe() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let monitor = |name: &str, update_policy, enabled| GithubReleaseMonitor {
+            name: name.to_owned(),
+            repository: "owner/repository".to_owned(),
+            asset_regex: r"^example\.zip$".to_owned(),
+            target_directory: temporary.path().join(name),
+            format: ReleaseAssetFormat::Zip,
+            update_policy,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled,
+        };
+        let status =
+            |name: &str, installed: Option<&str>, latest: Option<&str>, error| MonitorStatus {
+                name: name.to_owned(),
+                installed_tag: installed.map(str::to_owned),
+                latest_tag: latest.map(str::to_owned),
+                asset: Some("example.zip".to_owned()),
+                error,
+            };
+        let monitors = vec![
+            monitor("automatic", ReleaseUpdatePolicy::Automatic, true),
+            monitor("manual", ReleaseUpdatePolicy::Manual, true),
+            monitor("current", ReleaseUpdatePolicy::Automatic, true),
+            monitor("failed", ReleaseUpdatePolicy::Automatic, true),
+            monitor("disabled", ReleaseUpdatePolicy::Automatic, false),
+        ];
+        let statuses = vec![
+            status("automatic", Some("v1"), Some("v2"), None),
+            status("manual", Some("v1"), Some("v2"), None),
+            status("current", Some("v2"), Some("v2"), None),
+            status(
+                "failed",
+                Some("v1"),
+                None,
+                Some("release failed".to_owned()),
+            ),
+            status("disabled", Some("v1"), Some("v2"), None),
+        ];
+
+        assert_eq!(
+            automatic_release_update_names(&monitors, &statuses),
+            ["automatic".to_owned()]
+        );
+    }
+
+    #[test]
     fn github_monitor_form_enter_saves_from_any_field_and_keeps_strict_fields() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().join("state"));
@@ -13677,6 +13835,7 @@ mod tests {
                 temporary.path().join("installed").display().to_string(),
             ),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Automatic,
             max_download_bytes: TextInput::new("104857601".to_owned()),
             max_extracted_bytes: TextInput::new("314572803".to_owned()),
             max_extracted_files: TextInput::new("1001".to_owned()),
@@ -13695,6 +13854,7 @@ mod tests {
         assert_eq!(monitor.asset_regex, r"^example-.*\.zip$");
         assert_eq!(monitor.max_download_bytes, 104_857_601);
         assert_eq!(monitor.max_extracted_bytes, 314_572_803);
+        assert_eq!(monitor.update_policy, ReleaseUpdatePolicy::Automatic);
         assert!(monitor.enabled);
     }
 
@@ -13712,6 +13872,7 @@ mod tests {
             asset_regex: TextInput::new(r"^example-.*\.zip$".to_owned()),
             target_directory: TextInput::new("relative/path".to_owned()),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
             max_download_bytes: TextInput::new("104857600".to_owned()),
             max_extracted_bytes: TextInput::new("314572800".to_owned()),
             max_extracted_files: TextInput::new("1000".to_owned()),
@@ -13748,6 +13909,7 @@ mod tests {
             asset_regex: r"^example\.zip$".to_owned(),
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
@@ -13796,6 +13958,7 @@ mod tests {
             asset_regex: r"^existing\.zip$".to_owned(),
             target_directory: temporary.path().join("existing"),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
@@ -13818,6 +13981,7 @@ mod tests {
                 asset_regex: r"^second\.zip$".to_owned(),
                 target_directory: temporary.path().join("second"),
                 format: ReleaseAssetFormat::Zip,
+                update_policy: ReleaseUpdatePolicy::Manual,
                 max_download_bytes: 100,
                 max_extracted_bytes: 200,
                 max_extracted_files: 10,
@@ -13847,6 +14011,7 @@ mod tests {
             asset_regex: r"^explicit\.zip$".to_owned(),
             target_directory: temporary.path().join("explicit"),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
@@ -13885,6 +14050,7 @@ mod tests {
             asset_regex: r"^example-.*\.zip$".to_owned(),
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
@@ -13917,6 +14083,7 @@ mod tests {
         assert!(screen.contains("v1.2.3"), "screen: {screen}");
         assert!(screen.contains("up to date"), "screen: {screen}");
         assert!(screen.contains("INSTALLED"), "screen: {screen}");
+        assert!(screen.contains("manual"), "screen: {screen}");
         assert!(screen.contains("Enter install"), "screen: {screen}");
     }
 

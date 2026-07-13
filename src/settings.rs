@@ -288,13 +288,13 @@ impl AppSettings {
     }
 }
 
+#[cfg(windows)]
 fn persist_settings_file(mut temporary: tempfile::NamedTempFile, path: &Path) -> Result<()> {
     let mut retry = 0_u32;
     loop {
         match temporary.persist(path) {
             Ok(_) => return Ok(()),
             Err(error) => {
-                #[cfg(windows)]
                 if retry < 4 && matches!(error.error.raw_os_error(), Some(5 | 32)) {
                     temporary = error.file;
                     retry += 1;
@@ -308,6 +308,17 @@ fn persist_settings_file(mut temporary: tempfile::NamedTempFile, path: &Path) ->
             }
         }
     }
+}
+
+#[cfg(not(windows))]
+fn persist_settings_file(temporary: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| Error::SettingsWrite {
+            path: path.to_path_buf(),
+            source: error.error,
+        })
 }
 
 #[cfg(test)]
