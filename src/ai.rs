@@ -6,11 +6,11 @@ use std::{
 };
 
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
     config::{
-        GithubReleaseMonitor, ReleaseAssetFormat, ReleaseUpdatePolicy,
+        GithubReleaseMonitor, ReleaseAssetFormat, ReleaseUpdatePolicy, UserTool,
         valid_github_release_monitor_name,
     },
     credential,
@@ -63,11 +63,61 @@ impl SystemContext {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct GeneratedCommand {
     pub(crate) name: String,
-    pub(crate) command: String,
+    pub(crate) tool: UserTool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedCommandEnvelope {
+    name: String,
+    tool: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for GeneratedCommand {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const REQUIRED_TOOL_FIELDS: &[&str] = &[
+            "update",
+            "probe",
+            "latest",
+            "update_version",
+            "background",
+            "wait_for",
+            "processes",
+            "lock_timeout_secs",
+            "retries",
+            "retry_delay_secs",
+            "platforms",
+            "resource_group",
+        ];
+
+        let envelope = GeneratedCommandEnvelope::deserialize(deserializer)?;
+        let object = envelope
+            .tool
+            .as_object()
+            .ok_or_else(|| D::Error::custom("AI tool configuration must be a JSON object"))?;
+        for &field in REQUIRED_TOOL_FIELDS {
+            if !object.contains_key(field) {
+                return Err(D::Error::missing_field(field));
+            }
+        }
+        let tool = UserTool::deserialize(envelope.tool).map_err(D::Error::custom)?;
+        Ok(Self {
+            name: envelope.name,
+            tool,
+        })
+    }
+}
+
+impl GeneratedCommand {
+    pub(crate) fn into_user_tool(self) -> (String, UserTool) {
+        (self.name, self.tool)
+    }
 }
 
 #[derive(Serialize)]
@@ -122,7 +172,7 @@ pub(crate) fn generate_command(
     network: &NetworkSettings,
     context: &SystemContext,
     name_hint: &str,
-    command_hint: &str,
+    configuration_hint: &str,
 ) -> Result<GeneratedCommand> {
     if !settings.configured() {
         return Err(Error::Message(
@@ -130,31 +180,47 @@ pub(crate) fn generate_command(
         ));
     }
     let system = concat!(
-        "You generate safe dvup update-command form values. Return one JSON object only, ",
-        "with exactly two string properties: name and command. The command must be a single ",
-        "direct executable invocation, never a shell pipeline, redirection, sudo, or an installer ",
-        "download script. Prefer an already installed package manager from the supplied system ",
-        "context. It must update the named CLI/application non-interactively. Do not include markdown."
+        "You generate one complete dvup custom-tool definition. Return one JSON object only with ",
+        "exactly two properties: name (string) and tool (object). The tool object must have exactly ",
+        "these properties: update (non-empty string array), probe (non-empty string array), latest ",
+        "(null or an object with provider npm, pypi, crates_io, ",
+        "github_release, or github_tag plus package/repository), update_version (null or a string ",
+        "array containing exactly one {version}), background (auto or always), wait_for (null or a ",
+        "string array), processes (array of objects with name, optional command_contains, action ",
+        "wait/terminate/fail, and terminate_grace_secs), lock_timeout_secs (positive integer), ",
+        "retries (non-negative integer), retry_delay_secs (non-negative integer), platforms (array ",
+        "containing only windows, macos, or linux), and resource_group (null or string). The update ",
+        "array must be one direct executable invocation, never a shell pipeline, redirection, sudo, ",
+        "or an installer download script. The probe must print the installed version. Prefer an ",
+        "available package manager and supply latest/update_version when the ecosystem supports ",
+        "them. Do not include markdown or extra properties."
     );
     let user = format!(
-        "Generate or improve this update command.\n{}\nname_hint={}\ncommand_hint={}",
+        "Generate or improve this custom tool.\n{}\nname_hint={}\nconfiguration_hint={}",
         context.prompt(),
         name_hint.trim(),
-        command_hint.trim(),
+        configuration_hint.trim(),
     );
     let generated = chat_json::<GeneratedCommand>(settings, network, system, &user)?;
     if generated.name.is_empty()
         || generated.name.trim() != generated.name
-        || generated.command.is_empty()
-        || generated.command.trim() != generated.command
+        || generated.tool.update.is_empty()
+        || generated.tool.probe.is_empty()
         || generated.name.len() > MAX_GENERATED_NAME_BYTES
-        || generated.command.len() > MAX_GENERATED_COMMAND_BYTES
+        || generated
+            .tool
+            .update
+            .iter()
+            .chain(&generated.tool.probe)
+            .chain(generated.tool.update_version.iter().flatten())
+            .any(|value| value.len() > MAX_GENERATED_COMMAND_BYTES)
     {
         return Err(Error::Message(
-            "AI returned an empty, whitespace-padded, or oversized command configuration"
+            "AI returned an empty, whitespace-padded, or oversized custom-tool configuration"
                 .to_owned(),
         ));
     }
+    generated.tool.validate_for_name(&generated.name)?;
     Ok(generated)
 }
 
@@ -668,7 +734,7 @@ fn program_on_path(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ReleaseUpdatePolicy;
+    use crate::config::{LatestVersionSource, ReleaseUpdatePolicy, ToolBackground};
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
@@ -988,7 +1054,23 @@ mod tests {
     #[test]
     fn compatible_chat_completion_response_generates_a_command() {
         let (address, server) = spawn_chat_server(
-            "{\"name\":\"ripgrep\",\"command\":\"brew upgrade ripgrep\"}",
+            r#"{
+                "name":"ripgrep",
+                "tool": {
+                    "update":["brew","upgrade","ripgrep"],
+                    "probe":["rg","--version"],
+                    "latest":{"provider":"github_release","repository":"BurntSushi/ripgrep"},
+                    "update_version":["cargo","install","ripgrep","--version","{version}"],
+                    "background":"always",
+                    "wait_for":["rg"],
+                    "processes":[{"name":"rg","command_contains":"--files","action":"fail","terminate_grace_secs":3}],
+                    "lock_timeout_secs":45,
+                    "retries":3,
+                    "retry_delay_secs":2,
+                    "platforms":["macos"],
+                    "resource_group":"homebrew"
+                }
+            }"#,
             None,
         );
         let settings = AiSettings {
@@ -1012,12 +1094,83 @@ mod tests {
         let generated =
             generate_command(&settings, &network, &context, "ripgrep", "").expect("generated");
 
+        assert_eq!(generated.name, "ripgrep");
+        assert_eq!(generated.tool.update, ["brew", "upgrade", "ripgrep"]);
+        assert_eq!(generated.tool.probe, ["rg", "--version"]);
+        assert!(matches!(
+            generated.tool.latest,
+            Some(LatestVersionSource::GithubRelease { ref repository })
+                if repository == "BurntSushi/ripgrep"
+        ));
         assert_eq!(
-            generated,
-            GeneratedCommand {
-                name: "ripgrep".to_owned(),
-                command: "brew upgrade ripgrep".to_owned(),
-            }
+            generated
+                .tool
+                .update_version
+                .as_deref()
+                .map(|parts| parts.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec![
+                "cargo",
+                "install",
+                "ripgrep",
+                "--version",
+                "{version}"
+            ])
+        );
+        assert_eq!(generated.tool.background, ToolBackground::Always);
+        assert_eq!(
+            generated
+                .tool
+                .wait_for
+                .as_deref()
+                .map(|parts| parts.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["rg"])
+        );
+        assert_eq!(generated.tool.processes.len(), 1);
+        assert_eq!(generated.tool.processes[0].name, "rg");
+        assert_eq!(generated.tool.lock_timeout_secs, 45);
+        assert_eq!(generated.tool.retries, 3);
+        assert_eq!(generated.tool.retry_delay_secs, 2);
+        assert_eq!(generated.tool.platforms, ["macos"]);
+        assert_eq!(generated.tool.resource_group.as_deref(), Some("homebrew"));
+        server.join().expect("test server");
+    }
+
+    #[test]
+    fn generated_command_requires_every_user_tool_field() {
+        let (address, server) = spawn_chat_server(
+            r#"{
+                "name":"ripgrep",
+                "tool": {
+                    "update":["brew","upgrade","ripgrep"],
+                    "probe":["rg","--version"]
+                }
+            }"#,
+            None,
+        );
+        let settings = AiSettings {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            model: Some("test-model".to_owned()),
+            encrypted_api_key: None,
+        };
+        let network = NetworkSettings {
+            proxy_mode: ProxyMode::Direct,
+            proxy_url: None,
+            no_proxy: Vec::new(),
+        };
+        let context = SystemContext {
+            os: "macos",
+            arch: "aarch64",
+            available_package_managers: vec!["brew"],
+            install_root: "/tmp/dvup/installs".to_owned(),
+        };
+
+        let error = generate_command(&settings, &network, &context, "ripgrep", "")
+            .expect_err("incomplete AI tool configuration must be rejected");
+
+        assert!(
+            error.to_string().contains("missing field"),
+            "error: {error}"
         );
         server.join().expect("test server");
     }

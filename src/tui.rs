@@ -38,8 +38,9 @@ use zeroize::Zeroize;
 use crate::{
     ai, cli, command,
     config::{
-        GithubReleaseMonitor, LatestVersionSource, ReleaseAssetFormat, ReleaseUpdatePolicy, Tool,
-        UserConfig, UserTool,
+        Config, GithubReleaseMonitor, LatestVersionSource, ProcessRule, ReleaseAssetFormat,
+        ReleaseUpdatePolicy, Tool, ToolBackground, UserConfig, UserTool, default_lock_timeout_secs,
+        default_retries, default_retry_delay_secs,
     },
     credential, datetime, detach, doctor,
     error::{Error, Result},
@@ -49,9 +50,6 @@ use crate::{
     state::StateDirs,
     version, worker,
 };
-
-#[cfg(test)]
-use crate::config::Config;
 
 const TICK_RATE: Duration = Duration::from_millis(100);
 const ACTIVE_JOB_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -1517,18 +1515,297 @@ enum CommandFormMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LatestProviderChoice {
+    None,
+    Npm,
+    Pypi,
+    CratesIo,
+    GithubRelease,
+    GithubTag,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandFormField {
+    Name,
+    Update,
+    Probe,
+    LatestSource,
+    LatestValue,
+    UpdateVersion,
+    Background,
+    WaitFor,
+    Processes,
+    LockTimeout,
+    Retries,
+    RetryDelay,
+    Platforms,
+    ResourceGroup,
+}
+
+impl CommandFormField {
+    const ALL: [Self; 14] = [
+        Self::Name,
+        Self::Update,
+        Self::Probe,
+        Self::LatestSource,
+        Self::LatestValue,
+        Self::UpdateVersion,
+        Self::Background,
+        Self::WaitFor,
+        Self::Processes,
+        Self::LockTimeout,
+        Self::Retries,
+        Self::RetryDelay,
+        Self::Platforms,
+        Self::ResourceGroup,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    fn cycle(self, delta: isize) -> Self {
+        let next = (self.index() as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize;
+        Self::ALL[next]
+    }
+}
+
+impl LatestProviderChoice {
+    const ALL: [Self; 6] = [
+        Self::None,
+        Self::Npm,
+        Self::Pypi,
+        Self::CratesIo,
+        Self::GithubRelease,
+        Self::GithubTag,
+    ];
+
+    fn from_source(source: Option<&LatestVersionSource>) -> (Self, String) {
+        match source {
+            None => (Self::None, String::new()),
+            Some(LatestVersionSource::Npm { package }) => (Self::Npm, package.clone()),
+            Some(LatestVersionSource::Pypi { package }) => (Self::Pypi, package.clone()),
+            Some(LatestVersionSource::CratesIo { package }) => (Self::CratesIo, package.clone()),
+            Some(LatestVersionSource::GithubRelease { repository }) => {
+                (Self::GithubRelease, repository.clone())
+            }
+            Some(LatestVersionSource::GithubTag { repository }) => {
+                (Self::GithubTag, repository.clone())
+            }
+        }
+    }
+
+    fn cycle(self, delta: isize) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or_default();
+        let next = (index as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize;
+        Self::ALL[next]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Npm => "npm",
+            Self::Pypi => "pypi",
+            Self::CratesIo => "crates.io",
+            Self::GithubRelease => "github release",
+            Self::GithubTag => "github tag",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CommandForm {
+    mode: CommandFormMode,
+    original_name: Option<String>,
+    field: CommandFormField,
+    name: TextInput,
+    update: TextInput,
+    probe: TextInput,
+    latest_provider: LatestProviderChoice,
+    latest_value: TextInput,
+    update_version: TextInput,
+    background: ToolBackground,
+    wait_for: TextInput,
+    processes: TextInput,
+    lock_timeout_secs: TextInput,
+    retries: TextInput,
+    retry_delay_secs: TextInput,
+    platforms: TextInput,
+    resource_group: TextInput,
+}
+
+impl CommandForm {
+    fn new_add() -> Self {
+        Self {
+            mode: CommandFormMode::Add,
+            original_name: None,
+            field: CommandFormField::Name,
+            name: TextInput::new(String::new()),
+            update: TextInput::new(String::new()),
+            probe: TextInput::new(String::new()),
+            latest_provider: LatestProviderChoice::None,
+            latest_value: TextInput::new(String::new()),
+            update_version: TextInput::new(String::new()),
+            background: ToolBackground::Auto,
+            wait_for: TextInput::new(String::new()),
+            processes: TextInput::new(String::new()),
+            lock_timeout_secs: TextInput::new(default_lock_timeout_secs().to_string()),
+            retries: TextInput::new(default_retries().to_string()),
+            retry_delay_secs: TextInput::new(default_retry_delay_secs().to_string()),
+            platforms: TextInput::new(String::new()),
+            resource_group: TextInput::new(String::new()),
+        }
+    }
+
+    fn from_user_tool(
+        mode: CommandFormMode,
+        original_name: Option<String>,
+        name: String,
+        tool: &UserTool,
+    ) -> Self {
+        let (latest_provider, latest_value) =
+            LatestProviderChoice::from_source(tool.latest.as_ref());
+        Self {
+            mode,
+            original_name,
+            field: CommandFormField::Update,
+            name: TextInput::new(name),
+            update: TextInput::new(format_command_parts(&tool.update)),
+            probe: TextInput::new(format_command_parts(&tool.probe)),
+            latest_provider,
+            latest_value: TextInput::new(latest_value),
+            update_version: TextInput::new(
+                tool.update_version
+                    .as_deref()
+                    .map(format_command_parts)
+                    .unwrap_or_default(),
+            ),
+            background: tool.background,
+            wait_for: TextInput::new(format_optional_string_list(tool.wait_for.as_deref())),
+            processes: TextInput::new(if tool.processes.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(&tool.processes)
+                    .expect("serializing process rules cannot fail")
+            }),
+            lock_timeout_secs: TextInput::new(tool.lock_timeout_secs.to_string()),
+            retries: TextInput::new(tool.retries.to_string()),
+            retry_delay_secs: TextInput::new(tool.retry_delay_secs.to_string()),
+            platforms: TextInput::new(tool.platforms.join(", ")),
+            resource_group: TextInput::new(tool.resource_group.clone().unwrap_or_default()),
+        }
+    }
+
+    fn from_generated(
+        mode: CommandFormMode,
+        original_name: Option<String>,
+        generated: ai::GeneratedCommand,
+    ) -> Self {
+        let (name, tool) = generated.into_user_tool();
+        Self::from_user_tool(mode, original_name, name, &tool)
+    }
+
+    fn input(&self, field: CommandFormField) -> Option<&TextInput> {
+        match field {
+            CommandFormField::Name => Some(&self.name),
+            CommandFormField::Update => Some(&self.update),
+            CommandFormField::Probe => Some(&self.probe),
+            CommandFormField::LatestValue => Some(&self.latest_value),
+            CommandFormField::UpdateVersion => Some(&self.update_version),
+            CommandFormField::WaitFor => Some(&self.wait_for),
+            CommandFormField::Processes => Some(&self.processes),
+            CommandFormField::LockTimeout => Some(&self.lock_timeout_secs),
+            CommandFormField::Retries => Some(&self.retries),
+            CommandFormField::RetryDelay => Some(&self.retry_delay_secs),
+            CommandFormField::Platforms => Some(&self.platforms),
+            CommandFormField::ResourceGroup => Some(&self.resource_group),
+            CommandFormField::LatestSource | CommandFormField::Background => None,
+        }
+    }
+
+    fn input_mut(&mut self, field: CommandFormField) -> Option<&mut TextInput> {
+        match field {
+            CommandFormField::Name => Some(&mut self.name),
+            CommandFormField::Update => Some(&mut self.update),
+            CommandFormField::Probe => Some(&mut self.probe),
+            CommandFormField::LatestValue => Some(&mut self.latest_value),
+            CommandFormField::UpdateVersion => Some(&mut self.update_version),
+            CommandFormField::WaitFor => Some(&mut self.wait_for),
+            CommandFormField::Processes => Some(&mut self.processes),
+            CommandFormField::LockTimeout => Some(&mut self.lock_timeout_secs),
+            CommandFormField::Retries => Some(&mut self.retries),
+            CommandFormField::RetryDelay => Some(&mut self.retry_delay_secs),
+            CommandFormField::Platforms => Some(&mut self.platforms),
+            CommandFormField::ResourceGroup => Some(&mut self.resource_group),
+            CommandFormField::LatestSource | CommandFormField::Background => None,
+        }
+    }
+
+    fn clear_selections(&mut self) {
+        for field in CommandFormField::ALL {
+            if let Some(input) = self.input_mut(field) {
+                input.clear_selection();
+            }
+        }
+    }
+
+    fn configuration_hint(&self) -> String {
+        if [
+            &self.update,
+            &self.probe,
+            &self.latest_value,
+            &self.update_version,
+            &self.wait_for,
+            &self.processes,
+            &self.platforms,
+            &self.resource_group,
+        ]
+        .iter()
+        .all(|input| input.value.trim().is_empty())
+        {
+            return String::new();
+        }
+        format!(
+            concat!(
+                "update={}\nprobe={}\nlatest_source={}\nlatest_value={}\n",
+                "update_version={}\nbackground={}\nwait_for={}\nprocesses={}\n",
+                "lock_timeout_secs={}\nretries={}\nretry_delay_secs={}\nplatforms={}\n",
+                "resource_group={}"
+            ),
+            self.update.value,
+            self.probe.value,
+            self.latest_provider.label(),
+            self.latest_value.value,
+            self.update_version.value,
+            tool_background_label(self.background),
+            self.wait_for.value,
+            self.processes.value,
+            self.lock_timeout_secs.value,
+            self.retries.value,
+            self.retry_delay_secs.value,
+            self.platforms.value,
+            self.resource_group.value,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct CommandSubmission {
+    name: String,
+    tool: UserTool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MonitorFormMode {
     Add,
     Edit,
-}
-
-impl CommandFormMode {
-    fn operation(self) -> Operation {
-        match self {
-            Self::Add => Operation::Add,
-            Self::Edit => Operation::Edit,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1547,17 +1824,11 @@ enum Modal {
         version: TextInput,
     },
     AddCommand {
-        mode: CommandFormMode,
-        original_name: Option<String>,
-        field: usize,
-        name: TextInput,
-        command: TextInput,
+        form: Box<CommandForm>,
     },
     ConfirmAdd {
-        mode: CommandFormMode,
-        original_name: Option<String>,
-        name: String,
-        command: String,
+        form: Box<CommandForm>,
+        submission: CommandSubmission,
     },
     ConfirmDelete {
         name: String,
@@ -1611,8 +1882,6 @@ enum Modal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
     Update,
-    Add,
-    Edit,
     Delete,
 }
 
@@ -1621,10 +1890,6 @@ impl Operation {
         match (self, language) {
             (Self::Update, Language::English) => "update",
             (Self::Update, Language::Chinese) => "更新",
-            (Self::Add, Language::English) => "save",
-            (Self::Add, Language::Chinese) => "保存",
-            (Self::Edit, Language::English) => "edit",
-            (Self::Edit, Language::Chinese) => "编辑",
             (Self::Delete, Language::English) => "remove",
             (Self::Delete, Language::Chinese) => "删除",
         }
@@ -1639,32 +1904,8 @@ impl Operation {
         language: Language,
     ) -> String {
         match (self, success, language) {
-            (Self::Add, true, Language::English) => {
-                format!("Added {name}; it has not been run. Press Enter to update it")
-            }
-            (Self::Add, true, Language::Chinese) => {
-                format!("已添加 {name}，尚未执行；按 Enter 可更新")
-            }
-            (Self::Edit, true, Language::English) => {
-                format!("Updated {name}; the command has not been run")
-            }
-            (Self::Edit, true, Language::Chinese) => {
-                format!("已更新 {name} 的命令，尚未执行")
-            }
             (Self::Delete, true, Language::English) => format!("Removed {name}"),
             (Self::Delete, true, Language::Chinese) => format!("已删除 {name}"),
-            (Self::Add, false, Language::English) => {
-                format!("Could not add {name}; open Activity to view the error")
-            }
-            (Self::Add, false, Language::Chinese) => {
-                format!("无法添加 {name}；请在活动页查看错误")
-            }
-            (Self::Edit, false, Language::English) => {
-                format!("Could not edit {name}; open Activity to view the error")
-            }
-            (Self::Edit, false, Language::Chinese) => {
-                format!("无法编辑 {name}；请在活动页查看错误")
-            }
             (Self::Delete, false, Language::English) => {
                 format!("Could not remove {name}; open Activity to view the error")
             }
@@ -2671,7 +2912,7 @@ impl App {
         }
     }
 
-    fn start_ai_command_generation(&mut self, name: String, command: String) {
+    fn start_ai_command_generation(&mut self, name: String, configuration_hint: String) {
         if self.ai_generation_in_flight_request_id.is_some() {
             self.message = self
                 .language
@@ -2692,7 +2933,7 @@ impl App {
                 .to_owned();
             return;
         }
-        if name.trim().is_empty() && command.trim().is_empty() {
+        if name.trim().is_empty() && configuration_hint.trim().is_empty() {
             self.message = self
                 .language
                 .text(
@@ -2709,8 +2950,8 @@ impl App {
         self.message = self
             .language
             .text(
-                "AI is generating an update command…",
-                "AI 正在生成更新命令…",
+                "AI is generating a complete tool configuration…",
+                "AI 正在生成完整工具配置…",
             )
             .to_owned();
         let tx = self.tx.clone();
@@ -2718,8 +2959,9 @@ impl App {
         let network = self.settings.network.clone();
         let context = ai::SystemContext::detect(&self.state.root().join("installs"));
         thread::spawn(move || {
-            let result = ai::generate_command(&settings, &network, &context, &name, &command)
-                .map_err(|error| error.to_string());
+            let result =
+                ai::generate_command(&settings, &network, &context, &name, &configuration_hint)
+                    .map_err(|error| error.to_string());
             let _ = tx.send(AppEvent::AiCommandGenerated { request_id, result });
         });
     }
@@ -3372,9 +3614,6 @@ impl App {
                             self.push_activity(line);
                         }
                     }
-                    if matches!(operation, Operation::Add | Operation::Edit) && success {
-                        self.focus_tool_named(&name);
-                    }
                     self.message = operation.completion_message(
                         &name,
                         success,
@@ -3742,30 +3981,43 @@ impl App {
                     self.ai_generation_loading = false;
                     match result {
                         Ok(generated) => {
+                            let update = format_command_parts(&generated.tool.update);
                             if let Err(error) =
-                                validate_ai_generated_command(&generated.command, self.language)
+                                validate_ai_generated_command(&update, self.language)
                             {
                                 self.message = error;
                                 continue;
                             }
-                            if let Modal::AddCommand {
-                                field,
-                                name,
-                                command,
-                                ..
-                            } = &mut self.modal
-                            {
-                                *name = TextInput::new(generated.name);
-                                *command = TextInput::new(generated.command);
-                                *field = 1;
-                                self.message = self
-                                    .language
-                                    .text(
-                                        "AI command generated; review it before continuing",
-                                        "AI 已生成命令，请确认后再继续",
-                                    )
-                                    .to_owned();
+                            let Modal::AddCommand { form: active_form } = &self.modal else {
+                                continue;
+                            };
+                            let mut form = CommandForm::from_generated(
+                                active_form.mode,
+                                active_form.original_name.clone(),
+                                generated,
+                            );
+                            if let Err(error) = form.submission(self.language) {
+                                self.message = match self.language {
+                                    Language::English => format!(
+                                        "AI returned an invalid custom-tool configuration: {error}"
+                                    ),
+                                    Language::Chinese => {
+                                        format!("AI 返回的自定义工具配置无效：{error}")
+                                    }
+                                };
+                                continue;
                             }
+                            form.field = CommandFormField::Update;
+                            self.modal = Modal::AddCommand {
+                                form: Box::new(form),
+                            };
+                            self.message = self
+                                .language
+                                .text(
+                                    "AI configuration generated; review every field before continuing",
+                                    "AI 已生成完整配置，请检查所有字段后再继续",
+                                )
+                                .to_owned();
                         }
                         Err(error) => {
                             self.message = match self.language {
@@ -4097,16 +4349,13 @@ impl App {
                 .to_owned();
             return;
         };
-        let (program, args) = tool
-            .update
-            .split_first()
-            .expect("validated user update command");
         self.modal = Modal::AddCommand {
-            mode: CommandFormMode::Edit,
-            original_name: Some(selected.name.clone()),
-            field: 1,
-            name: TextInput::new(selected.name),
-            command: TextInput::new(format_editable_command(program, args)),
+            form: Box::new(CommandForm::from_user_tool(
+                CommandFormMode::Edit,
+                Some(selected.name.clone()),
+                selected.name,
+                tool,
+            )),
         };
     }
 
@@ -4227,13 +4476,7 @@ impl App {
         };
     }
 
-    fn start_add(
-        &mut self,
-        mode: CommandFormMode,
-        original_name: Option<String>,
-        name: String,
-        command_line: String,
-    ) {
+    fn save_command_form(&mut self, form: CommandForm, submission: CommandSubmission) {
         if self.config_path.is_some() {
             self.message = self
                 .language
@@ -4244,73 +4487,97 @@ impl App {
                 .to_owned();
             return;
         }
-        let command = match split_command_line(&command_line, self.language) {
-            Ok(command) if !command.is_empty() => command,
-            Ok(_) => {
-                self.message = self
-                    .language
-                    .text("Command cannot be empty", "命令不能为空")
-                    .to_owned();
-                return;
+        let name = submission.name.clone();
+        let result = (|| {
+            let path = self.state.custom_config_path();
+            let mut custom = if path.is_file() {
+                UserConfig::load(&path)?
+            } else {
+                UserConfig::empty()
+            };
+            let built_in_conflict = Config::starter().tools.contains_key(&name);
+            match form.mode {
+                CommandFormMode::Add => {
+                    if built_in_conflict || custom.tools.contains_key(&name) {
+                        return Err(Error::Message(format!(
+                            "a tool named `{name}` already exists"
+                        )));
+                    }
+                }
+                CommandFormMode::Edit => {
+                    let original_name = form.original_name.as_deref().ok_or_else(|| {
+                        Error::Message("original command name is missing".to_owned())
+                    })?;
+                    if !custom.tools.contains_key(original_name) {
+                        return Err(Error::Message(format!(
+                            "custom tool `{original_name}` no longer exists"
+                        )));
+                    }
+                    if name != original_name
+                        && (built_in_conflict || custom.tools.contains_key(&name))
+                    {
+                        return Err(Error::Message(format!(
+                            "a tool named `{name}` already exists"
+                        )));
+                    }
+                    custom.tools.remove(original_name);
+                }
+            }
+            custom.tools.insert(name.clone(), submission.tool);
+            custom.save(&path)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.tab = Tab::Tools;
+                self.push_activity(match (form.mode, self.language) {
+                    (CommandFormMode::Add, Language::English) => {
+                        format!("\n>>> saved complete custom-tool configuration for {name}")
+                    }
+                    (CommandFormMode::Add, Language::Chinese) => {
+                        format!("\n>>> 已保存 {name} 的完整自定义工具配置")
+                    }
+                    (CommandFormMode::Edit, Language::English) => {
+                        format!("\n>>> updated complete custom-tool configuration for {name}")
+                    }
+                    (CommandFormMode::Edit, Language::Chinese) => {
+                        format!("\n>>> 已更新 {name} 的完整自定义工具配置")
+                    }
+                });
+                if let Err(error) = self.refresh_tools() {
+                    self.message = match self.language {
+                        Language::English => format!(
+                            "Saved {name}, but the tool list could not be refreshed: {error}"
+                        ),
+                        Language::Chinese => {
+                            format!("已保存 {name}，但无法刷新工具列表：{error}")
+                        }
+                    };
+                    return;
+                }
+                self.focus_tool_named(&name);
+                self.message = match (form.mode, self.language) {
+                    (CommandFormMode::Add, Language::English) => {
+                        format!("Saved complete custom-tool configuration for {name}")
+                    }
+                    (CommandFormMode::Add, Language::Chinese) => {
+                        format!("已保存 {name} 的完整自定义工具配置")
+                    }
+                    (CommandFormMode::Edit, Language::English) => {
+                        format!("Updated complete custom-tool configuration for {name}")
+                    }
+                    (CommandFormMode::Edit, Language::Chinese) => {
+                        format!("已更新 {name} 的完整自定义工具配置")
+                    }
+                };
             }
             Err(error) => {
-                self.message = error;
-                return;
-            }
-        };
-        let operation = mode.operation();
-        let arguments = match mode {
-            CommandFormMode::Add => add_arguments(&name, command, false),
-            CommandFormMode::Edit => {
-                let Some(original_name) = original_name.as_deref() else {
-                    self.message = self
-                        .language
-                        .text("Original command name is missing", "缺少原命令名称")
-                        .to_owned();
-                    return;
+                self.message = match self.language {
+                    Language::English => format!("Custom tool was not saved: {error}"),
+                    Language::Chinese => format!("自定义工具未保存：{error}"),
                 };
-                edit_arguments(original_name, &name, command)
             }
-        };
-        self.running += 1;
-        self.message = match (mode, self.language) {
-            (CommandFormMode::Add, Language::English) => {
-                format!("Saving {name}; the command will not be run")
-            }
-            (CommandFormMode::Add, Language::Chinese) => {
-                format!("正在保存 {name}；不会执行该命令")
-            }
-            (CommandFormMode::Edit, Language::English) => {
-                format!("Updating {name}; the command will not be run")
-            }
-            (CommandFormMode::Edit, Language::Chinese) => {
-                format!("正在更新 {name}；不会执行该命令")
-            }
-        };
-        self.push_activity(match (mode, self.language) {
-            (CommandFormMode::Add, Language::English) => {
-                format!("\n>>> saving {name} (not running): {command_line}")
-            }
-            (CommandFormMode::Add, Language::Chinese) => {
-                format!("\n>>> 正在保存 {name}（不执行）：{command_line}")
-            }
-            (CommandFormMode::Edit, Language::English) => {
-                format!("\n>>> updating {name} (not running): {command_line}")
-            }
-            (CommandFormMode::Edit, Language::Chinese) => {
-                format!("\n>>> 正在更新 {name}（不执行）：{command_line}")
-            }
-        });
-        spawn_dvup(
-            self.tx.clone(),
-            self.executable.clone(),
-            self.state.root().to_path_buf(),
-            arguments,
-            name,
-            operation,
-            self.language,
-        );
-        self.tab = Tab::Tools;
+        }
     }
 
     fn start_delete(&mut self, name: String) {
@@ -5171,10 +5438,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         && matches!(key.code, KeyCode::Char('g' | 'G'));
     if ctrl_g {
         match &app.modal {
-            Modal::AddCommand { name, command, .. } => {
-                let name = name.value.clone();
-                let command = command.value.clone();
-                app.start_ai_command_generation(name, command);
+            Modal::AddCommand { form } => {
+                let name = form.name.value.clone();
+                let configuration_hint = form.configuration_hint();
+                app.start_ai_command_generation(name, configuration_hint);
                 return;
             }
             Modal::GithubMonitorForm { repository, .. } => {
@@ -5243,23 +5510,16 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             app.modal = Modal::TargetVersion { name, version };
         }
         Modal::ConfirmAdd {
-            mode,
-            original_name,
-            name,
-            command,
+            mut form,
+            submission,
         } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 app.modal = Modal::None;
-                app.start_add(mode, original_name, name, command);
+                app.save_command_form(*form, submission);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.modal = Modal::AddCommand {
-                    mode,
-                    original_name,
-                    field: 1,
-                    name: TextInput::new(name),
-                    command: TextInput::new(command),
-                };
+                form.field = CommandFormField::Update;
+                app.modal = Modal::AddCommand { form };
                 app.message = app
                     .language
                     .text(
@@ -5278,82 +5538,62 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
             _ => {}
         },
-        Modal::AddCommand {
-            mode,
-            original_name,
-            mut field,
-            mut name,
-            mut command,
-        } => {
+        Modal::AddCommand { mut form } => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let save =
+                key.code == KeyCode::Enter || ctrl && matches!(key.code, KeyCode::Char('s' | 'S'));
             match key.code {
                 KeyCode::Esc => {
                     app.cancel_ai_generation();
                     app.modal = Modal::None;
                     return;
                 }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    field = usize::from(field == 0);
-                    name.clear_selection();
-                    command.clear_selection();
+                KeyCode::Tab if !save => {
+                    form.field = form.field.cycle(1);
+                    form.clear_selections();
                 }
-                KeyCode::Up | KeyCode::Down => {
-                    let next_field = usize::from(key.code == KeyCode::Down);
-                    if field != next_field {
-                        field = next_field;
-                        name.clear_selection();
-                        command.clear_selection();
+                KeyCode::BackTab if !save => {
+                    form.field = form.field.cycle(-1);
+                    form.clear_selections();
+                }
+                KeyCode::Up if !save => {
+                    form.field = form.field.cycle(-1);
+                    form.clear_selections();
+                }
+                KeyCode::Down if !save => {
+                    form.field = form.field.cycle(1);
+                    form.clear_selections();
+                }
+                KeyCode::Left if form.field == CommandFormField::LatestSource && !ctrl => {
+                    form.latest_provider = form.latest_provider.cycle(-1);
+                }
+                KeyCode::Right | KeyCode::Char(' ')
+                    if form.field == CommandFormField::LatestSource && !ctrl =>
+                {
+                    form.latest_provider = form.latest_provider.cycle(1);
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                    if form.field == CommandFormField::Background && !ctrl =>
+                {
+                    form.background = match form.background {
+                        ToolBackground::Auto => ToolBackground::Always,
+                        ToolBackground::Always => ToolBackground::Auto,
+                    };
+                }
+                _ if save => match form.submission(app.language) {
+                    Ok(submission) => {
+                        app.modal = Modal::ConfirmAdd { form, submission };
+                        return;
                     }
-                }
-                KeyCode::Enter if field == 0 => field = 1,
-                KeyCode::Enter => {
-                    let trimmed_name = name.value.trim().to_owned();
-                    let trimmed_command = command.value.trim().to_owned();
-                    if trimmed_name.is_empty() {
-                        app.message = app
-                            .language
-                            .text("Name cannot be empty", "名称不能为空")
-                            .to_owned();
-                        field = 0;
-                    } else if trimmed_command.is_empty() {
-                        app.message = app
-                            .language
-                            .text("Command cannot be empty", "命令不能为空")
-                            .to_owned();
-                    } else {
-                        match split_command_line(&trimmed_command, app.language) {
-                            Ok(parts) if !parts.is_empty() => {
-                                app.modal = Modal::ConfirmAdd {
-                                    mode,
-                                    original_name,
-                                    name: trimmed_name,
-                                    command: trimmed_command,
-                                };
-                                return;
-                            }
-                            Ok(_) => {
-                                app.message = app
-                                    .language
-                                    .text("Command cannot be empty", "命令不能为空")
-                                    .to_owned()
-                            }
-                            Err(error) => app.message = error,
-                        }
-                    }
-                }
-                _ if field == 0 => {
-                    handle_text_input_key(&mut name, key);
-                }
+                    Err(error) => app.message = error,
+                },
                 _ => {
-                    handle_text_input_key(&mut command, key);
+                    if let Some(input) = form.input_mut(form.field) {
+                        handle_text_input_key(input, key);
+                    }
                 }
             }
-            app.modal = Modal::AddCommand {
-                mode,
-                original_name,
-                field,
-                name,
-                command,
-            };
+            app.modal = Modal::AddCommand { form };
         }
         Modal::NetworkProxy {
             mut proxy_mode,
@@ -5979,6 +6219,12 @@ fn handle_paste(app: &mut App, text: &str) {
     match &mut app.modal {
         Modal::TomlEditor { editor } => editor.insert_text(text),
         Modal::TargetVersion { version, .. } => version.insert_text(text),
+        Modal::AddCommand { form } => {
+            let Some(input) = form.input_mut(form.field) else {
+                return;
+            };
+            input.insert_text(text);
+        }
         Modal::GithubSettings {
             field,
             api_key,
@@ -6366,11 +6612,7 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
                     .to_owned();
             } else {
                 app.modal = Modal::AddCommand {
-                    mode: CommandFormMode::Add,
-                    original_name: None,
-                    field: 0,
-                    name: TextInput::new(String::new()),
-                    command: TextInput::new(String::new()),
+                    form: Box::new(CommandForm::new_add()),
                 };
             }
         }
@@ -6868,8 +7110,9 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
             if let Some(hitbox) = hitbox
                 && modal_field_is_editable(&app.modal, hitbox.field)
             {
-                if let Modal::AddCommand { field, .. } = &mut app.modal {
-                    *field = hitbox.field;
+                if let Modal::AddCommand { form } = &mut app.modal {
+                    form.field = CommandFormField::from_index(hitbox.field)
+                        .expect("editable command form field");
                 } else if let Modal::NetworkProxy { field, .. } = &mut app.modal {
                     *field = hitbox.field;
                 } else if let Modal::GithubSettings { field, .. } = &mut app.modal {
@@ -6907,6 +7150,24 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 app.modal_drag = None;
                 return;
             }
+            if let Modal::AddCommand { form } = &mut app.modal {
+                let field = CommandFormField::from_index(hitbox.field)
+                    .expect("editable command form field");
+                form.field = field;
+                if field == CommandFormField::LatestSource {
+                    form.latest_provider = form.latest_provider.cycle(1);
+                    app.modal_drag = None;
+                    return;
+                }
+                if field == CommandFormField::Background {
+                    form.background = match form.background {
+                        ToolBackground::Auto => ToolBackground::Always,
+                        ToolBackground::Always => ToolBackground::Auto,
+                    };
+                    app.modal_drag = None;
+                    return;
+                }
+            }
             if let Modal::GithubMonitorForm {
                 field,
                 format,
@@ -6941,15 +7202,13 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
             let Some(target) = modal_cursor_at(app, hitbox, mouse.column) else {
                 return;
             };
-            if let Modal::AddCommand {
-                field,
-                name,
-                command,
-                ..
-            } = &mut app.modal
-            {
-                *field = hitbox.field;
-                let input = if hitbox.field == 0 { name } else { command };
+            if let Modal::AddCommand { form } = &mut app.modal {
+                let field = CommandFormField::from_index(hitbox.field)
+                    .expect("editable command form field");
+                form.field = field;
+                let Some(input) = form.input_mut(field) else {
+                    return;
+                };
                 input.cursor = target;
                 input.clear_selection();
                 app.modal_drag = Some((hitbox.field, target));
@@ -7055,8 +7314,13 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
             let Some(target) = modal_cursor_at(app, hitbox, column) else {
                 return;
             };
-            if let Modal::AddCommand { name, command, .. } = &mut app.modal {
-                let input = if field == 0 { name } else { command };
+            if let Modal::AddCommand { form } = &mut app.modal {
+                let Some(field) = CommandFormField::from_index(field) else {
+                    return;
+                };
+                let Some(input) = form.input_mut(field) else {
+                    return;
+                };
                 input.cursor = target;
                 input.selection_anchor = (target != anchor).then_some(anchor);
             } else if let Modal::GithubSettings {
@@ -7208,10 +7472,10 @@ fn toml_editor_cursor_at(
 
 fn modal_field_is_editable(modal: &Modal, field: usize) -> bool {
     match modal {
-        Modal::AddCommand { .. }
-        | Modal::TargetVersion { .. }
-        | Modal::GithubSettings { .. }
-        | Modal::AiSettings { .. } => true,
+        Modal::AddCommand { .. } => CommandFormField::from_index(field).is_some(),
+        Modal::TargetVersion { .. } | Modal::GithubSettings { .. } | Modal::AiSettings { .. } => {
+            true
+        }
         Modal::GithubMonitorForm { .. } => field < GITHUB_MONITOR_FORM_FIELD_COUNT,
         Modal::NetworkProxy { proxy_mode, .. } => {
             field == 0 || (*proxy_mode == ProxyMode::Explicit && field <= 2)
@@ -7222,13 +7486,7 @@ fn modal_field_is_editable(modal: &Modal, field: usize) -> bool {
 
 fn modal_cursor_at(app: &App, hitbox: ModalInputHitbox, column: u16) -> Option<usize> {
     let input = match &app.modal {
-        Modal::AddCommand { name, command, .. } => {
-            if hitbox.field == 0 {
-                name
-            } else {
-                command
-            }
-        }
+        Modal::AddCommand { form } => form.input(CommandFormField::from_index(hitbox.field)?)?,
         Modal::TargetVersion { version, .. } => version,
         Modal::GithubSettings {
             api_key,
@@ -9370,45 +9628,72 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame.set_cursor_position(Position::new(cursor_x, inner.y.saturating_add(2)));
             }
         }
-        Modal::ConfirmAdd {
-            mode,
-            name,
-            command,
-            ..
-        } => {
+        Modal::ConfirmAdd { form, submission } => {
             let inner = modal_panel(
                 frame,
                 area,
-                match mode {
+                match form.mode {
                     CommandFormMode::Add => app.language.text("Confirm add", "确认添加"),
                     CommandFormMode::Edit => app.language.text("Confirm edit", "确认编辑"),
                 },
-                74,
-                14,
+                100,
+                16,
             );
+            let update = format_command_parts(&submission.tool.update);
+            let probe = format_command_parts(&submission.tool.probe);
+            let latest = latest_source_summary(submission.tool.latest.as_ref());
+            let platforms = if submission.tool.platforms.is_empty() {
+                app.language.text("all", "全部").to_owned()
+            } else {
+                submission.tool.platforms.join(", ")
+            };
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        match mode {
+                        match form.mode {
                             CommandFormMode::Add => app.language.text(
-                                "Save this custom update command?",
-                                "保存这条自定义更新命令？",
+                                "Save this complete custom-tool configuration?",
+                                "保存这份完整的自定义工具配置？",
                             ),
                             CommandFormMode::Edit => app.language.text(
-                                "Replace this custom update command?",
-                                "更新这条自定义更新命令？",
+                                "Replace this complete custom-tool configuration?",
+                                "更新这份完整的自定义工具配置？",
                             ),
                         },
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Line::raw(""),
-                    labeled_value(app.language.text("Name", "名称"), name, ACCENT),
-                    labeled_value(app.language.text("Command", "命令"), command, Color::White),
+                    labeled_value(app.language.text("Name", "名称"), &submission.name, ACCENT),
+                    labeled_value(
+                        app.language.text("Update command", "更新命令"),
+                        &update,
+                        Color::White,
+                    ),
+                    labeled_value(
+                        app.language.text("Probe command", "探测命令"),
+                        &probe,
+                        Color::White,
+                    ),
+                    labeled_value(
+                        app.language.text("Latest source", "最新版本来源"),
+                        &latest,
+                        Color::White,
+                    ),
+                    labeled_value(
+                        app.language.text("Background", "后台模式"),
+                        tool_background_label(submission.tool.background),
+                        Color::White,
+                    ),
+                    labeled_value(
+                        app.language.text("Platforms", "平台"),
+                        &platforms,
+                        Color::White,
+                    ),
                     Line::raw(""),
                     Line::styled(
                         app.language.text(
-                            "This saves the command only; it will not run now.",
-                            "这里只保存命令，本次不会执行。",
+                            "All tool fields will be written to TOML; the update command will not run now.",
+                            "所有工具字段都会写入 TOML；本次不会执行更新命令。",
                         ),
                         Style::default()
                             .fg(WARNING_COLOR)
@@ -9457,63 +9742,179 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 inner,
             );
         }
-        Modal::AddCommand {
-            mode,
-            field,
-            name,
-            command,
-            ..
-        } => {
+        Modal::AddCommand { form } => {
             let inner = modal_panel(
                 frame,
                 area,
-                match mode {
+                match form.mode {
                     CommandFormMode::Add => app.language.text("Add command", "添加命令"),
                     CommandFormMode::Edit => app.language.text("Edit command", "编辑命令"),
                 },
-                80,
-                16,
+                112,
+                24,
             );
-            let name_label = app.language.text("Name", "名称");
-            let command_label = app.language.text("Command", "命令");
-            let name_width = input_value_width(inner.width, name_label);
-            let command_width = input_value_width(inner.width, command_label);
+            let labels: [&str; CommandFormField::ALL.len()] = [
+                app.language.text("Name", "名称"),
+                app.language.text("Update command", "更新命令"),
+                app.language.text("Probe command", "探测命令"),
+                app.language.text("Latest source", "最新版本来源"),
+                app.language.text("Latest value", "最新版本来源值"),
+                app.language.text("Versioned update", "指定版本更新"),
+                app.language.text("Background", "后台模式"),
+                app.language.text("Wait for", "等待进程"),
+                app.language.text("Process rules", "进程规则"),
+                app.language.text("Lock timeout", "锁超时秒数"),
+                app.language.text("Retries", "重试次数"),
+                app.language.text("Retry delay", "重试延迟秒数"),
+                app.language.text("Platforms", "平台"),
+                app.language.text("Resource group", "资源组"),
+            ];
+            let value_width = labels
+                .iter()
+                .map(|label| input_value_width(inner.width, label))
+                .min()
+                .unwrap_or_default();
+            let label = |field: CommandFormField| labels[field.index()];
+            let selector = |active: bool, label: &str, value: &str| {
+                Line::from(vec![
+                    Span::styled(
+                        if active { "› " } else { "  " },
+                        Style::default().fg(if active { ACCENT } else { SUBTLE }),
+                    ),
+                    Span::styled(
+                        format!("{label}  "),
+                        Style::default().fg(if active { ACCENT } else { DIM }),
+                    ),
+                    Span::styled(
+                        format!("[ {value} ]"),
+                        Style::default()
+                            .fg(if active { SUCCESS } else { SUBTLE })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+                .style(if active {
+                    Style::default().bg(SURFACE)
+                } else {
+                    Style::default().bg(PANEL_BG)
+                })
+            };
             let lines = vec![
                 Line::styled(
-                    match mode {
+                    match form.mode {
                         CommandFormMode::Add => app.language.text(
-                            "Create a user-level update command.",
-                            "创建一条用户级更新命令。",
+                            "Create a complete user-level custom-tool definition.",
+                            "创建一份完整的用户级自定义工具配置。",
                         ),
                         CommandFormMode::Edit => app.language.text(
-                            "Edit or rename the selected custom command.",
-                            "编辑或重命名选中的自定义命令。",
+                            "Edit every field of the selected custom tool.",
+                            "编辑所选自定义工具的全部字段。",
                         ),
                     },
                     Style::default().fg(DIM),
                 ),
                 Line::raw(""),
-                modal_input_line(*field == 0, name_label, name, "claude", name_width),
                 modal_input_line(
-                    *field == 1,
-                    command_label,
-                    command,
-                    "claude update",
-                    command_width,
+                    form.field == CommandFormField::Name,
+                    label(CommandFormField::Name),
+                    &form.name,
+                    "ripgrep",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::Update,
+                    label(CommandFormField::Update),
+                    &form.update,
+                    "brew upgrade ripgrep",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::Probe,
+                    label(CommandFormField::Probe),
+                    &form.probe,
+                    "rg --version",
+                    value_width,
+                ),
+                selector(
+                    form.field == CommandFormField::LatestSource,
+                    label(CommandFormField::LatestSource),
+                    form.latest_provider.label(),
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::LatestValue,
+                    label(CommandFormField::LatestValue),
+                    &form.latest_value,
+                    "owner/repository or package",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::UpdateVersion,
+                    label(CommandFormField::UpdateVersion),
+                    &form.update_version,
+                    "cargo install package --version {version}",
+                    value_width,
+                ),
+                selector(
+                    form.field == CommandFormField::Background,
+                    label(CommandFormField::Background),
+                    tool_background_label(form.background),
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::WaitFor,
+                    label(CommandFormField::WaitFor),
+                    &form.wait_for,
+                    r#"["process-a","process-b"] (or [] for none)"#,
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::Processes,
+                    label(CommandFormField::Processes),
+                    &form.processes,
+                    r#"[{"name":"node","action":"wait"}]"#,
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::LockTimeout,
+                    label(CommandFormField::LockTimeout),
+                    &form.lock_timeout_secs,
+                    "86400",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::Retries,
+                    label(CommandFormField::Retries),
+                    &form.retries,
+                    "8",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::RetryDelay,
+                    label(CommandFormField::RetryDelay),
+                    &form.retry_delay_secs,
+                    "2",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::Platforms,
+                    label(CommandFormField::Platforms),
+                    &form.platforms,
+                    "macos, linux (empty means all)",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::ResourceGroup,
+                    label(CommandFormField::ResourceGroup),
+                    &form.resource_group,
+                    "homebrew",
+                    value_width,
                 ),
                 Line::raw(""),
                 Line::styled(
-                    app.language.text("Examples", "示例"),
-                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-                ),
-                Line::styled("  claude update", Style::default().fg(SUBTLE)),
-                Line::styled(
-                    "  npm install -g package@latest",
+                    app.language.text(
+                        "Wait/process rules use JSON arrays; platforms use a comma-separated list.",
+                        "等待进程和进程规则使用 JSON 数组；平台使用逗号分隔。",
+                    ),
                     Style::default().fg(SUBTLE),
                 ),
-                Line::styled("  pnpm add -g package@latest", Style::default().fg(SUBTLE)),
-                Line::styled("  brew upgrade ripgrep", Style::default().fg(SUBTLE)),
-                Line::raw(""),
                 Line::from(vec![
                     Span::styled("[Ctrl+G]", Style::default().fg(ACCENT)),
                     Span::raw(app.language.text(
@@ -9538,15 +9939,18 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 inner,
             );
 
-            for (field, label, input, row, value_width) in [
-                (0, name_label, name, 2, name_width),
-                (1, command_label, command, 3, command_width),
-            ] {
-                if inner.height <= row || value_width == 0 {
+            for (field, label) in labels.iter().enumerate() {
+                let command_field = CommandFormField::from_index(field)
+                    .expect("label for every command form field");
+                let row = u16::try_from(field + 2).unwrap_or(u16::MAX);
+                if inner.height <= row {
                     continue;
                 }
                 let label_width = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
-                let (visible_start, visible_end) = input.visible_range(value_width);
+                let (visible_start, visible_end) = form
+                    .input(command_field)
+                    .map(|input| input.visible_range(value_width))
+                    .unwrap_or((0, 0));
                 app.modal_input_hitboxes.push(ModalInputHitbox {
                     area: Rect::new(
                         inner
@@ -9555,7 +9959,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                             .saturating_add(label_width)
                             .saturating_add(2),
                         inner.y.saturating_add(row),
-                        u16::try_from(value_width).unwrap_or(u16::MAX),
+                        u16::try_from(value_width.max(1)).unwrap_or(u16::MAX),
                         1,
                     ),
                     field,
@@ -9564,12 +9968,12 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 });
             }
 
-            let (label, input, row, value_width) = if *field == 0 {
-                (name_label, name, 2, name_width)
-            } else {
-                (command_label, command, 3, command_width)
-            };
-            if inner.width > 0 && inner.height > row {
+            let row = u16::try_from(form.field.index() + 2).unwrap_or(u16::MAX);
+            if let Some(input) = form.input(form.field)
+                && inner.width > 0
+                && inner.height > row
+            {
+                let label = labels[form.field.index()];
                 let label_width = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
                 let (visible_start, _) = input.visible_range(value_width);
                 let cursor_width =
@@ -11190,22 +11594,6 @@ fn update_arguments(
     arguments
 }
 
-fn add_arguments(name: &str, command: Vec<String>, force: bool) -> Vec<String> {
-    let mut arguments = vec!["add".to_owned()];
-    if force {
-        arguments.push("--force".to_owned());
-    }
-    arguments.push(name.to_owned());
-    arguments.extend(command);
-    arguments
-}
-
-fn edit_arguments(original_name: &str, name: &str, command: Vec<String>) -> Vec<String> {
-    let mut arguments = vec!["edit".to_owned(), original_name.to_owned(), name.to_owned()];
-    arguments.extend(command);
-    arguments
-}
-
 fn output_was_queued(name: &str, output: &str) -> bool {
     let queued = format!("queued {name}:");
     let updated = format!("updated {name}:");
@@ -11479,6 +11867,210 @@ fn format_editable_command(program: &str, args: &[String]) -> String {
         .join(" ")
 }
 
+fn format_command_parts(parts: &[String]) -> String {
+    let Some((program, args)) = parts.split_first() else {
+        return String::new();
+    };
+    format_editable_command(program, args)
+}
+
+fn format_optional_string_list(values: Option<&[String]>) -> String {
+    match values {
+        None => String::new(),
+        Some(values) => {
+            serde_json::to_string(values).expect("serializing a string list cannot fail")
+        }
+    }
+}
+
+fn tool_background_label(background: ToolBackground) -> &'static str {
+    match background {
+        ToolBackground::Auto => "auto",
+        ToolBackground::Always => "always",
+    }
+}
+
+fn latest_source_summary(source: Option<&LatestVersionSource>) -> String {
+    match source {
+        None => "none".to_owned(),
+        Some(LatestVersionSource::Npm { package }) => format!("npm: {package}"),
+        Some(LatestVersionSource::Pypi { package }) => format!("pypi: {package}"),
+        Some(LatestVersionSource::CratesIo { package }) => format!("crates.io: {package}"),
+        Some(LatestVersionSource::GithubRelease { repository }) => {
+            format!("github release: {repository}")
+        }
+        Some(LatestVersionSource::GithubTag { repository }) => {
+            format!("github tag: {repository}")
+        }
+    }
+}
+
+fn parse_csv(
+    input: &str,
+    field: &str,
+    language: Language,
+) -> std::result::Result<Vec<String>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(Vec::new());
+    }
+    let values = trimmed
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if values.iter().any(String::is_empty) {
+        return Err(match language {
+            Language::English => format!("{field} contains an empty comma-separated value"),
+            Language::Chinese => format!("{field} 中包含空的逗号分隔项"),
+        });
+    }
+    Ok(values)
+}
+
+fn parse_optional_string_list(
+    input: &str,
+    field: &str,
+    language: Language,
+) -> std::result::Result<Option<Vec<String>>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else if trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .map(Some)
+            .map_err(|error| match language {
+                Language::English => format!("{field} must be a JSON string array: {error}"),
+                Language::Chinese => format!("{field} 必须是 JSON 字符串数组：{error}"),
+            })
+    } else {
+        parse_csv(input, field, language).map(Some)
+    }
+}
+
+fn parse_form_number<T>(
+    input: &TextInput,
+    field: &str,
+    language: Language,
+) -> std::result::Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    input.value.trim().parse().map_err(|_| match language {
+        Language::English => format!("{field} must be a non-negative whole number"),
+        Language::Chinese => format!("{field} 必须是非负整数"),
+    })
+}
+
+impl CommandForm {
+    fn submission(&self, language: Language) -> std::result::Result<CommandSubmission, String> {
+        let name = self.name.value.trim().to_owned();
+        if name.is_empty() {
+            return Err(language
+                .text("Name cannot be empty", "名称不能为空")
+                .to_owned());
+        }
+        let update = split_command_line(self.update.value.trim(), language)?;
+        if update.is_empty() {
+            return Err(language
+                .text("Update command cannot be empty", "更新命令不能为空")
+                .to_owned());
+        }
+        let probe = split_command_line(self.probe.value.trim(), language)?;
+        if probe.is_empty() {
+            return Err(language
+                .text("Probe command cannot be empty", "版本探测命令不能为空")
+                .to_owned());
+        }
+        let update_version = if self.update_version.value.trim().is_empty() {
+            None
+        } else {
+            Some(split_command_line(
+                self.update_version.value.trim(),
+                language,
+            )?)
+        };
+        let latest_value = self.latest_value.value.trim().to_owned();
+        let latest = match self.latest_provider {
+            LatestProviderChoice::None => None,
+            _ if latest_value.is_empty() => {
+                return Err(language
+                    .text(
+                        "Latest value is required for the selected source",
+                        "选择最新版本来源后必须填写来源值",
+                    )
+                    .to_owned());
+            }
+            LatestProviderChoice::Npm => Some(LatestVersionSource::Npm {
+                package: latest_value,
+            }),
+            LatestProviderChoice::Pypi => Some(LatestVersionSource::Pypi {
+                package: latest_value,
+            }),
+            LatestProviderChoice::CratesIo => Some(LatestVersionSource::CratesIo {
+                package: latest_value,
+            }),
+            LatestProviderChoice::GithubRelease => Some(LatestVersionSource::GithubRelease {
+                repository: latest_value,
+            }),
+            LatestProviderChoice::GithubTag => Some(LatestVersionSource::GithubTag {
+                repository: latest_value,
+            }),
+        };
+        let wait_for = parse_optional_string_list(
+            &self.wait_for.value,
+            language.text("Wait for", "等待进程"),
+            language,
+        )?;
+        let processes = if self.processes.value.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str::<Vec<ProcessRule>>(self.processes.value.trim()).map_err(
+                |error| match language {
+                    Language::English => format!("Process rules must be a JSON array: {error}"),
+                    Language::Chinese => format!("进程规则必须是 JSON 数组：{error}"),
+                },
+            )?
+        };
+        let platforms = parse_csv(
+            &self.platforms.value,
+            language.text("Platforms", "平台"),
+            language,
+        )?;
+        let resource_group = (!self.resource_group.value.trim().is_empty())
+            .then(|| self.resource_group.value.trim().to_owned());
+        let tool = UserTool {
+            update,
+            probe,
+            latest,
+            update_version,
+            background: self.background,
+            wait_for,
+            processes,
+            lock_timeout_secs: parse_form_number(
+                &self.lock_timeout_secs,
+                language.text("Lock timeout", "锁超时"),
+                language,
+            )?,
+            retries: parse_form_number(
+                &self.retries,
+                language.text("Retries", "重试次数"),
+                language,
+            )?,
+            retry_delay_secs: parse_form_number(
+                &self.retry_delay_secs,
+                language.text("Retry delay", "重试延迟"),
+                language,
+            )?,
+            platforms,
+            resource_group,
+        };
+        tool.validate_for_name(&name)
+            .map_err(|error| error.to_string())?;
+        Ok(CommandSubmission { name, tool })
+    }
+}
+
 fn quote_editable_argument(value: &str) -> String {
     if !value.is_empty()
         && !value.chars().any(char::is_whitespace)
@@ -11487,13 +12079,8 @@ fn quote_editable_argument(value: &str) -> String {
     {
         return value.to_owned();
     }
-    if !value.contains('"') {
-        format!("\"{value}\"")
-    } else if !value.contains('\'') {
-        format!("'{value}'")
-    } else {
-        value.to_owned()
-    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn split_command_line(input: &str, language: Language) -> std::result::Result<Vec<String>, String> {
@@ -11501,7 +12088,14 @@ fn split_command_line(input: &str, language: Language) -> std::result::Result<Ve
     let mut current = String::new();
     let mut quote = None;
     let mut started = false;
-    for character in input.chars() {
+    let mut characters = input.chars().peekable();
+    while let Some(character) = characters.next() {
+        if quote == Some('"') && character == '\\' && matches!(characters.peek(), Some('"' | '\\'))
+        {
+            current.push(characters.next().expect("peeked escaped character"));
+            started = true;
+            continue;
+        }
         match (quote, character) {
             (Some(expected), value) if value == expected => quote = None,
             (Some(_), value) => {
@@ -11631,6 +12225,40 @@ fn next_index(current: usize, length: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_command_form(name: &str, update: &str) -> Box<CommandForm> {
+        let mut form = CommandForm::new_add();
+        form.name = TextInput::new(name.to_owned());
+        form.update = TextInput::new(update.to_owned());
+        let probe_name = if name.trim().is_empty() {
+            "example"
+        } else {
+            name.trim()
+        };
+        form.probe = TextInput::new(format!("{probe_name} --version"));
+        form.field = CommandFormField::Update;
+        Box::new(form)
+    }
+
+    fn generated_command(name: &str, update: &[&str]) -> ai::GeneratedCommand {
+        ai::GeneratedCommand {
+            name: name.to_owned(),
+            tool: UserTool {
+                update: update.iter().map(|part| (*part).to_owned()).collect(),
+                probe: vec![name.to_owned(), "--version".to_owned()],
+                latest: None,
+                update_version: None,
+                background: ToolBackground::Auto,
+                wait_for: None,
+                processes: Vec::new(),
+                lock_timeout_secs: default_lock_timeout_secs(),
+                retries: default_retries(),
+                retry_delay_secs: default_retry_delay_secs(),
+                platforms: Vec::new(),
+                resource_group: None,
+            },
+        }
+    }
 
     fn render_test_screen(app: &mut App, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
@@ -11883,6 +12511,8 @@ mod tests {
                 "update".to_owned(),
                 "two words".to_owned(),
                 "a\"b".to_owned(),
+                r#"a'b"c"#.to_owned(),
+                r#"folder\name with space"#.to_owned(),
             ],
         );
         assert_eq!(
@@ -11891,7 +12521,9 @@ mod tests {
                 r#"C:\Program Files\Example\example.exe"#,
                 "update",
                 "two words",
-                "a\"b"
+                "a\"b",
+                r#"a'b"c"#,
+                r#"folder\name with space"#,
             ]
         );
     }
@@ -12684,17 +13316,13 @@ mod tests {
         assert_eq!(app.language.job_status(&JobStatus::Pending), "等待执行");
 
         app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 0,
-            name: TextInput::new(String::new()),
-            command: TextInput::new(String::new()),
+            form: Box::new(CommandForm::new_add()),
         };
         handle_key(&mut app, lower_l);
         assert_eq!(app.language, Language::Chinese);
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { name, .. } if name.value == "l"
+            Modal::AddCommand { form } if form.name.value == "l"
         ));
 
         let restarted = App::new(state, None).expect("restarted app");
@@ -12839,11 +13467,7 @@ mod tests {
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 1,
-            name: TextInput::new("example"),
-            command: TextInput::new("abcd"),
+            form: test_command_form("example", "abcd"),
         };
         app.modal_input_hitboxes = vec![ModalInputHitbox {
             area: Rect::new(10, 5, 10, 1),
@@ -12874,7 +13498,7 @@ mod tests {
 
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { command, .. } if command.value == "aXd"
+            Modal::AddCommand { form } if form.update.value == "aXd"
         ));
     }
 
@@ -12916,11 +13540,7 @@ mod tests {
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 1,
-            name: TextInput::new("example"),
-            command: TextInput::new("example update"),
+            form: test_command_form("example", "example update"),
         };
         let backend = TestBackend::new(20, 6);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -12936,11 +13556,7 @@ mod tests {
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 1,
-            name: TextInput::new("example"),
-            command: TextInput::new("abcd"),
+            form: test_command_form("example", "abcd"),
         };
 
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
@@ -12951,7 +13567,7 @@ mod tests {
 
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { command, .. } if command.value == "abcXd"
+            Modal::AddCommand { form } if form.update.value == "abcXd"
         ));
     }
 
@@ -12961,11 +13577,7 @@ mod tests {
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 1,
-            name: TextInput::new("example"),
-            command: TextInput::new("old command"),
+            form: test_command_form("example", "old command"),
         };
 
         handle_modal_key(
@@ -12979,7 +13591,7 @@ mod tests {
 
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { command, .. } if command.value == "X"
+            Modal::AddCommand { form } if form.update.value == "X"
         ));
     }
 
@@ -12989,11 +13601,7 @@ mod tests {
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 1,
-            name: TextInput::new("example"),
-            command: TextInput::new("abcd"),
+            form: test_command_form("example", "abcd"),
         };
 
         for (code, modifiers) in [
@@ -13007,7 +13615,37 @@ mod tests {
 
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { command, .. } if command.value == "aXd"
+            Modal::AddCommand { form } if form.update.value == "aXd"
+        ));
+    }
+
+    #[test]
+    fn command_form_cycles_latest_source_and_background_choices() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let mut form = test_command_form("example", "example update");
+        form.field = CommandFormField::LatestSource;
+        app.modal = Modal::AddCommand { form };
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.latest_provider == LatestProviderChoice::Npm
+        ));
+        for _ in 0..3 {
+            handle_modal_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.field == CommandFormField::Background
+                    && form.background == ToolBackground::Always
         ));
     }
 
@@ -13042,24 +13680,32 @@ mod tests {
 
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand {
-                mode: CommandFormMode::Edit,
-                original_name: Some(original_name),
-                field: 1,
-                name,
-                command,
-            } if original_name == "example"
-                && name.value == "example"
-                && command.value == r#"example-cli update "two words""#
+            Modal::AddCommand { form }
+                if form.mode == CommandFormMode::Edit
+                    && form.original_name.as_deref() == Some("example")
+                    && form.field == CommandFormField::Update
+                    && form.name.value == "example"
+                    && form.update.value == r#"example-cli update "two words""#
         ));
 
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert!(matches!(&app.modal, Modal::AddCommand { field: 0, .. }));
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form } if form.field == CommandFormField::Name
+        ));
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert!(matches!(&app.modal, Modal::AddCommand { field: 1, .. }));
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form } if form.field == CommandFormField::Update
+        ));
 
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(matches!(&app.modal, Modal::AddCommand { field: 0, .. }));
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form } if form.field == CommandFormField::Probe
+        ));
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         handle_modal_key(
             &mut app,
@@ -13072,16 +13718,140 @@ mod tests {
             );
         }
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             &app.modal,
             Modal::ConfirmAdd {
-                mode: CommandFormMode::Edit,
-                original_name: Some(original_name),
-                name,
+                form,
+                submission,
                 ..
-            } if original_name == "example" && name == "renamed"
+            } if form.mode == CommandFormMode::Edit
+                && form.original_name.as_deref() == Some("example")
+                && submission.name == "renamed"
         ));
+    }
+
+    #[test]
+    fn complete_command_form_persists_every_user_tool_field_to_toml() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state.clone(), None).expect("app");
+        let mut form = test_command_form("complete-example", r#"brew upgrade "example package""#);
+        form.probe = TextInput::new(r#"example-cli --version"#);
+        form.latest_provider = LatestProviderChoice::GithubRelease;
+        form.latest_value = TextInput::new("owner/example".to_owned());
+        form.update_version =
+            TextInput::new(r#"cargo install example-cli --version "{version}""#.to_owned());
+        form.background = ToolBackground::Always;
+        form.wait_for = TextInput::new("example-cli, helper".to_owned());
+        form.processes = TextInput::new(
+            r#"[{"name":"example-cli","command_contains":"serve","action":"fail","terminate_grace_secs":3}]"#
+                .to_owned(),
+        );
+        form.lock_timeout_secs = TextInput::new("45".to_owned());
+        form.retries = TextInput::new("3".to_owned());
+        form.retry_delay_secs = TextInput::new("4".to_owned());
+        form.platforms = TextInput::new("macos, linux".to_owned());
+        form.resource_group = TextInput::new("homebrew".to_owned());
+        app.modal = Modal::AddCommand { form };
+
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(app.modal, Modal::ConfirmAdd { .. }));
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(app.modal, Modal::None));
+        let path = state.custom_config_path();
+        let saved = UserConfig::load(&path).expect("reload complete custom tool");
+        let tool = saved
+            .tools
+            .get("complete-example")
+            .expect("saved complete custom tool");
+        assert_eq!(tool.update, ["brew", "upgrade", "example package"]);
+        assert_eq!(tool.probe, ["example-cli", "--version"]);
+        assert!(matches!(
+            &tool.latest,
+            Some(LatestVersionSource::GithubRelease { repository })
+                if repository == "owner/example"
+        ));
+        assert_eq!(
+            tool.update_version
+                .as_deref()
+                .expect("versioned update command"),
+            ["cargo", "install", "example-cli", "--version", "{version}"]
+        );
+        assert_eq!(tool.background, ToolBackground::Always);
+        assert_eq!(
+            tool.wait_for.as_deref().expect("wait-for processes"),
+            ["example-cli", "helper"]
+        );
+        assert_eq!(tool.processes.len(), 1);
+        assert_eq!(tool.processes[0].name, "example-cli");
+        assert_eq!(tool.processes[0].command_contains.as_deref(), Some("serve"));
+        assert_eq!(tool.processes[0].action, crate::config::ProcessAction::Fail);
+        assert_eq!(tool.processes[0].terminate_grace_secs, 3);
+        assert_eq!(tool.lock_timeout_secs, 45);
+        assert_eq!(tool.retries, 3);
+        assert_eq!(tool.retry_delay_secs, 4);
+        assert_eq!(tool.platforms, ["macos", "linux"]);
+        assert_eq!(tool.resource_group.as_deref(), Some("homebrew"));
+
+        let toml = std::fs::read_to_string(path).expect("saved TOML");
+        for key in [
+            "update =",
+            "probe =",
+            "latest",
+            "update_version =",
+            "background = \"always\"",
+            "wait_for =",
+            "processes]]",
+            "lock_timeout_secs = 45",
+            "retries = 3",
+            "retry_delay_secs = 4",
+            "platforms =",
+            "resource_group = \"homebrew\"",
+        ] {
+            assert!(toml.contains(key), "missing `{key}` in TOML:\n{toml}");
+        }
+    }
+
+    #[test]
+    fn command_form_preserves_lossless_wait_for_lists() {
+        let mut tool = UserTool::custom(
+            "no-wait-example",
+            "example-cli".to_owned(),
+            vec!["update".to_owned()],
+        );
+        tool.wait_for = Some(Vec::new());
+        let form = CommandForm::from_user_tool(
+            CommandFormMode::Edit,
+            Some("no-wait-example".to_owned()),
+            "no-wait-example".to_owned(),
+            &tool,
+        );
+
+        assert_eq!(form.wait_for.value, "[]");
+        let submission = form
+            .submission(Language::English)
+            .expect("complete command form");
+        assert_eq!(submission.tool.wait_for, Some(Vec::new()));
+
+        tool.wait_for = Some(vec!["process,with,commas".to_owned()]);
+        let form = CommandForm::from_user_tool(
+            CommandFormMode::Edit,
+            Some("no-wait-example".to_owned()),
+            "no-wait-example".to_owned(),
+            &tool,
+        );
+        assert_eq!(form.wait_for.value, r#"["process,with,commas"]"#);
+        let submission = form
+            .submission(Language::English)
+            .expect("comma-containing process name");
+        assert_eq!(submission.tool.wait_for, tool.wait_for);
     }
 
     #[test]
@@ -13315,13 +14085,9 @@ mod tests {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
-        app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 0,
-            name: TextInput::new("code"),
-            command: TextInput::new(String::new()),
-        };
+        let mut form = test_command_form("code", "");
+        form.field = CommandFormField::Name;
+        app.modal = Modal::AddCommand { form };
         app.ai_generation_loading = true;
         app.ai_generation_request_id = 15;
         app.ai_generation_in_flight_request_id = Some(15);
@@ -13337,17 +14103,14 @@ mod tests {
         app.tx
             .send(AppEvent::AiCommandGenerated {
                 request_id: 15,
-                result: Ok(ai::GeneratedCommand {
-                    name: "stale".to_owned(),
-                    command: "stale update".to_owned(),
-                }),
+                result: Ok(generated_command("stale", &["stale", "update"])),
             })
             .expect("stale generated command");
         app.process_events();
         assert_eq!(app.ai_generation_in_flight_request_id, None);
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { name, .. } if name.value == "codex"
+            Modal::AddCommand { form } if form.name.value == "codex"
         ));
     }
 
@@ -13356,38 +14119,59 @@ mod tests {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
-        app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 0,
-            name: TextInput::new("code"),
-            command: TextInput::new(String::new()),
-        };
+        let mut form = test_command_form("code", "");
+        form.field = CommandFormField::Name;
+        app.modal = Modal::AddCommand { form };
         app.ai_generation_loading = true;
         app.ai_generation_request_id = 8;
         app.tx
             .send(AppEvent::AiCommandGenerated {
                 request_id: 7,
-                result: Ok(ai::GeneratedCommand {
-                    name: "stale".to_owned(),
-                    command: "stale update".to_owned(),
-                }),
+                result: Ok(generated_command("stale", &["stale", "update"])),
             })
             .expect("stale result");
         app.process_events();
         assert!(app.ai_generation_loading);
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { name, .. } if name.value == "code"
+            Modal::AddCommand { form } if form.name.value == "code"
         ));
 
+        let mut generated = generated_command(
+            "codegraph",
+            &[
+                "npm",
+                "install",
+                "--global",
+                "@colbymchenry/codegraph@latest",
+            ],
+        );
+        generated.tool.latest = Some(LatestVersionSource::Npm {
+            package: "@colbymchenry/codegraph".to_owned(),
+        });
+        generated.tool.update_version = Some(vec![
+            "npm".to_owned(),
+            "install".to_owned(),
+            "--global".to_owned(),
+            "@colbymchenry/codegraph@{version}".to_owned(),
+        ]);
+        generated.tool.background = ToolBackground::Always;
+        generated.tool.wait_for = Some(vec!["codegraph".to_owned()]);
+        generated.tool.processes = vec![ProcessRule {
+            name: "node".to_owned(),
+            command_contains: Some("codegraph".to_owned()),
+            action: crate::config::ProcessAction::Wait,
+            terminate_grace_secs: 5,
+        }];
+        generated.tool.lock_timeout_secs = 60;
+        generated.tool.retries = 4;
+        generated.tool.retry_delay_secs = 3;
+        generated.tool.platforms = vec!["macos".to_owned(), "linux".to_owned()];
+        generated.tool.resource_group = Some("node-global".to_owned());
         app.tx
             .send(AppEvent::AiCommandGenerated {
                 request_id: 8,
-                result: Ok(ai::GeneratedCommand {
-                    name: "codegraph".to_owned(),
-                    command: "npm install --global @colbymchenry/codegraph@latest".to_owned(),
-                }),
+                result: Ok(generated),
             })
             .expect("current result");
         app.process_events();
@@ -13395,13 +14179,24 @@ mod tests {
         assert!(!app.ai_generation_loading);
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand {
-                field: 1,
-                name,
-                command,
-                ..
-            } if name.value == "codegraph"
-                && command.value == "npm install --global @colbymchenry/codegraph@latest"
+            Modal::AddCommand { form }
+                if form.field == CommandFormField::Update
+                    && form.name.value == "codegraph"
+                    && form.update.value
+                        == "npm install --global @colbymchenry/codegraph@latest"
+                    && form.probe.value == "codegraph --version"
+                    && form.latest_provider == LatestProviderChoice::Npm
+                    && form.latest_value.value == "@colbymchenry/codegraph"
+                    && form.update_version.value
+                        == "npm install --global @colbymchenry/codegraph@{version}"
+                    && form.background == ToolBackground::Always
+                    && form.wait_for.value == r#"["codegraph"]"#
+                    && form.processes.value.contains("\"command_contains\":\"codegraph\"")
+                    && form.lock_timeout_secs.value == "60"
+                    && form.retries.value == "4"
+                    && form.retry_delay_secs.value == "3"
+                    && form.platforms.value == "macos, linux"
+                    && form.resource_group.value == "node-global"
         ));
         assert!(app.message.contains("review"));
     }
@@ -13502,14 +14297,28 @@ mod tests {
         assert!(enabled < base_url && base_url < api_key && api_key < model);
 
         app.modal = Modal::AddCommand {
-            mode: CommandFormMode::Add,
-            original_name: None,
-            field: 0,
-            name: TextInput::new("example"),
-            command: TextInput::new(String::new()),
+            form: test_command_form("example", "example update"),
         };
         let add = render_test_screen(&mut app, 140, 30);
         assert!(add.contains("Ctrl+G"), "screen: {add}");
+        for label in [
+            "Name",
+            "Update command",
+            "Probe command",
+            "Latest source",
+            "Latest value",
+            "Versioned update",
+            "Background",
+            "Wait for",
+            "Process rules",
+            "Lock timeout",
+            "Retries",
+            "Retry delay",
+            "Platforms",
+            "Resource group",
+        ] {
+            assert!(add.contains(label), "missing `{label}` in screen: {add}");
+        }
 
         app.open_github_monitor_form(MonitorFormMode::Add, None);
         let github = render_test_screen(&mut app, 140, 30);
@@ -14646,53 +15455,6 @@ mod tests {
                 "2.1.207",
                 "claude"
             ]
-        );
-    }
-
-    #[test]
-    fn adding_a_command_only_builds_a_save_operation() {
-        let arguments = add_arguments(
-            "sentinel",
-            vec!["Write-Output".to_owned(), "must-not-run".to_owned()],
-            false,
-        );
-
-        assert_eq!(
-            arguments,
-            ["add", "sentinel", "Write-Output", "must-not-run"]
-        );
-        assert!(!arguments.iter().any(|argument| argument == "update"));
-        assert!(
-            Operation::Add
-                .completion_message("sentinel", true, Duration::ZERO, 0, Language::English)
-                .contains("has not been run")
-        );
-        assert!(
-            Operation::Add
-                .completion_message("sentinel", true, Duration::ZERO, 0, Language::Chinese)
-                .contains("尚未执行")
-        );
-
-        assert_eq!(
-            add_arguments(
-                "sentinel",
-                vec!["Write-Output".to_owned(), "replacement".to_owned()],
-                true,
-            ),
-            ["add", "--force", "sentinel", "Write-Output", "replacement"]
-        );
-        assert!(
-            Operation::Edit
-                .completion_message("sentinel", true, Duration::ZERO, 0, Language::English)
-                .contains("Updated")
-        );
-        assert_eq!(
-            edit_arguments(
-                "sentinel",
-                "renamed",
-                vec!["Write-Output".to_owned(), "replacement".to_owned()],
-            ),
-            ["edit", "sentinel", "renamed", "Write-Output", "replacement"]
         );
     }
 

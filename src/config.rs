@@ -618,6 +618,13 @@ fn inferred_platforms(program: &str) -> &'static [&'static str] {
 }
 
 impl UserTool {
+    /// Validates one complete user-authored tool in its name-dependent context.
+    pub(crate) fn validate_for_name(&self, name: &str) -> Result<()> {
+        let mut candidate = UserConfig::empty();
+        candidate.tools.insert(name.to_owned(), self.clone());
+        candidate.resolve().map(|_| ())
+    }
+
     /// Creates a concise user definition with an explicit version probe.
     pub fn custom(name: &str, program: String, args: Vec<String>) -> Self {
         let mut update = Vec::with_capacity(args.len() + 1);
@@ -914,7 +921,7 @@ fn normalize_process_name(name: &str) -> String {
         .to_owned()
 }
 
-const fn default_lock_timeout_secs() -> u64 {
+pub(crate) const fn default_lock_timeout_secs() -> u64 {
     86_400
 }
 
@@ -922,7 +929,7 @@ fn is_default_lock_timeout_secs(value: &u64) -> bool {
     *value == default_lock_timeout_secs()
 }
 
-const fn default_retries() -> u32 {
+pub(crate) const fn default_retries() -> u32 {
     8
 }
 
@@ -930,7 +937,7 @@ fn is_default_retries(value: &u32) -> bool {
     *value == default_retries()
 }
 
-const fn default_retry_delay_secs() -> u64 {
+pub(crate) const fn default_retry_delay_secs() -> u64 {
     2
 }
 
