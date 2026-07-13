@@ -85,7 +85,18 @@ pub(crate) fn probe_monitors(
     Ok(monitors
         .iter()
         .map(|monitor| {
-            let installed_tag = state.releases.get(&monitor.name).cloned();
+            let installed_tag = match installed_monitor_version(monitor, &state) {
+                Ok(version) => version,
+                Err(error) => {
+                    return MonitorStatus {
+                        name: monitor.name.clone(),
+                        installed_tag: None,
+                        latest_tag: None,
+                        asset: None,
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
             if !monitor.enabled {
                 return MonitorStatus {
                     name: monitor.name.clone(),
@@ -175,7 +186,10 @@ fn update_monitor(
     installer_root: &Path,
 ) -> Result<MonitorOutcome> {
     let release = resolve_latest_asset(monitor, api_key, agent)?;
-    if state.releases.get(&monitor.name) == Some(&release.tag) {
+    if installed_monitor_version(monitor, state)?
+        .as_deref()
+        .is_some_and(|installed| release_versions_match(installed, &release.tag))
+    {
         return Ok(MonitorOutcome::Current {
             name: monitor.name.clone(),
             tag: release.tag,
@@ -189,6 +203,82 @@ fn update_monitor(
         tag: release.tag,
         asset: release.asset.name,
     })
+}
+
+fn installed_monitor_version(
+    monitor: &GithubReleaseMonitor,
+    state: &ReleaseState,
+) -> Result<Option<String>> {
+    match monitor.format {
+        ReleaseAssetFormat::Dmg => {
+            #[cfg(target_os = "macos")]
+            return installed_macos_app_version(&monitor.target_directory);
+            #[cfg(not(target_os = "macos"))]
+            return Err(Error::Message(
+                "macOS application version probing is unavailable on this platform".to_owned(),
+            ));
+        }
+        _ => Ok(state.releases.get(&monitor.name).cloned()),
+    }
+}
+
+pub(crate) fn release_versions_match(installed: &str, release_tag: &str) -> bool {
+    fn without_v_prefix(value: &str) -> &str {
+        value
+            .strip_prefix('v')
+            .or_else(|| value.strip_prefix('V'))
+            .unwrap_or(value)
+    }
+
+    installed == release_tag || without_v_prefix(installed) == without_v_prefix(release_tag)
+}
+
+#[cfg(target_os = "macos")]
+fn installed_macos_app_version(app: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(app) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::Message(format!(
+            "macOS application target is not a real directory: {}",
+            app.display()
+        )));
+    }
+    let info = app.join("Contents/Info.plist");
+    let short = plist_string(&info, "CFBundleShortVersionString")?;
+    if let Some(version) = short {
+        return Ok(Some(version));
+    }
+    plist_string(&info, "CFBundleVersion")?.map_or_else(
+        || {
+            Err(Error::Message(format!(
+                "macOS application has no bundle version: {}",
+                app.display()
+            )))
+        },
+        |version| Ok(Some(version)),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn plist_string(path: &Path, key: &str) -> Result<Option<String>> {
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", &format!("Print :{key}")])
+        .arg(path)
+        .output()?;
+    if output.status.success() {
+        let value = String::from_utf8(output.stdout)
+            .map_err(|_| Error::Message(format!("Info.plist key `{key}` is not UTF-8")))?;
+        let value = value.trim();
+        return Ok((!value.is_empty()).then(|| value.to_owned()));
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    if detail.contains("Does Not Exist") || detail.contains("Entry, \":") {
+        return Ok(None);
+    }
+    Err(command_error("read macOS application version", &output))
 }
 
 struct ResolvedRelease {
@@ -1058,6 +1148,70 @@ mod tests {
                 error: None,
             }]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_probe_reports_the_real_app_version_instead_of_stale_install_history() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state_path = temporary.path().join("github-releases.json");
+        let mut state = ReleaseState::default();
+        state
+            .releases
+            .insert("reqable".to_owned(), "3.2.7".to_owned());
+        save_state(&state_path, &state).expect("save stale release state");
+
+        let app = temporary.path().join("Reqable.app");
+        fs::create_dir_all(app.join("Contents")).expect("create app bundle");
+        fs::write(
+            app.join("Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleShortVersionString</key><string>3.2.2</string>
+<key>CFBundleVersion</key><string>200</string>
+</dict></plist>"#,
+        )
+        .expect("write Info.plist");
+        let monitors = [GithubReleaseMonitor {
+            name: "reqable".to_owned(),
+            repository: "reqable/reqable-app".to_owned(),
+            asset_regex: r"^reqable-app-macos-arm64\.dmg$".to_owned(),
+            target_directory: app.clone(),
+            format: ReleaseAssetFormat::Dmg,
+            update_policy: crate::config::ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled: false,
+        }];
+        let github = GithubSettings {
+            poll_interval_secs: 300,
+            encrypted_api_key: None,
+        };
+
+        let installed =
+            probe_monitors(&monitors, &github, &NetworkSettings::default(), &state_path)
+                .expect("probe installed app");
+        assert_eq!(installed[0].installed_tag.as_deref(), Some("3.2.2"));
+
+        fs::write(
+            app.join("Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleVersion</key><string>200</string>
+</dict></plist>"#,
+        )
+        .expect("write build-only Info.plist");
+        let fallback = probe_monitors(&monitors, &github, &NetworkSettings::default(), &state_path)
+            .expect("probe build version fallback");
+        assert_eq!(fallback[0].installed_tag.as_deref(), Some("200"));
+
+        fs::remove_dir_all(&app).expect("remove app");
+        let missing = probe_monitors(&monitors, &github, &NetworkSettings::default(), &state_path)
+            .expect("probe missing app");
+        assert_eq!(missing[0].installed_tag, None);
     }
 
     #[test]

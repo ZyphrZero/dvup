@@ -3245,7 +3245,7 @@ impl App {
                                 .iter()
                                 .filter(|status| {
                                     status.latest_tag.is_some()
-                                        && status.installed_tag != status.latest_tag
+                                        && !monitor_status_is_current(status)
                                 })
                                 .count();
                             self.release_monitor_statuses = statuses;
@@ -4246,11 +4246,18 @@ fn automatic_release_update_names(
                 .is_some_and(|status| {
                     status.error.is_none()
                         && status.latest_tag.is_some()
-                        && status.installed_tag != status.latest_tag
+                        && !monitor_status_is_current(status)
                 })
         })
         .map(|monitor| monitor.name.clone())
         .collect()
+}
+
+fn monitor_status_is_current(status: &MonitorStatus) -> bool {
+    match (&status.installed_tag, &status.latest_tag) {
+        (Some(installed), Some(latest)) => release::release_versions_match(installed, latest),
+        _ => false,
+    }
 }
 
 fn update_monitor_status(
@@ -5622,20 +5629,14 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Enter => {
-            let mut requested = if app.selected_github_monitors.is_empty() {
-                app.focused_github_monitor()
-                    .filter(|monitor| monitor.enabled)
-                    .map(|monitor| vec![monitor.name.clone()])
-                    .unwrap_or_default()
-            } else {
-                app.github_monitors
-                    .iter()
-                    .filter(|monitor| {
-                        monitor.enabled && app.selected_github_monitors.contains(&monitor.name)
-                    })
-                    .map(|monitor| monitor.name.clone())
-                    .collect::<Vec<_>>()
-            };
+            let mut requested = app
+                .github_monitors
+                .iter()
+                .filter(|monitor| {
+                    monitor.enabled && app.selected_github_monitors.contains(&monitor.name)
+                })
+                .map(|monitor| monitor.name.clone())
+                .collect::<Vec<_>>();
             if requested.is_empty() {
                 app.message = app
                     .language
@@ -5653,7 +5654,7 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
                         .iter()
                         .find(|status| status.name.as_str() == name.as_str())
                         .is_some_and(|status| {
-                            status.latest_tag.is_some() && status.installed_tag == status.latest_tag
+                            status.latest_tag.is_some() && monitor_status_is_current(status)
                         })
                 })
                 .cloned()
@@ -5676,6 +5677,17 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Char('a' | 'A') => {
+            let should_select = app.github_monitors.iter().any(|monitor| {
+                monitor.enabled && !app.selected_github_monitors.contains(&monitor.name)
+            });
+            app.selected_github_monitors = app
+                .github_monitors
+                .iter()
+                .filter(|monitor| monitor.enabled && should_select)
+                .map(|monitor| monitor.name.clone())
+                .collect();
+        }
+        KeyCode::Char('c' | 'C') => {
             if app.config_path.is_some() {
                 app.message = app
                     .language
@@ -5703,6 +5715,8 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
                 app.open_github_monitor_form(MonitorFormMode::Edit, Some(app.github_monitor_index));
             }
         }
+        KeyCode::Char('t' | 'T') => app.open_toml_editor(),
+        KeyCode::Char('o' | 'O') => app.open_toml_in_system_editor(),
         KeyCode::Char('d' | 'D') if monitor_count > 0 => {
             if app.config_path.is_some() {
                 app.message = app
@@ -5718,7 +5732,7 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
                 index: app.github_monitor_index,
             };
         }
-        KeyCode::Char('r' | 'R' | 'c' | 'C') => app.start_release_probe(true),
+        KeyCode::Char('r' | 'R') => app.start_release_probe(true),
         _ => {}
     }
 }
@@ -6550,18 +6564,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 "q / Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab",
             ],
             ToolView::Github => [
-                "↑↓/hover move · click/Space select · Enter install · A add · E edit · D delete",
-                "Tab command tools · R/C refresh status · q / Ctrl+C quit · L 中/EN · ←/→ main tab",
+                "↑↓/hover move · click/Space select · a all · Enter install · Tab command tools",
+                "q / Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab",
             ],
         },
         (Tab::Tools, Language::Chinese) => match app.tool_view {
             ToolView::Commands => [
                 "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 更新 · v 指定版本 · Tab GitHub",
-                "q / Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 页签",
+                "q / Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页",
             ],
             ToolView::Github => [
-                "↑↓/悬停 移动 · 点击/Space 选择 · Enter 安装 · A 添加 · E 编辑 · D 删除",
-                "Tab 命令工具 · R/C 刷新状态 · q / Ctrl+C 退出 · L 中/EN · ←/→ 主页签",
+                "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 安装 · Tab 命令工具",
+                "q / Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页",
             ],
         },
         (Tab::Activity, Language::English) => [
@@ -6570,7 +6584,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ],
         (Tab::Activity, Language::Chinese) => [
             "↑↓ 滚动 · 点击执行展开 · Home/End · r 刷新",
-            "q / Ctrl+C 退出 · ←/→ 或点击页签 · L 中/EN · Shift+Tab 策略",
+            "q / Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
         ],
         (Tab::Jobs, Language::English) => [
             "↑↓/hover move · click/Enter expand result · PgUp/PgDn scroll · r refresh",
@@ -6578,7 +6592,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ],
         (Tab::Jobs, Language::Chinese) => [
             "↑↓/悬停 移动 · 点击/Enter 展开结果 · PgUp/PgDn 滚动 · r 刷新",
-            "q / Ctrl+C 退出 · ←/→ 或点击页签 · L 中/EN · Shift+Tab 策略",
+            "q / Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
         ],
         (Tab::Doctor, Language::English) => [
             "Enter scan/expand · r rescan · ↑↓/hover move · PgUp/PgDn scroll",
@@ -6586,7 +6600,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ],
         (Tab::Doctor, Language::Chinese) => [
             "Enter 扫描/展开 · r 重新扫描 · ↑↓/悬停 移动 · PgUp/PgDn 滚动",
-            "q / Ctrl+C 退出 · active 为当前生效项 · shadowed 为被遮蔽项 · ←/→ 或点击页签",
+            "q / Ctrl+C 退出 · active 为当前生效项 · shadowed 为被遮蔽项 · ←/→ 或点击标签页",
         ],
         (Tab::Settings, Language::English) => [
             "↑↓/hover move · click/Space/Enter toggle setting",
@@ -6594,7 +6608,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ],
         (Tab::Settings, Language::Chinese) => [
             "↑↓/悬停 移动 · 点击/Space/Enter 切换设置",
-            "q / Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击页签 · L 中/EN",
+            "q / Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击标签页 · L 中/EN",
         ],
     };
     let footer = Paragraph::new(vec![
@@ -7090,7 +7104,7 @@ fn github_monitor_result(
         );
     }
     match (&status.installed_tag, &status.latest_tag) {
-        (Some(installed), Some(latest)) if installed == latest => (
+        (Some(installed), Some(latest)) if release::release_versions_match(installed, latest) => (
             language.text("up to date", "已是最新").to_owned(),
             Style::default().fg(SUCCESS),
         ),
@@ -13728,6 +13742,133 @@ mod tests {
     }
 
     #[test]
+    fn github_tool_a_toggles_all_enabled_repository_selections() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state, None).expect("app");
+        let monitor = |name: &str, enabled| GithubReleaseMonitor {
+            name: name.to_owned(),
+            repository: format!("owner/{name}"),
+            asset_regex: format!(r"^{name}\.zip$"),
+            target_directory: temporary.path().join(name),
+            format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled,
+        };
+        app.github_monitors = vec![
+            monitor("first", true),
+            monitor("disabled", false),
+            monitor("second", true),
+        ];
+
+        handle_github_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(
+            app.selected_github_monitors,
+            HashSet::from(["first".to_owned(), "second".to_owned()])
+        );
+
+        handle_github_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE),
+        );
+
+        assert!(app.selected_github_monitors.is_empty());
+    }
+
+    #[test]
+    fn github_tool_c_opens_the_add_repository_form() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state, None).expect("app");
+
+        handle_github_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            app.modal,
+            Modal::GithubMonitorForm {
+                mode: MonitorFormMode::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn github_tool_t_opens_the_toml_editor() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state.clone(), None).expect("app");
+
+        handle_github_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            &app.modal,
+            Modal::TomlEditor { editor }
+                if editor.path == state.custom_config_path()
+                    && UserConfig::parse(&editor.text).is_ok()
+        ));
+    }
+
+    #[test]
+    fn github_tool_o_uses_the_system_toml_editor_action() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state, None).expect("app");
+        app.running = 1;
+        app.message.clear();
+
+        handle_github_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(
+            app.message,
+            "Wait for the current operation before editing TOML"
+        );
+    }
+
+    #[test]
+    fn github_tool_enter_requires_an_explicit_repository_selection() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state, None).expect("app");
+        app.github_monitors.push(GithubReleaseMonitor {
+            name: "example".to_owned(),
+            repository: "owner/repository".to_owned(),
+            asset_regex: r"^example\.zip$".to_owned(),
+            target_directory: temporary.path().join("installed"),
+            format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled: true,
+        });
+
+        handle_github_tools_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.message, "Select an enabled GitHub repository first");
+    }
+
+    #[test]
     fn github_tool_enter_confirms_available_update_and_skips_current_release() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().join("state"));
@@ -13755,6 +13896,10 @@ mod tests {
             error: None,
         });
 
+        handle_github_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
         handle_github_tools_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             &app.modal,
@@ -13832,7 +13977,7 @@ mod tests {
         let statuses = vec![
             status("automatic", Some("v1"), Some("v2"), None),
             status("manual", Some("v1"), Some("v2"), None),
-            status("current", Some("v2"), Some("v2"), None),
+            status("current", Some("2"), Some("v2"), None),
             status(
                 "failed",
                 Some("v1"),
@@ -14062,7 +14207,7 @@ mod tests {
         assert_eq!(app.github_monitors.len(), 1);
         handle_github_tools_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
         );
 
         assert!(matches!(app.modal, Modal::None));
@@ -14121,6 +14266,10 @@ mod tests {
         assert!(screen.contains("up to date"), "screen: {screen}");
         assert!(screen.contains("INSTALLED"), "screen: {screen}");
         assert!(screen.contains("manual"), "screen: {screen}");
+        assert!(screen.contains("a all"), "screen: {screen}");
+        assert!(screen.contains("c add"), "screen: {screen}");
+        assert!(screen.contains("t TOML"), "screen: {screen}");
+        assert!(screen.contains("o editor"), "screen: {screen}");
         assert!(screen.contains("Enter install"), "screen: {screen}");
     }
 

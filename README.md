@@ -24,8 +24,8 @@ dvup
 | `Enter` | 更新尚未达到最新版本的命令工具；在 GitHub 仓库视图确认后安装所选 Release；在 Jobs 页展开或收起任务结果；在 Doctor 页首次启动扫描或展开结果；在 Settings 页切换选项 |
 | `Tab` | 在 Tools 页的“命令工具”和“GitHub 仓库”视图之间切换 |
 | `v` | 在 Tools 页为当前工具输入一个精确目标版本；仅对配置了 `update_version` 的工具可用 |
-| 鼠标左键 | 点击顶部页签或 Tools 内部视图切换；在 Tools 页勾选命令工具/GitHub 仓库；在 Activity 页展开执行输出；在 Jobs 页展开任务结果；在 Doctor 页展开诊断详情；在 Settings 页切换选项 |
-| 鼠标移动 | Tools/Jobs/Doctor/Settings 行焦点跟随鼠标；页签和 Activity 执行标题显示悬停高亮，不自动触发操作 |
+| 鼠标左键 | 点击顶部标签页或 Tools 内部视图切换；在 Tools 页勾选命令工具/GitHub 仓库；在 Activity 页展开执行输出；在 Jobs 页展开任务结果；在 Doctor 页展开诊断详情；在 Settings 页切换选项 |
+| 鼠标移动 | Tools/Jobs/Doctor/Settings 行焦点跟随鼠标；标签页和 Activity 执行标题显示悬停高亮，不自动触发操作 |
 | 鼠标滚轮 | 每格滚动一行；Tools/Jobs/Doctor 列表滚动后焦点保持在鼠标所在屏幕行；详情区、Activity 和 TOML 编辑器逐行滚动内容 |
 | `PgUp` / `PgDn` | 在 Jobs 页滚动已展开的任务结果 |
 | `t` | 在 Tools 页打开当前生效配置的 TOML 编辑视图 |
@@ -82,7 +82,7 @@ no_proxy = ["localhost", "127.0.0.1", ".internal.example"]
 
 Settings 的 `GitHub API Key` 行使用遮罩输入。保存时只把 `encrypted_api_key` 密文写入 `settings.toml`，应用重启后自动解密，不需要重新输入；明文不会写入配置、任务日志、Activity、子进程环境或命令行。Windows 使用绑定当前 Windows 用户的原生 DPAPI 加密，因此复制密文到其他账号无法解密；macOS/Linux 使用 AES-256-GCM，随机加密密钥分别由 Keychain/Secret Service 保存。这里没有旧凭据迁移或明文兼容路径，格式错误、密文损坏或不属于当前用户都会直接报错。Windows 上如果编辑器、安全软件或其他进程短暂占用 `settings.toml`，原子替换会先进行有限重试；最终仍无法写入时，TUI 会显示被占用的精确配置路径并保留遮罩输入，释放占用后可直接按 `Enter` 重试，不会误报为凭据或加密配置错误。保存后 GitHub Release/Tag 最新版本查询会立即重新执行，以避免匿名 API 每小时 60 次的限额。TUI 顶部会通过一次后台 `/user` 请求同时显示 `@Token主人`、已用和剩余 API 配额，并用进度条按剩余比例切换绿/黄/红警示；状态每 5 分钟低频刷新，Token 不会进入显示文本或错误信息。
 
-GitHub Release 监控使用严格配置。在 Tools 页按 `Tab` 切到“GitHub 仓库”，表格会直接显示仓库、已安装 tag、最新 tag、更新状态、更新策略和目标目录；`A` 新增、`E` 编辑、`D` 删除、`Space` 选择、`Enter` 确认并安装所选 Release，`R`/`C` 刷新状态。新增和编辑表单会与自定义命令工具一起原子写入 `dvup_custom.toml`，校验失败会保留全部输入供直接修正；`settings.toml` 严格拒绝 `github.monitors`，Settings 只保留 GitHub API Key、轮询间隔和网络策略等全局设置。每项监控可选择 `update_policy = "manual"`（默认，需要逐次确认）或 `update_policy = "automatic"`（后台探测到新 tag 后立即安装）；停用项、探测失败项和已是最新版的项不会进入自动安装队列。`asset_regex` 使用 Rust `regex` 语法，推荐用 `^` 和 `$` 限定完整文件名；正则必须恰好匹配一个 Release asset。`target_directory` 必须是绝对路径。以下配置写入 `dvup_custom.toml`：
+GitHub Release 监控使用严格配置。在 Tools 页按 `Tab` 切到“GitHub 仓库”，表格会直接显示仓库、真实已安装版本、最新 tag、更新状态、更新策略和目标目录；`A` 新增、`E` 编辑、`D` 删除、`Space` 选择、`Enter` 确认并安装所选 Release，`R`/`C` 刷新状态。DMG 监控从目标 `.app/Contents/Info.plist` 读取 `CFBundleShortVersionString`，缺失时回退到 `CFBundleVersion`；应用不存在时显示未安装，且比较时忽略 GitHub tag 常见的前导 `v`。其他资产格式仍使用 dvup 上次成功安装的 tag。新增和编辑表单会与自定义命令工具一起原子写入 `dvup_custom.toml`，校验失败会保留全部输入供直接修正；`settings.toml` 严格拒绝 `github.monitors`，Settings 只保留 GitHub API Key、轮询间隔和网络策略等全局设置。每项监控可选择 `update_policy = "manual"`（默认，需要逐次确认）或 `update_policy = "automatic"`（后台探测到新 tag 后立即安装）；停用项、探测失败项和已是最新版的项不会进入自动安装队列。`asset_regex` 使用 Rust `regex` 语法，推荐用 `^` 和 `$` 限定完整文件名；正则必须恰好匹配一个 Release asset。`target_directory` 必须是绝对路径。以下配置写入 `dvup_custom.toml`：
 
 ```toml
 [[github.monitors]]
@@ -124,7 +124,7 @@ strip_components = 0
 enabled = true
 ```
 
-`cleanup_installer` 默认为 `true`：安装前清理该监控以前保留的安装包，本次临时下载也会在安装结束后自动删除。设为 `false` 时，原始 Release asset 会保留在状态目录的 `github-installers/<监控名>/<资产名>`，可用于离线重装。`format` 只能是 `file`、`zip`、`tar_gz` 或 macOS 专用的 `dmg`，不会在格式错误时猜测或尝试另一种处理方式。每个监控项必须明确限制下载字节数；ZIP、TAR.GZ 和 DMG 还必须限制展开总字节数和文件数。普通 `file` 的两个展开上限必须为 `0`。ZIP/TAR.GZ 会先下载和解压到目标目录同一文件系统中的临时目录，校验路径不能越界，拒绝 TAR 符号链接等非普通条目，再替换完整目标目录；失败时保留原目录。DMG 目标必须是绝对 `.app` 路径：dvup 使用 `hdiutil` 只读挂载镜像，只接受唯一的顶层 `.app`，检查展开上限，使用 `ditto` 保留应用包元数据，通过 `codesign --verify --deep --strict` 后卸载镜像，最后在同一文件系统中原子替换旧应用；任何前置步骤失败都不会修改现有应用。普通 `file` 会保存为 Release asset 的原始文件名。成功安装的 tag 单独记录在状态目录的 `github-releases.json`，其中不包含 API Key。
+`cleanup_installer` 默认为 `true`：安装前清理该监控以前保留的安装包，本次临时下载也会在安装结束后自动删除。设为 `false` 时，原始 Release asset 会保留在状态目录的 `github-installers/<监控名>/<资产名>`，可用于离线重装。`format` 只能是 `file`、`zip`、`tar_gz` 或 macOS 专用的 `dmg`，不会在格式错误时猜测或尝试另一种处理方式。每个监控项必须明确限制下载字节数；ZIP、TAR.GZ 和 DMG 还必须限制展开总字节数和文件数。普通 `file` 的两个展开上限必须为 `0`。ZIP/TAR.GZ 会先下载和解压到目标目录同一文件系统中的临时目录，校验路径不能越界，拒绝 TAR 符号链接等非普通条目，再替换完整目标目录；失败时保留原目录。DMG 目标必须是绝对 `.app` 路径：dvup 使用 `hdiutil` 只读挂载镜像，只接受唯一的顶层 `.app`，检查展开上限，使用 `ditto` 保留应用包元数据，通过 `codesign --verify --deep --strict` 后卸载镜像，最后在同一文件系统中原子替换旧应用；任何前置步骤失败都不会修改现有应用。普通 `file` 会保存为 Release asset 的原始文件名。成功安装的 tag 单独记录在状态目录的 `github-releases.json`，其中不包含 API Key；对 DMG 而言它只作为安装历史，真实版本始终以目标应用的 `Info.plist` 为准。
 
 服务器最简单的配置方式是保留 `environment` 模式并在服务环境中注入标准变量，例如：
 
@@ -136,7 +136,7 @@ NO_PROXY=localhost,127.0.0.1,.internal.example
 
 systemd 可以把这些值写入 unit 的 `Environment=` 或 `EnvironmentFile=`，Docker 可以使用 `-e HTTP_PROXY=... -e HTTPS_PROXY=... -e NO_PROXY=...`。外部包管理器是否读取这些标准变量仍由该工具自身决定；dvup 会准确注入所选策略，但不会伪装或重试不支持代理的第三方命令。
 
-TUI 使用统一的暗色语义配色、圆角弱边框、选中行底色和滚动条。确认更新、添加命令、确认保存与删除窗口会显示为居中的独立面板，并压暗底层视图；子窗口存在期间，键盘和鼠标输入只交给当前子窗口，不能切换页签、勾选工具、展开 Activity/Jobs、滚动底层内容、切换进程策略或退出程序。普通确认框和单行表单可用 `Esc` 或 `Ctrl+C` 关闭/返回，确认操作仍使用 `Enter`/`y`；TOML 编辑视图中的 `Ctrl+C` 专用于复制，不会关闭窗口或退出 dvup。
+TUI 使用统一的暗色语义配色、圆角弱边框、选中行底色和滚动条。确认更新、添加命令、确认保存与删除窗口会显示为居中的独立面板，并压暗底层视图；子窗口存在期间，键盘和鼠标输入只交给当前子窗口，不能切换标签页、勾选工具、展开 Activity/Jobs、滚动底层内容、切换进程策略或退出程序。普通确认框和单行表单可用 `Esc` 或 `Ctrl+C` 关闭/返回，确认操作仍使用 `Enter`/`y`；TOML 编辑视图中的 `Ctrl+C` 专用于复制，不会关闭窗口或退出 dvup。
 
 在 Tools 页按 `t` 会打开全屏 TOML 编辑视图。使用 `--config` 时编辑该显式文件；否则始终编辑用户数据目录中的全局 `dvup_custom.toml`，不会扫描或创建当前项目配置。目标文件尚不存在时，编辑器会用当前聚焦工具生成一份可通过校验的初始配置，直到按 `Ctrl+S` 才真正创建文件。编辑器使用 Taplo 语法树高亮键名、字符串、数字、布尔值、日期时间、注释和错误标记；即使文件尚未写完或语法无效，也会保留并高亮全部原始内容。编辑器支持方向键、`Home`/`End`、`PgUp`/`PgDn` 移动光标，按住 `Shift` 扩展选区，鼠标点击定位、拖拽选择、滚轮滚动；`Ctrl+A` 全选，`Ctrl+C` 复制原始 TOML 选区，`Ctrl+V` 或终端原生多行粘贴会替换选区。`Ctrl+/` 会对当前行或选区覆盖的所有完整行统一增加或移除 `# `，并保留整行选区；`Ctrl+Z` 撤销，`Ctrl+Y` 或 `Ctrl+Shift+Z` 重做。输入批次、多行粘贴和整块注释各自只占一个撤销步骤，历史最多保留 100 步且总快照约束为 8 MiB。终端把粘贴拆成连续字符事件时，dvup 会合并为批量文本插入，避免逐字符解析和重绘。`Ctrl+S` 会先执行完整 TOML 与 dvup 配置校验，再原样保存注释和排版并刷新工具列表；无效内容不会覆盖磁盘文件。按 `Esc` 关闭编辑视图。
 
@@ -150,7 +150,7 @@ dvup path/to/dvup_custom.toml
 
 直达模式只在启动时检查文件存在且扩展名为 `.toml`，不会要求内容已经是有效配置，因此可以直接打开语法损坏或缺少字段的文件进行修复。只有按 `Ctrl+S` 时才执行完整 dvup 配置校验；校验失败仍不会覆盖原文件。
 
-TUI 默认使用英文，随时按 `L` 可切换为中文，再按一次切回英文。页签、表头、工具与任务状态、帮助栏、表单、确认框、进程策略以及 dvup 在界面内生成的运行摘要都会即时使用当前语言；已经写入 Activity 的历史记录保留产生时的语言，外部工具 stdout/stderr 和持久化 Job 日志始终保持原文，确保诊断内容不被翻译改写。在添加命令、目标版本文本输入框和 TOML 编辑视图中，`l`/`L` 仍作为普通字符输入；退出输入界面后即可继续用 `L` 切换语言。
+TUI 默认使用英文，随时按 `L` 可切换为中文，再按一次切回英文。标签页、表头、工具与任务状态、帮助栏、表单、确认框、进程策略以及 dvup 在界面内生成的运行摘要都会即时使用当前语言；已经写入 Activity 的历史记录保留产生时的语言，外部工具 stdout/stderr 和持久化 Job 日志始终保持原文，确保诊断内容不被翻译改写。在添加命令、目标版本文本输入框和 TOML 编辑视图中，`l`/`L` 仍作为普通字符输入；退出输入界面后即可继续用 `L` 切换语言。
 
 在 TUI 中按 `c`，只需填写名称和命令。例如名称填写 `claude`，命令填写 `claude update`；也可以填写 `npm install -g package@latest`、`pnpm add -g package@latest` 或 `brew upgrade ripgrep`。填写后会先出现预览确认框，并明确提示“只保存，不执行”。保存完成后界面返回 Tools 页面并聚焦新工具；只有之后再次按 `Enter` 并确认更新，命令才会真正执行。
 
