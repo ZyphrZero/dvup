@@ -157,13 +157,7 @@ pub(crate) struct GithubReleaseMonitor {
 
 impl GithubReleaseMonitor {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.name.is_empty()
-            || self.name.trim() != self.name
-            || !self
-                .name
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-        {
+        if !valid_github_release_monitor_name(&self.name) {
             return Err(Error::InvalidConfig(format!(
                 "invalid GitHub release monitor name `{}`",
                 self.name
@@ -268,6 +262,14 @@ impl GithubReleaseMonitor {
         }
         Ok(())
     }
+}
+
+pub(crate) fn valid_github_release_monitor_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
 }
 
 impl GithubMonitorConfig {

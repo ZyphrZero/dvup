@@ -9,7 +9,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{GithubReleaseMonitor, ReleaseAssetFormat, ReleaseUpdatePolicy},
+    config::{
+        GithubReleaseMonitor, ReleaseAssetFormat, ReleaseUpdatePolicy,
+        valid_github_release_monitor_name,
+    },
     credential,
     error::{Error, Result},
     settings::{AiSettings, NetworkSettings, ProxyMode},
@@ -256,11 +259,18 @@ pub(crate) fn list_models(settings: &AiSettings, network: &NetworkSettings) -> R
 }
 
 fn validate_generated_monitor(
-    monitor: GithubReleaseMonitor,
+    mut monitor: GithubReleaseMonitor,
     repository: &str,
     context: &SystemContext,
     assets: &[String],
 ) -> Result<GithubReleaseMonitor> {
+    if !valid_github_release_monitor_name(&monitor.name) {
+        monitor.name = repository
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(repository)
+            .to_owned();
+    }
     monitor.validate()?;
     if monitor.repository != *repository {
         return Err(Error::Message(format!(
@@ -847,6 +857,15 @@ mod tests {
         assert!(
             validate_generated_monitor(monitor.clone(), "owner/example", &context, &assets).is_ok()
         );
+
+        for generated_name in ["owner/example", "Example CLI", "示例工具"] {
+            let mut invalid_name = monitor.clone();
+            invalid_name.name = generated_name.to_owned();
+            let normalized =
+                validate_generated_monitor(invalid_name, "owner/example", &context, &assets)
+                    .expect("invalid generated names are normalized");
+            assert_eq!(normalized.name, "example");
+        }
 
         let mut outside = monitor.clone();
         outside.target_directory = if cfg!(windows) {
