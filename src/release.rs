@@ -132,6 +132,10 @@ pub(crate) fn run_selected_monitors(
     let agent = version::network_agent(network)?;
     let api_key = credential::github_api_key(github.encrypted_api_key.as_deref())?;
     let mut state = load_state(state_path)?;
+    let installer_root = state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("github-installers");
     let mut changed = false;
     let outcomes = monitors
         .iter()
@@ -142,6 +146,7 @@ pub(crate) fn run_selected_monitors(
                 api_key.as_ref().map(|key| key.as_str()),
                 &agent,
                 &state,
+                &installer_root,
             ) {
                 Ok(MonitorOutcome::Updated { name, tag, asset }) => {
                     state.releases.insert(name.clone(), tag.clone());
@@ -167,6 +172,7 @@ fn update_monitor(
     api_key: Option<&str>,
     agent: &ureq::Agent,
     state: &ReleaseState,
+    installer_root: &Path,
 ) -> Result<MonitorOutcome> {
     let release = resolve_latest_asset(monitor, api_key, agent)?;
     if state.releases.get(&monitor.name) == Some(&release.tag) {
@@ -176,7 +182,7 @@ fn update_monitor(
         });
     }
 
-    install_asset(monitor, api_key, agent, &release.asset)?;
+    install_asset(monitor, api_key, agent, &release.asset, installer_root)?;
 
     Ok(MonitorOutcome::Updated {
         name: monitor.name.clone(),
@@ -241,6 +247,7 @@ fn install_asset(
     api_key: Option<&str>,
     agent: &ureq::Agent,
     asset: &GithubAsset,
+    installer_root: &Path,
 ) -> Result<()> {
     if monitor.format != ReleaseAssetFormat::Dmg {
         fs::create_dir_all(&monitor.target_directory)?;
@@ -276,6 +283,13 @@ fn install_asset(
     }
     downloaded.flush()?;
     downloaded.as_file().sync_all()?;
+    apply_installer_retention(
+        downloaded.path(),
+        installer_root,
+        &monitor.name,
+        &asset.name,
+        monitor.cleanup_installer,
+    )?;
 
     match monitor.format {
         ReleaseAssetFormat::File => {
@@ -322,6 +336,55 @@ fn install_asset(
         }
     }
 
+    Ok(())
+}
+
+fn apply_installer_retention(
+    downloaded: &Path,
+    cache_root: &Path,
+    monitor_name: &str,
+    asset_name: &str,
+    cleanup: bool,
+) -> Result<()> {
+    let monitor_cache = cache_root.join(monitor_name);
+    if cleanup {
+        match fs::symlink_metadata(&monitor_cache) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(&monitor_cache)?;
+            }
+            Ok(_) => fs::remove_file(&monitor_cache)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(&monitor_cache)?;
+    let target = monitor_cache.join(asset_name);
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".installer-")
+        .suffix(".tmp")
+        .tempfile_in(&monitor_cache)?;
+    io::copy(&mut File::open(downloaded)?, &mut temporary)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            return Err(Error::Message(format!(
+                "installer cache target is a directory: {}",
+                target.display()
+            )));
+        }
+        Ok(_) => fs::remove_file(&target)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    temporary.persist(&target).map_err(|error| {
+        Error::Message(format!(
+            "failed to retain installer {}: {error}",
+            target.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -921,6 +984,40 @@ mod tests {
     }
 
     #[test]
+    fn installer_cache_can_retain_an_asset_and_cleanup_the_monitor_cache() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let downloaded = temporary.path().join("downloaded.dmg");
+        fs::write(&downloaded, b"installer bytes").expect("downloaded installer");
+        let cache_root = temporary.path().join("github-installers");
+
+        apply_installer_retention(
+            &downloaded,
+            &cache_root,
+            "reqable-macos-arm64",
+            "reqable-app-macos-arm64.dmg",
+            false,
+        )
+        .expect("retain installer");
+        let retained = cache_root
+            .join("reqable-macos-arm64")
+            .join("reqable-app-macos-arm64.dmg");
+        assert_eq!(
+            fs::read(&retained).expect("retained asset"),
+            b"installer bytes"
+        );
+
+        apply_installer_retention(
+            &downloaded,
+            &cache_root,
+            "reqable-macos-arm64",
+            "next-release.dmg",
+            true,
+        )
+        .expect("cleanup installers");
+        assert!(!cache_root.join("reqable-macos-arm64").exists());
+    }
+
+    #[test]
     fn disabled_monitor_probe_reads_installed_tag_without_network_access() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state_path = temporary.path().join("github-releases.json");
@@ -940,6 +1037,7 @@ mod tests {
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
             update_policy: crate::config::ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: 1024,
             max_extracted_bytes: 2048,
             max_extracted_files: 10,

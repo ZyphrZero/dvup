@@ -92,6 +92,7 @@ asset_regex = '^reqable-app-macos-arm64\.dmg$'
 target_directory = "/Applications/Reqable.app"
 format = "dmg"
 update_policy = "automatic"
+cleanup_installer = true
 max_download_bytes = 104857600
 max_extracted_bytes = 536870912
 max_extracted_files = 20000
@@ -123,7 +124,7 @@ strip_components = 0
 enabled = true
 ```
 
-`format` 只能是 `file`、`zip`、`tar_gz` 或 macOS 专用的 `dmg`，不会在格式错误时猜测或尝试另一种处理方式。每个监控项必须明确限制下载字节数；ZIP、TAR.GZ 和 DMG 还必须限制展开总字节数和文件数。普通 `file` 的两个展开上限必须为 `0`。ZIP/TAR.GZ 会先下载和解压到目标目录同一文件系统中的临时目录，校验路径不能越界，拒绝 TAR 符号链接等非普通条目，再替换完整目标目录；失败时保留原目录。DMG 目标必须是绝对 `.app` 路径：dvup 使用 `hdiutil` 只读挂载镜像，只接受唯一的顶层 `.app`，检查展开上限，使用 `ditto` 保留应用包元数据，通过 `codesign --verify --deep --strict` 后卸载镜像，最后在同一文件系统中原子替换旧应用；任何前置步骤失败都不会修改现有应用。普通 `file` 会保存为 Release asset 的原始文件名。成功安装的 tag 单独记录在状态目录的 `github-releases.json`，其中不包含 API Key。
+`cleanup_installer` 默认为 `true`：安装前清理该监控以前保留的安装包，本次临时下载也会在安装结束后自动删除。设为 `false` 时，原始 Release asset 会保留在状态目录的 `github-installers/<监控名>/<资产名>`，可用于离线重装。`format` 只能是 `file`、`zip`、`tar_gz` 或 macOS 专用的 `dmg`，不会在格式错误时猜测或尝试另一种处理方式。每个监控项必须明确限制下载字节数；ZIP、TAR.GZ 和 DMG 还必须限制展开总字节数和文件数。普通 `file` 的两个展开上限必须为 `0`。ZIP/TAR.GZ 会先下载和解压到目标目录同一文件系统中的临时目录，校验路径不能越界，拒绝 TAR 符号链接等非普通条目，再替换完整目标目录；失败时保留原目录。DMG 目标必须是绝对 `.app` 路径：dvup 使用 `hdiutil` 只读挂载镜像，只接受唯一的顶层 `.app`，检查展开上限，使用 `ditto` 保留应用包元数据，通过 `codesign --verify --deep --strict` 后卸载镜像，最后在同一文件系统中原子替换旧应用；任何前置步骤失败都不会修改现有应用。普通 `file` 会保存为 Release asset 的原始文件名。成功安装的 tag 单独记录在状态目录的 `github-releases.json`，其中不包含 API Key。
 
 服务器最简单的配置方式是保留 `environment` 模式并在服务环境中注入标准变量，例如：
 

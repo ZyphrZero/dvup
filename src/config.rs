@@ -127,6 +127,14 @@ fn is_manual_release_update_policy(value: &ReleaseUpdatePolicy) -> bool {
     *value == ReleaseUpdatePolicy::Manual
 }
 
+fn enabled_by_default() -> bool {
+    true
+}
+
+fn is_enabled(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GithubReleaseMonitor {
@@ -137,6 +145,8 @@ pub(crate) struct GithubReleaseMonitor {
     pub(crate) format: ReleaseAssetFormat,
     #[serde(default, skip_serializing_if = "is_manual_release_update_policy")]
     pub(crate) update_policy: ReleaseUpdatePolicy,
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
+    pub(crate) cleanup_installer: bool,
     pub(crate) max_download_bytes: u64,
     pub(crate) max_extracted_bytes: u64,
     pub(crate) max_extracted_files: usize,
@@ -1395,6 +1405,40 @@ enabled = true
     }
 
     #[test]
+    fn github_installer_cleanup_is_enabled_by_default_and_can_be_disabled() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let target = toml::Value::String(temporary.path().join("example").display().to_string());
+        let input = format!(
+            r#"[[github.monitors]]
+name = "example"
+repository = "owner/repository"
+asset_regex = '^example\.zip$'
+target_directory = {target}
+format = "zip"
+max_download_bytes = 1024
+max_extracted_bytes = 2048
+max_extracted_files = 10
+enabled = true
+"#
+        );
+
+        let cleanup = UserConfig::parse(&input).expect("cleanup by default");
+        assert!(cleanup.github.monitors[0].cleanup_installer);
+        assert!(
+            !toml::to_string(&cleanup)
+                .expect("serialize cleanup default")
+                .contains("cleanup_installer")
+        );
+
+        let retained = UserConfig::parse(&input.replace(
+            "enabled = true",
+            "cleanup_installer = false\nenabled = true",
+        ))
+        .expect("retain installer");
+        assert!(!retained.github.monitors[0].cleanup_installer);
+    }
+
+    #[test]
     fn user_manifest_rejects_legacy_github_asset_pattern() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let target = toml::Value::String(temporary.path().join("example").display().to_string());
@@ -1427,6 +1471,7 @@ enabled = true
             target_directory: temporary.path().join("tool"),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: 100 * 1024 * 1024,
             max_extracted_bytes: 300 * 1024 * 1024,
             max_extracted_files: 1_000,
@@ -1461,6 +1506,7 @@ enabled = true
             target_directory: temporary.path().join("Reqable.app"),
             format: ReleaseAssetFormat::Dmg,
             update_policy: ReleaseUpdatePolicy::Automatic,
+            cleanup_installer: true,
             max_download_bytes: 100 * 1024 * 1024,
             max_extracted_bytes: 500 * 1024 * 1024,
             max_extracted_files: 20_000,
@@ -1491,6 +1537,7 @@ enabled = true
             target_directory: temporary.path().join("Example.app"),
             format: ReleaseAssetFormat::Dmg,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: 1024,
             max_extracted_bytes: 2048,
             max_extracted_files: 10,

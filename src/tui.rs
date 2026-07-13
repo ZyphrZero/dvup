@@ -61,7 +61,7 @@ const GITHUB_RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT_TUI_PROBES: usize = 2;
 const MOUSE_WHEEL_ROWS: isize = 1;
 const SETTINGS_ROW_COUNT: usize = 8;
-const GITHUB_MONITOR_FORM_FIELD_COUNT: usize = 11;
+const GITHUB_MONITOR_FORM_FIELD_COUNT: usize = 12;
 const DEFAULT_MONITOR_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MONITOR_MAX_EXTRACTED_BYTES: u64 = 2_048 * 1024 * 1024;
 const DEFAULT_MONITOR_MAX_EXTRACTED_FILES: usize = 10_000;
@@ -1584,6 +1584,7 @@ enum Modal {
         target_directory: TextInput,
         format: ReleaseAssetFormat,
         update_policy: ReleaseUpdatePolicy,
+        cleanup_installer: bool,
         max_download_bytes: TextInput,
         max_extracted_bytes: TextInput,
         max_extracted_files: TextInput,
@@ -2556,6 +2557,7 @@ impl App {
                 .map(|value| value.format)
                 .unwrap_or(ReleaseAssetFormat::Zip),
             update_policy: monitor.map(|value| value.update_policy).unwrap_or_default(),
+            cleanup_installer: monitor.map(|value| value.cleanup_installer).unwrap_or(true),
             max_download_bytes: TextInput::new(
                 monitor
                     .map(|value| value.max_download_bytes.to_string())
@@ -4162,6 +4164,7 @@ fn github_monitor_from_form(
     target_directory: &TextInput,
     format: ReleaseAssetFormat,
     update_policy: ReleaseUpdatePolicy,
+    cleanup_installer: bool,
     max_download_bytes: &TextInput,
     max_extracted_bytes: &TextInput,
     max_extracted_files: &TextInput,
@@ -4175,6 +4178,7 @@ fn github_monitor_from_form(
         target_directory: PathBuf::from(target_directory.value.trim()),
         format,
         update_policy,
+        cleanup_installer,
         max_download_bytes: parse_u64_input(max_download_bytes, "max download size")?,
         max_extracted_bytes: parse_u64_input(max_extracted_bytes, "max extracted size")?,
         max_extracted_files: parse_usize_input(max_extracted_files, "max extracted files")?,
@@ -4617,6 +4621,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             mut target_directory,
             mut format,
             mut update_policy,
+            mut cleanup_installer,
             mut max_download_bytes,
             mut max_extracted_bytes,
             mut max_extracted_files,
@@ -4645,7 +4650,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if field == 5 => {
                     update_policy = next_release_update_policy(update_policy);
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if field == 10 => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if field == 6 => {
+                    cleanup_installer = !cleanup_installer;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if field == 11 => {
                     enabled = !enabled;
                 }
                 _ if !save => {
@@ -4654,10 +4662,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         1 => Some(&mut repository),
                         2 => Some(&mut asset_regex),
                         3 => Some(&mut target_directory),
-                        6 => Some(&mut max_download_bytes),
-                        7 => Some(&mut max_extracted_bytes),
-                        8 => Some(&mut max_extracted_files),
-                        9 => Some(&mut strip_components),
+                        7 => Some(&mut max_download_bytes),
+                        8 => Some(&mut max_extracted_bytes),
+                        9 => Some(&mut max_extracted_files),
+                        10 => Some(&mut strip_components),
                         _ => None,
                     };
                     if let Some(input) = input {
@@ -4674,6 +4682,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     &target_directory,
                     format,
                     update_policy,
+                    cleanup_installer,
                     &max_download_bytes,
                     &max_extracted_bytes,
                     &max_extracted_files,
@@ -4721,6 +4730,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 target_directory,
                 format,
                 update_policy,
+                cleanup_installer,
                 max_download_bytes,
                 max_extracted_bytes,
                 max_extracted_files,
@@ -5215,10 +5225,10 @@ fn handle_paste(app: &mut App, text: &str) {
                 1 => Some(repository),
                 2 => Some(asset_regex),
                 3 => Some(target_directory),
-                6 => Some(max_download_bytes),
-                7 => Some(max_extracted_bytes),
-                8 => Some(max_extracted_files),
-                9 => Some(strip_components),
+                7 => Some(max_download_bytes),
+                8 => Some(max_extracted_bytes),
+                9 => Some(max_extracted_files),
+                10 => Some(strip_components),
                 _ => None,
             };
             let Some(input) = input else {
@@ -6050,6 +6060,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 field,
                 format,
                 update_policy,
+                cleanup_installer,
                 enabled,
                 ..
             } = &mut app.modal
@@ -6065,7 +6076,12 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     app.modal_drag = None;
                     return;
                 }
-                if hitbox.field == 10 {
+                if hitbox.field == 6 {
+                    *cleanup_installer = !*cleanup_installer;
+                    app.modal_drag = None;
+                    return;
+                }
+                if hitbox.field == 11 {
                     *enabled = !*enabled;
                     app.modal_drag = None;
                     return;
@@ -6109,10 +6125,10 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     1 => repository,
                     2 => asset_regex,
                     3 => target_directory,
-                    6 => max_download_bytes,
-                    7 => max_extracted_bytes,
-                    8 => max_extracted_files,
-                    9 => strip_components,
+                    7 => max_download_bytes,
+                    8 => max_extracted_bytes,
+                    9 => max_extracted_files,
+                    10 => strip_components,
                     _ => return,
                 };
                 input.cursor = target;
@@ -6182,10 +6198,10 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     1 => repository,
                     2 => asset_regex,
                     3 => target_directory,
-                    6 => max_download_bytes,
-                    7 => max_extracted_bytes,
-                    8 => max_extracted_files,
-                    9 => strip_components,
+                    7 => max_download_bytes,
+                    8 => max_extracted_bytes,
+                    9 => max_extracted_files,
+                    10 => strip_components,
                     _ => return,
                 };
                 input.cursor = target;
@@ -6325,10 +6341,10 @@ fn modal_cursor_at(app: &App, hitbox: ModalInputHitbox, column: u16) -> Option<u
             1 => repository,
             2 => asset_regex,
             3 => target_directory,
-            6 => max_download_bytes,
-            7 => max_extracted_bytes,
-            8 => max_extracted_files,
-            9 => strip_components,
+            7 => max_download_bytes,
+            8 => max_extracted_bytes,
+            9 => max_extracted_files,
+            10 => strip_components,
             _ => return None,
         },
         Modal::GithubPollInterval { seconds } => seconds,
@@ -8524,6 +8540,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             target_directory,
             format,
             update_policy,
+            cleanup_installer,
             max_download_bytes,
             max_extracted_bytes,
             max_extracted_files,
@@ -8552,6 +8569,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.language.text("Target directory", "目标目录"),
                 app.language.text("Format", "格式"),
                 app.language.text("Update policy", "更新策略"),
+                app.language.text("Clean installer", "清理安装包"),
                 app.language.text("Max download bytes", "最大下载字节数"),
                 app.language.text("Max extracted bytes", "最大解压字节数"),
                 app.language.text("Max extracted files", "最大文件数"),
@@ -8622,37 +8640,45 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     labels[5],
                     release_update_policy_label(*update_policy, app.language),
                 ),
-                modal_input_line(
+                selector(
                     *field == 6,
                     labels[6],
+                    app.language.text(
+                        if *cleanup_installer { "enabled" } else { "keep" },
+                        if *cleanup_installer { "自动清理" } else { "保留" },
+                    ),
+                ),
+                modal_input_line(
+                    *field == 7,
+                    labels[7],
                     max_download_bytes,
                     "536870912",
                     value_width,
                 ),
                 modal_input_line(
-                    *field == 7,
-                    labels[7],
+                    *field == 8,
+                    labels[8],
                     max_extracted_bytes,
                     "2147483648 (file: 0)",
                     value_width,
                 ),
                 modal_input_line(
-                    *field == 8,
-                    labels[8],
+                    *field == 9,
+                    labels[9],
                     max_extracted_files,
                     "10000 (file: 0)",
                     value_width,
                 ),
                 modal_input_line(
-                    *field == 9,
-                    labels[9],
+                    *field == 10,
+                    labels[10],
                     strip_components,
                     "0",
                     value_width,
                 ),
                 selector(
-                    *field == 10,
-                    labels[10],
+                    *field == 11,
+                    labels[11],
                     app.language.text(
                         if *enabled { "enabled" } else { "disabled" },
                         if *enabled { "已启用" } else { "已停用" },
@@ -8682,10 +8708,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 (1, labels[1], repository, 3),
                 (2, labels[2], asset_regex, 4),
                 (3, labels[3], target_directory, 5),
-                (6, labels[6], max_download_bytes, 8),
-                (7, labels[7], max_extracted_bytes, 9),
-                (8, labels[8], max_extracted_files, 10),
-                (9, labels[9], strip_components, 11),
+                (7, labels[7], max_download_bytes, 9),
+                (8, labels[8], max_extracted_bytes, 10),
+                (9, labels[9], max_extracted_files, 11),
+                (10, labels[10], strip_components, 12),
             ];
             for (input_field, label, input, row) in input_fields {
                 if inner.height <= row {
@@ -8724,7 +8750,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
             }
-            for (selector_field, row) in [(4, 6), (5, 7), (10, 12)] {
+            for (selector_field, row) in [(4, 6), (5, 7), (6, 8), (11, 13)] {
                 if inner.height > row {
                     app.modal_input_hitboxes.push(ModalInputHitbox {
                         area: Rect::new(inner.x, inner.y.saturating_add(row), inner.width, 1),
@@ -13673,6 +13699,7 @@ mod tests {
             &TextInput::new(temporary.path().join("example").display().to_string()),
             ReleaseAssetFormat::Zip,
             ReleaseUpdatePolicy::Automatic,
+            true,
             &TextInput::new("104857601".to_owned()),
             &TextInput::new("314572803".to_owned()),
             &TextInput::new("1001".to_owned()),
@@ -13713,6 +13740,7 @@ mod tests {
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: false,
             max_download_bytes: 1024,
             max_extracted_bytes: 2048,
             max_extracted_files: 10,
@@ -13779,6 +13807,7 @@ mod tests {
             target_directory: temporary.path().join(name),
             format: ReleaseAssetFormat::Zip,
             update_policy,
+            cleanup_installer: true,
             max_download_bytes: 1024,
             max_extracted_bytes: 2048,
             max_extracted_files: 10,
@@ -13836,6 +13865,7 @@ mod tests {
             ),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Automatic,
+            cleanup_installer: false,
             max_download_bytes: TextInput::new("104857601".to_owned()),
             max_extracted_bytes: TextInput::new("314572803".to_owned()),
             max_extracted_files: TextInput::new("1001".to_owned()),
@@ -13855,6 +13885,7 @@ mod tests {
         assert_eq!(monitor.max_download_bytes, 104_857_601);
         assert_eq!(monitor.max_extracted_bytes, 314_572_803);
         assert_eq!(monitor.update_policy, ReleaseUpdatePolicy::Automatic);
+        assert!(!monitor.cleanup_installer);
         assert!(monitor.enabled);
     }
 
@@ -13873,6 +13904,7 @@ mod tests {
             target_directory: TextInput::new("relative/path".to_owned()),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: TextInput::new("104857600".to_owned()),
             max_extracted_bytes: TextInput::new("314572800".to_owned()),
             max_extracted_files: TextInput::new("1000".to_owned()),
@@ -13910,6 +13942,7 @@ mod tests {
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
@@ -13959,6 +13992,7 @@ mod tests {
             target_directory: temporary.path().join("existing"),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
@@ -13982,6 +14016,7 @@ mod tests {
                 target_directory: temporary.path().join("second"),
                 format: ReleaseAssetFormat::Zip,
                 update_policy: ReleaseUpdatePolicy::Manual,
+                cleanup_installer: true,
                 max_download_bytes: 100,
                 max_extracted_bytes: 200,
                 max_extracted_files: 10,
@@ -14012,6 +14047,7 @@ mod tests {
             target_directory: temporary.path().join("explicit"),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
@@ -14051,6 +14087,7 @@ mod tests {
             target_directory: temporary.path().join("installed"),
             format: ReleaseAssetFormat::Zip,
             update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
             max_download_bytes: 100,
             max_extracted_bytes: 200,
             max_extracted_files: 10,
