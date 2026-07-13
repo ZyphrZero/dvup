@@ -25,7 +25,6 @@ const MAX_GITHUB_RELEASE_BYTES: u64 = 1024 * 1024;
 const MAX_GENERATED_NAME_BYTES: usize = 128;
 const MAX_GENERATED_COMMAND_BYTES: usize = 4 * 1024;
 const MAX_GENERATED_FIELD_BYTES: usize = 4 * 1024;
-const MACOS_APPLICATIONS_DIRECTORY: &str = "/Applications";
 const USER_AGENT: &str = concat!("dvup/", env!("CARGO_PKG_VERSION"));
 const PACKAGE_MANAGERS: &[&str] = &[
     "brew", "scoop", "winget", "apt", "dnf", "pacman", "npm", "pnpm", "bun", "cargo", "pipx", "uv",
@@ -301,7 +300,7 @@ fn validate_generated_monitor(
         .components()
         .any(|component| component == Component::ParentDir);
     if monitor.format == ReleaseAssetFormat::Dmg {
-        if monitor.target_directory.parent() != Some(Path::new(MACOS_APPLICATIONS_DIRECTORY))
+        if monitor.target_directory.parent() != Some(macos_applications_directory())
             || contains_parent_traversal
         {
             return Err(Error::Message(
@@ -374,7 +373,11 @@ fn normalize_generated_target_directory(monitor: &mut GithubReleaseMonitor) {
     }) else {
         return;
     };
-    monitor.target_directory = Path::new(MACOS_APPLICATIONS_DIRECTORY).join(bundle_name);
+    monitor.target_directory = macos_applications_directory().join(bundle_name);
+}
+
+fn macos_applications_directory() -> &'static Path {
+    Path::new("/Applications")
 }
 
 fn asset_matches_system(asset: &str, os: &str, arch: &str) -> bool {
