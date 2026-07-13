@@ -15,6 +15,7 @@ use crate::{
     },
     credential,
     error::{Error, Result},
+    generation::{self, GenerationEvidence, GenerationRequest},
     settings::{AiSettings, NetworkSettings, ProxyMode},
 };
 
@@ -171,7 +172,8 @@ pub(crate) fn generate_command(
     settings: &AiSettings,
     network: &NetworkSettings,
     context: &SystemContext,
-    name_hint: &str,
+    request: &GenerationRequest,
+    evidence: &GenerationEvidence,
     configuration_hint: &str,
 ) -> Result<GeneratedCommand> {
     if !settings.configured() {
@@ -191,14 +193,30 @@ pub(crate) fn generate_command(
         "retries (non-negative integer), retry_delay_secs (non-negative integer), platforms (array ",
         "containing only windows, macos, or linux), and resource_group (null or string). The update ",
         "array must be one direct executable invocation, never a shell pipeline, redirection, sudo, ",
-        "or an installer download script. The probe must print the installed version. Prefer an ",
-        "available package manager and supply latest/update_version when the ecosystem supports ",
-        "them. Do not include markdown or extra properties."
+        "or an installer download script. The probe must print the installed version. Use only the ",
+        "supplied authoritative evidence; ",
+        "never invent or replace a provider, package, repository, version, platform, or update ",
+        "command. The locked update, update_version, latest, name, and platforms values must be ",
+        "copied exactly. Do not include markdown or extra properties."
     );
+    request.validate()?;
+    let locked_update = request
+        .update_provider
+        .update_command(&request.update_package);
+    let locked_update_version = request
+        .update_provider
+        .update_version_command(&request.update_package);
     let user = format!(
-        "Generate or improve this custom tool.\n{}\nname_hint={}\nconfiguration_hint={}",
+        concat!(
+            "Generate this custom tool using only the locked request and evidence.\n{}\n",
+            "locked_request={}\nlocked_update={}\nlocked_update_version={}\n",
+            "authoritative_evidence={}\neditable_configuration_hint={}"
+        ),
         context.prompt(),
-        name_hint.trim(),
+        serde_json::to_string(request)?,
+        serde_json::to_string(&locked_update)?,
+        serde_json::to_string(&locked_update_version)?,
+        serde_json::to_string(evidence)?,
         configuration_hint.trim(),
     );
     let generated = chat_json::<GeneratedCommand>(settings, network, system, &user)?;
@@ -220,7 +238,12 @@ pub(crate) fn generate_command(
                 .to_owned(),
         ));
     }
-    generated.tool.validate_for_name(&generated.name)?;
+    generation::validate_generated_against_evidence(
+        request,
+        evidence,
+        &generated.name,
+        &generated.tool,
+    )?;
     Ok(generated)
 }
 
@@ -507,8 +530,7 @@ fn chat_json<T: for<'de> Deserialize<'de>>(
     user: &str,
 ) -> Result<T> {
     let text = chat_text(settings, network, system, user)?;
-    let json = extract_json_object(&text)?;
-    serde_json::from_str(json)
+    serde_json::from_str(&text)
         .map_err(|error| Error::Message(format!("AI configuration is invalid: {error}")))
 }
 
@@ -601,21 +623,6 @@ fn response_content_text(content: &serde_json::Value) -> Result<String> {
         ));
     }
     Ok(text)
-}
-
-fn extract_json_object(text: &str) -> Result<&str> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| Error::Message("AI response did not contain a JSON object".to_owned()))?;
-    let end = text
-        .rfind('}')
-        .ok_or_else(|| Error::Message("AI response did not contain a JSON object".to_owned()))?;
-    if start > end {
-        return Err(Error::Message(
-            "AI response did not contain a JSON object".to_owned(),
-        ));
-    }
-    Ok(&text[start..=end])
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -734,7 +741,12 @@ fn program_on_path(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LatestVersionSource, ReleaseUpdatePolicy, ToolBackground};
+    use crate::{
+        config::{LatestVersionSource, ReleaseUpdatePolicy, ToolBackground},
+        generation::{
+            EvidenceProvider, GenerationEvidence, GenerationRequest, SourceEvidence, UpdateProvider,
+        },
+    };
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
@@ -744,11 +756,16 @@ mod tests {
     fn spawn_chat_server(
         response_content: &str,
         expected_authorization: Option<&str>,
+        expected_user_fragments: &[&str],
     ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
         let address = listener.local_addr().expect("listener address");
         let response_content = response_content.to_owned();
         let expected_authorization = expected_authorization.map(str::to_owned);
+        let expected_user_fragments = expected_user_fragments
+            .iter()
+            .map(|fragment| (*fragment).to_owned())
+            .collect::<Vec<_>>();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("AI request");
             let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -783,6 +800,15 @@ mod tests {
             assert_eq!(body["model"], "test-model");
             assert_eq!(body["messages"][0]["role"], "system");
             assert_eq!(body["messages"][1]["role"], "user");
+            let user_message = body["messages"][1]["content"]
+                .as_str()
+                .expect("user message content");
+            for fragment in expected_user_fragments {
+                assert!(
+                    user_message.contains(&fragment),
+                    "user message must contain `{fragment}`: {user_message}"
+                );
+            }
 
             let response = serde_json::json!({
                 "choices": [{
@@ -801,6 +827,35 @@ mod tests {
             .expect("AI response");
         });
         (address, server)
+    }
+
+    fn command_generation_request() -> GenerationRequest {
+        GenerationRequest {
+            name: "ripgrep".to_owned(),
+            instructions: "Fail if rg is running".to_owned(),
+            update_provider: UpdateProvider::Cargo,
+            update_package: "ripgrep".to_owned(),
+            latest: LatestVersionSource::GithubRelease {
+                repository: "BurntSushi/ripgrep".to_owned(),
+            },
+            platforms: vec!["macos".to_owned()],
+        }
+    }
+
+    fn command_generation_evidence() -> GenerationEvidence {
+        GenerationEvidence {
+            collected_at_unix_secs: 1_700_000_000,
+            update: SourceEvidence {
+                provider: EvidenceProvider::CratesIo,
+                identifier: "ripgrep".to_owned(),
+                latest_version: "14.1.1".to_owned(),
+            },
+            latest: SourceEvidence {
+                provider: EvidenceProvider::GithubRelease,
+                identifier: "BurntSushi/ripgrep".to_owned(),
+                latest_version: "14.1.1".to_owned(),
+            },
+        }
     }
 
     fn spawn_models_server(
@@ -894,18 +949,6 @@ mod tests {
 
         assert_eq!(models, vec!["gpt-4.1", "gpt-4.1-mini"]);
         server.join().expect("test server");
-    }
-
-    #[test]
-    fn extracts_json_from_plain_or_fenced_responses() {
-        assert_eq!(
-            extract_json_object(r#"{"name":"tool"}"#).unwrap(),
-            r#"{"name":"tool"}"#
-        );
-        assert_eq!(
-            extract_json_object("```json\n{\"name\":\"tool\"}\n```").unwrap(),
-            r#"{"name":"tool"}"#
-        );
     }
 
     #[test]
@@ -1057,7 +1100,7 @@ mod tests {
             r#"{
                 "name":"ripgrep",
                 "tool": {
-                    "update":["brew","upgrade","ripgrep"],
+                    "update":["cargo","install","ripgrep"],
                     "probe":["rg","--version"],
                     "latest":{"provider":"github_release","repository":"BurntSushi/ripgrep"},
                     "update_version":["cargo","install","ripgrep","--version","{version}"],
@@ -1068,10 +1111,15 @@ mod tests {
                     "retries":3,
                     "retry_delay_secs":2,
                     "platforms":["macos"],
-                    "resource_group":"homebrew"
+                    "resource_group":null
                 }
             }"#,
             None,
+            &[
+                "Fail if rg is running",
+                r#"locked_update=["cargo","install","ripgrep"]"#,
+                r#""latest_version":"14.1.1""#,
+            ],
         );
         let settings = AiSettings {
             enabled: true,
@@ -1087,15 +1135,22 @@ mod tests {
         let context = SystemContext {
             os: "macos",
             arch: "aarch64",
-            available_package_managers: vec!["brew"],
+            available_package_managers: vec!["cargo"],
             install_root: "/tmp/dvup/installs".to_owned(),
         };
 
-        let generated =
-            generate_command(&settings, &network, &context, "ripgrep", "").expect("generated");
+        let generated = generate_command(
+            &settings,
+            &network,
+            &context,
+            &command_generation_request(),
+            &command_generation_evidence(),
+            "",
+        )
+        .expect("generated");
 
         assert_eq!(generated.name, "ripgrep");
-        assert_eq!(generated.tool.update, ["brew", "upgrade", "ripgrep"]);
+        assert_eq!(generated.tool.update, ["cargo", "install", "ripgrep"]);
         assert_eq!(generated.tool.probe, ["rg", "--version"]);
         assert!(matches!(
             generated.tool.latest,
@@ -1131,7 +1186,7 @@ mod tests {
         assert_eq!(generated.tool.retries, 3);
         assert_eq!(generated.tool.retry_delay_secs, 2);
         assert_eq!(generated.tool.platforms, ["macos"]);
-        assert_eq!(generated.tool.resource_group.as_deref(), Some("homebrew"));
+        assert_eq!(generated.tool.resource_group, None);
         server.join().expect("test server");
     }
 
@@ -1146,6 +1201,7 @@ mod tests {
                 }
             }"#,
             None,
+            &[],
         );
         let settings = AiSettings {
             enabled: true,
@@ -1165,8 +1221,15 @@ mod tests {
             install_root: "/tmp/dvup/installs".to_owned(),
         };
 
-        let error = generate_command(&settings, &network, &context, "ripgrep", "")
-            .expect_err("incomplete AI tool configuration must be rejected");
+        let error = generate_command(
+            &settings,
+            &network,
+            &context,
+            &command_generation_request(),
+            &command_generation_evidence(),
+            "",
+        )
+        .expect_err("incomplete AI tool configuration must be rejected");
 
         assert!(
             error.to_string().contains("missing field"),
@@ -1176,9 +1239,66 @@ mod tests {
     }
 
     #[test]
+    fn generated_command_rejects_markdown_wrapped_json() {
+        let (address, server) = spawn_chat_server(
+            r#"```json
+            {
+                "name":"ripgrep",
+                "tool": {
+                    "update":["cargo","install","ripgrep"],
+                    "probe":["rg","--version"],
+                    "latest":{"provider":"github_release","repository":"BurntSushi/ripgrep"},
+                    "update_version":["cargo","install","ripgrep","--version","{version}"],
+                    "background":"always",
+                    "wait_for":["rg"],
+                    "processes":[],
+                    "lock_timeout_secs":45,
+                    "retries":3,
+                    "retry_delay_secs":2,
+                    "platforms":["macos"],
+                    "resource_group":null
+                }
+            }
+            ```"#,
+            None,
+            &[],
+        );
+        let settings = AiSettings {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            model: Some("test-model".to_owned()),
+            encrypted_api_key: None,
+        };
+        let network = NetworkSettings {
+            proxy_mode: ProxyMode::Direct,
+            proxy_url: None,
+            no_proxy: Vec::new(),
+        };
+        let context = SystemContext {
+            os: "macos",
+            arch: "aarch64",
+            available_package_managers: vec!["cargo"],
+            install_root: "/tmp/dvup/installs".to_owned(),
+        };
+
+        let error = generate_command(
+            &settings,
+            &network,
+            &context,
+            &command_generation_request(),
+            &command_generation_evidence(),
+            "",
+        )
+        .expect_err("Markdown-wrapped JSON must be rejected");
+
+        assert!(error.to_string().contains("AI configuration is invalid"));
+        server.join().expect("test server");
+    }
+
+    #[test]
     fn connection_test_checks_the_model_and_encrypted_api_key() {
         let token = "sk-connection-test";
-        let (address, server) = spawn_chat_server("OK", Some("Bearer sk-connection-test"));
+        let (address, server) = spawn_chat_server("OK", Some("Bearer sk-connection-test"), &[]);
         let settings = AiSettings {
             enabled: true,
             base_url: Some(format!("http://{address}/v1")),

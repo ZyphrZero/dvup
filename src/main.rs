@@ -7,6 +7,7 @@ mod datetime;
 mod detach;
 mod doctor;
 mod error;
+mod generation;
 mod job;
 mod process;
 mod release;

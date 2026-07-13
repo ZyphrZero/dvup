@@ -6,7 +6,7 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(not(test))]
@@ -44,6 +44,10 @@ use crate::{
     },
     credential, datetime, detach, doctor,
     error::{Error, Result},
+    generation::{
+        self, GenerationEvidence, GenerationRequest, GenerationRequestField,
+        GenerationRequestIssue, UpdateProvider,
+    },
     job::{CommandSpec, JobStatus, JobStore},
     release::{self, MonitorOutcome, MonitorStatus},
     settings::{AiSettings, AppSettings, Language, NetworkSettings, ProxyMode},
@@ -1527,6 +1531,9 @@ enum LatestProviderChoice {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandFormField {
     Name,
+    AiRequest,
+    UpdateProvider,
+    UpdatePackage,
     Update,
     Probe,
     LatestSource,
@@ -1543,8 +1550,11 @@ enum CommandFormField {
 }
 
 impl CommandFormField {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 17] = [
         Self::Name,
+        Self::AiRequest,
+        Self::UpdateProvider,
+        Self::UpdatePackage,
         Self::Update,
         Self::Probe,
         Self::LatestSource,
@@ -1620,12 +1630,25 @@ impl LatestProviderChoice {
     }
 }
 
+fn cycle_update_provider(current: Option<UpdateProvider>, delta: isize) -> UpdateProvider {
+    match current {
+        Some(provider) => provider.cycle(delta),
+        None if delta < 0 => *UpdateProvider::ALL
+            .last()
+            .expect("supported update providers are not empty"),
+        None => UpdateProvider::ALL[0],
+    }
+}
+
 #[derive(Clone)]
 struct CommandForm {
     mode: CommandFormMode,
     original_name: Option<String>,
     field: CommandFormField,
     name: TextInput,
+    ai_request: TextInput,
+    update_provider: Option<UpdateProvider>,
+    update_package: TextInput,
     update: TextInput,
     probe: TextInput,
     latest_provider: LatestProviderChoice,
@@ -1639,6 +1662,7 @@ struct CommandForm {
     retry_delay_secs: TextInput,
     platforms: TextInput,
     resource_group: TextInput,
+    generation_evidence: Option<GenerationEvidence>,
 }
 
 impl CommandForm {
@@ -1648,6 +1672,9 @@ impl CommandForm {
             original_name: None,
             field: CommandFormField::Name,
             name: TextInput::new(String::new()),
+            ai_request: TextInput::new(String::new()),
+            update_provider: None,
+            update_package: TextInput::new(String::new()),
             update: TextInput::new(String::new()),
             probe: TextInput::new(String::new()),
             latest_provider: LatestProviderChoice::None,
@@ -1661,6 +1688,7 @@ impl CommandForm {
             retry_delay_secs: TextInput::new(default_retry_delay_secs().to_string()),
             platforms: TextInput::new(String::new()),
             resource_group: TextInput::new(String::new()),
+            generation_evidence: None,
         }
     }
 
@@ -1677,6 +1705,9 @@ impl CommandForm {
             original_name,
             field: CommandFormField::Update,
             name: TextInput::new(name),
+            ai_request: TextInput::new(String::new()),
+            update_provider: None,
+            update_package: TextInput::new(String::new()),
             update: TextInput::new(format_command_parts(&tool.update)),
             probe: TextInput::new(format_command_parts(&tool.probe)),
             latest_provider,
@@ -1698,21 +1729,29 @@ impl CommandForm {
             retry_delay_secs: TextInput::new(tool.retry_delay_secs.to_string()),
             platforms: TextInput::new(tool.platforms.join(", ")),
             resource_group: TextInput::new(tool.resource_group.clone().unwrap_or_default()),
+            generation_evidence: None,
         }
     }
 
     fn from_generated(
-        mode: CommandFormMode,
-        original_name: Option<String>,
+        active: &CommandForm,
         generated: ai::GeneratedCommand,
+        evidence: GenerationEvidence,
     ) -> Self {
         let (name, tool) = generated.into_user_tool();
-        Self::from_user_tool(mode, original_name, name, &tool)
+        let mut form = Self::from_user_tool(active.mode, active.original_name.clone(), name, &tool);
+        form.ai_request = active.ai_request.clone();
+        form.update_provider = active.update_provider;
+        form.update_package = active.update_package.clone();
+        form.generation_evidence = Some(evidence);
+        form
     }
 
     fn input(&self, field: CommandFormField) -> Option<&TextInput> {
         match field {
             CommandFormField::Name => Some(&self.name),
+            CommandFormField::AiRequest => Some(&self.ai_request),
+            CommandFormField::UpdatePackage => Some(&self.update_package),
             CommandFormField::Update => Some(&self.update),
             CommandFormField::Probe => Some(&self.probe),
             CommandFormField::LatestValue => Some(&self.latest_value),
@@ -1724,13 +1763,17 @@ impl CommandForm {
             CommandFormField::RetryDelay => Some(&self.retry_delay_secs),
             CommandFormField::Platforms => Some(&self.platforms),
             CommandFormField::ResourceGroup => Some(&self.resource_group),
-            CommandFormField::LatestSource | CommandFormField::Background => None,
+            CommandFormField::UpdateProvider
+            | CommandFormField::LatestSource
+            | CommandFormField::Background => None,
         }
     }
 
     fn input_mut(&mut self, field: CommandFormField) -> Option<&mut TextInput> {
         match field {
             CommandFormField::Name => Some(&mut self.name),
+            CommandFormField::AiRequest => Some(&mut self.ai_request),
+            CommandFormField::UpdatePackage => Some(&mut self.update_package),
             CommandFormField::Update => Some(&mut self.update),
             CommandFormField::Probe => Some(&mut self.probe),
             CommandFormField::LatestValue => Some(&mut self.latest_value),
@@ -1742,7 +1785,9 @@ impl CommandForm {
             CommandFormField::RetryDelay => Some(&mut self.retry_delay_secs),
             CommandFormField::Platforms => Some(&mut self.platforms),
             CommandFormField::ResourceGroup => Some(&mut self.resource_group),
-            CommandFormField::LatestSource | CommandFormField::Background => None,
+            CommandFormField::UpdateProvider
+            | CommandFormField::LatestSource
+            | CommandFormField::Background => None,
         }
     }
 
@@ -1756,13 +1801,12 @@ impl CommandForm {
 
     fn configuration_hint(&self) -> String {
         if [
-            &self.update,
             &self.probe,
-            &self.latest_value,
-            &self.update_version,
             &self.wait_for,
             &self.processes,
-            &self.platforms,
+            &self.lock_timeout_secs,
+            &self.retries,
+            &self.retry_delay_secs,
             &self.resource_group,
         ]
         .iter()
@@ -1772,23 +1816,16 @@ impl CommandForm {
         }
         format!(
             concat!(
-                "update={}\nprobe={}\nlatest_source={}\nlatest_value={}\n",
-                "update_version={}\nbackground={}\nwait_for={}\nprocesses={}\n",
-                "lock_timeout_secs={}\nretries={}\nretry_delay_secs={}\nplatforms={}\n",
-                "resource_group={}"
+                "probe={}\nbackground={}\nwait_for={}\nprocesses={}\n",
+                "lock_timeout_secs={}\nretries={}\nretry_delay_secs={}\nresource_group={}"
             ),
-            self.update.value,
             self.probe.value,
-            self.latest_provider.label(),
-            self.latest_value.value,
-            self.update_version.value,
             tool_background_label(self.background),
             self.wait_for.value,
             self.processes.value,
             self.lock_timeout_secs.value,
             self.retries.value,
             self.retry_delay_secs.value,
-            self.platforms.value,
             self.resource_group.value,
         )
     }
@@ -1925,6 +1962,13 @@ impl Operation {
 }
 
 #[derive(Debug)]
+struct AiCommandGenerationResult {
+    request: GenerationRequest,
+    evidence: GenerationEvidence,
+    generated: ai::GeneratedCommand,
+}
+
+#[derive(Debug)]
 enum AppEvent {
     InitialLoadProgress(InitialLoadProgress),
     InitialLoadFinished(std::result::Result<InitialLoadData, String>),
@@ -1966,7 +2010,7 @@ enum AppEvent {
     },
     AiCommandGenerated {
         request_id: u64,
-        result: std::result::Result<ai::GeneratedCommand, String>,
+        result: std::result::Result<Box<AiCommandGenerationResult>, String>,
     },
     AiGithubMonitorGenerated {
         request_id: u64,
@@ -2910,7 +2954,11 @@ impl App {
         }
     }
 
-    fn start_ai_command_generation(&mut self, name: String, configuration_hint: String) {
+    fn start_ai_command_generation(
+        &mut self,
+        request: GenerationRequest,
+        configuration_hint: String,
+    ) {
         if self.ai_generation_in_flight_request_id.is_some() {
             self.message = self
                 .language
@@ -2931,14 +2979,8 @@ impl App {
                 .to_owned();
             return;
         }
-        if name.trim().is_empty() && configuration_hint.trim().is_empty() {
-            self.message = self
-                .language
-                .text(
-                    "Enter a tool name or command hint before using AI",
-                    "请先填写工具名称或命令提示，再使用 AI 生成",
-                )
-                .to_owned();
+        if let Err(error) = request.validate() {
+            self.message = error.to_string();
             return;
         }
         self.ai_generation_request_id = self.ai_generation_request_id.wrapping_add(1).max(1);
@@ -2948,18 +2990,44 @@ impl App {
         self.message = self
             .language
             .text(
-                "AI is generating a complete tool configuration…",
-                "AI 正在生成完整工具配置…",
+                "Verifying authoritative sources and generating the tool…",
+                "正在验证权威来源并生成工具配置…",
             )
             .to_owned();
         let tx = self.tx.clone();
         let settings = self.settings.ai.clone();
         let network = self.settings.network.clone();
+        let encrypted_github_api_key = self.settings.github.encrypted_api_key.clone();
         let context = ai::SystemContext::detect(&self.state.root().join("installs"));
         thread::spawn(move || {
-            let result =
-                ai::generate_command(&settings, &network, &context, &name, &configuration_hint)
-                    .map_err(|error| error.to_string());
+            let result: Result<AiCommandGenerationResult> = (|| {
+                let github_api_key =
+                    credential::github_api_key(encrypted_github_api_key.as_deref())?;
+                let collected_at_unix_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|error| Error::Message(format!("system clock is invalid: {error}")))?
+                    .as_secs();
+                let evidence = generation::collect_live_evidence(
+                    &request,
+                    &network,
+                    github_api_key.as_ref().map(|value| value.as_str()),
+                    collected_at_unix_secs,
+                )?;
+                let generated = ai::generate_command(
+                    &settings,
+                    &network,
+                    &context,
+                    &request,
+                    &evidence,
+                    &configuration_hint,
+                )?;
+                Ok(AiCommandGenerationResult {
+                    request,
+                    evidence,
+                    generated,
+                })
+            })();
+            let result = result.map(Box::new).map_err(|error| error.to_string());
             let _ = tx.send(AppEvent::AiCommandGenerated { request_id, result });
         });
     }
@@ -3978,7 +4046,52 @@ impl App {
                     }
                     self.ai_generation_loading = false;
                     match result {
-                        Ok(generated) => {
+                        Ok(generation_result) => {
+                            let AiCommandGenerationResult {
+                                request,
+                                evidence,
+                                generated,
+                            } = *generation_result;
+                            let Modal::AddCommand { form: active_form } = &self.modal else {
+                                continue;
+                            };
+                            let Ok(active_request) = active_form.generation_request(self.language)
+                            else {
+                                self.message = self
+                                    .language
+                                    .text(
+                                        "AI result discarded because the locked request changed",
+                                        "锁定的生成请求已变化，已丢弃 AI 结果",
+                                    )
+                                    .to_owned();
+                                continue;
+                            };
+                            if active_request != request {
+                                self.message = self
+                                    .language
+                                    .text(
+                                        "AI result discarded because the locked request changed",
+                                        "锁定的生成请求已变化，已丢弃 AI 结果",
+                                    )
+                                    .to_owned();
+                                continue;
+                            }
+                            if let Err(error) = generation::validate_generated_against_evidence(
+                                &request,
+                                &evidence,
+                                &generated.name,
+                                &generated.tool,
+                            ) {
+                                self.message = match self.language {
+                                    Language::English => format!(
+                                        "AI returned a configuration that changed locked fields: {error}"
+                                    ),
+                                    Language::Chinese => {
+                                        format!("AI 返回的配置修改了锁定字段：{error}")
+                                    }
+                                };
+                                continue;
+                            }
                             let update = format_command_parts(&generated.tool.update);
                             if let Err(error) =
                                 validate_ai_generated_command(&update, self.language)
@@ -3986,14 +4099,8 @@ impl App {
                                 self.message = error;
                                 continue;
                             }
-                            let Modal::AddCommand { form: active_form } = &self.modal else {
-                                continue;
-                            };
-                            let mut form = CommandForm::from_generated(
-                                active_form.mode,
-                                active_form.original_name.clone(),
-                                generated,
-                            );
+                            let mut form =
+                                CommandForm::from_generated(active_form, generated, evidence);
                             if let Err(error) = form.submission(self.language) {
                                 self.message = match self.language {
                                     Language::English => format!(
@@ -4012,8 +4119,8 @@ impl App {
                             self.message = self
                                 .language
                                 .text(
-                                    "AI configuration generated; review every field before continuing",
-                                    "AI 已生成完整配置，请检查所有字段后再继续",
+                                    "AI configuration generated from verified authoritative sources; review every field before continuing",
+                                    "AI 已根据验证过的权威来源生成完整配置，请检查所有字段后再继续",
                                 )
                                 .to_owned();
                         }
@@ -5437,9 +5544,11 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     if ctrl_g {
         match &app.modal {
             Modal::AddCommand { form } => {
-                let name = form.name.value.clone();
                 let configuration_hint = form.configuration_hint();
-                app.start_ai_command_generation(name, configuration_hint);
+                match form.generation_request(app.language) {
+                    Ok(request) => app.start_ai_command_generation(request, configuration_hint),
+                    Err(error) => app.message = error,
+                }
                 return;
             }
             Modal::GithubMonitorForm { repository, .. } => {
@@ -5562,13 +5671,25 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     form.field = form.field.cycle(1);
                     form.clear_selections();
                 }
+                KeyCode::Left if form.field == CommandFormField::UpdateProvider && !ctrl => {
+                    form.update_provider = Some(cycle_update_provider(form.update_provider, -1));
+                    form.generation_evidence = None;
+                }
+                KeyCode::Right | KeyCode::Char(' ')
+                    if form.field == CommandFormField::UpdateProvider && !ctrl =>
+                {
+                    form.update_provider = Some(cycle_update_provider(form.update_provider, 1));
+                    form.generation_evidence = None;
+                }
                 KeyCode::Left if form.field == CommandFormField::LatestSource && !ctrl => {
                     form.latest_provider = form.latest_provider.cycle(-1);
+                    form.generation_evidence = None;
                 }
                 KeyCode::Right | KeyCode::Char(' ')
                     if form.field == CommandFormField::LatestSource && !ctrl =>
                 {
                     form.latest_provider = form.latest_provider.cycle(1);
+                    form.generation_evidence = None;
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                     if form.field == CommandFormField::Background && !ctrl =>
@@ -5577,6 +5698,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         ToolBackground::Auto => ToolBackground::Always,
                         ToolBackground::Always => ToolBackground::Auto,
                     };
+                    form.generation_evidence = None;
                 }
                 _ if save => match form.submission(app.language) {
                     Ok(submission) => {
@@ -5587,7 +5709,11 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 },
                 _ => {
                     if let Some(input) = form.input_mut(form.field) {
+                        let previous_value = input.value.clone();
                         handle_text_input_key(input, key);
+                        if input.value != previous_value {
+                            form.generation_evidence = None;
+                        }
                     }
                 }
             }
@@ -6221,7 +6347,11 @@ fn handle_paste(app: &mut App, text: &str) {
             let Some(input) = form.input_mut(form.field) else {
                 return;
             };
+            let previous_value = input.value.clone();
             input.insert_text(text);
+            if input.value != previous_value {
+                form.generation_evidence = None;
+            }
         }
         Modal::GithubSettings {
             field,
@@ -7152,8 +7282,15 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 let field = CommandFormField::from_index(hitbox.field)
                     .expect("editable command form field");
                 form.field = field;
+                if field == CommandFormField::UpdateProvider {
+                    form.update_provider = Some(cycle_update_provider(form.update_provider, 1));
+                    form.generation_evidence = None;
+                    app.modal_drag = None;
+                    return;
+                }
                 if field == CommandFormField::LatestSource {
                     form.latest_provider = form.latest_provider.cycle(1);
+                    form.generation_evidence = None;
                     app.modal_drag = None;
                     return;
                 }
@@ -7162,6 +7299,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                         ToolBackground::Auto => ToolBackground::Always,
                         ToolBackground::Always => ToolBackground::Auto,
                     };
+                    form.generation_evidence = None;
                     app.modal_drag = None;
                     return;
                 }
@@ -9635,7 +9773,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     CommandFormMode::Edit => app.language.text("Confirm edit", "确认编辑"),
                 },
                 100,
-                16,
+                22,
             );
             let update = format_command_parts(&submission.tool.update);
             let probe = format_command_parts(&submission.tool.probe);
@@ -9645,67 +9783,120 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 submission.tool.platforms.join(", ")
             };
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(
-                        match form.mode {
-                            CommandFormMode::Add => app.language.text(
-                                "Save this complete custom-tool configuration?",
-                                "保存这份完整的自定义工具配置？",
-                            ),
-                            CommandFormMode::Edit => app.language.text(
-                                "Replace this complete custom-tool configuration?",
-                                "更新这份完整的自定义工具配置？",
-                            ),
-                        },
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Line::raw(""),
-                    labeled_value(app.language.text("Name", "名称"), &submission.name, ACCENT),
-                    labeled_value(
-                        app.language.text("Update command", "更新命令"),
-                        &update,
-                        Color::White,
-                    ),
-                    labeled_value(
-                        app.language.text("Probe command", "探测命令"),
-                        &probe,
-                        Color::White,
-                    ),
-                    labeled_value(
-                        app.language.text("Latest source", "最新版本来源"),
-                        &latest,
-                        Color::White,
-                    ),
-                    labeled_value(
-                        app.language.text("Background", "后台模式"),
-                        tool_background_label(submission.tool.background),
-                        Color::White,
-                    ),
-                    labeled_value(
-                        app.language.text("Platforms", "平台"),
-                        &platforms,
-                        Color::White,
-                    ),
-                    Line::raw(""),
-                    Line::styled(
-                        app.language.text(
-                            "All tool fields will be written to TOML; the update command will not run now.",
-                            "所有工具字段都会写入 TOML；本次不会执行更新命令。",
+            let mut lines = vec![
+                Line::styled(
+                    match form.mode {
+                        CommandFormMode::Add => app.language.text(
+                            "Save this complete custom-tool configuration?",
+                            "保存这份完整的自定义工具配置？",
                         ),
-                        Style::default()
-                            .fg(WARNING_COLOR)
-                            .add_modifier(Modifier::BOLD),
+                        CommandFormMode::Edit => app.language.text(
+                            "Replace this complete custom-tool configuration?",
+                            "更新这份完整的自定义工具配置？",
+                        ),
+                    },
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                labeled_value(app.language.text("Name", "名称"), &submission.name, ACCENT),
+                labeled_value(
+                    app.language.text("Update command", "更新命令"),
+                    &update,
+                    Color::White,
+                ),
+                labeled_value(
+                    app.language.text("Probe command", "探测命令"),
+                    &probe,
+                    Color::White,
+                ),
+                labeled_value(
+                    app.language.text("Latest source", "最新版本来源"),
+                    &latest,
+                    Color::White,
+                ),
+                labeled_value(
+                    app.language.text("Background", "后台模式"),
+                    tool_background_label(submission.tool.background),
+                    Color::White,
+                ),
+                labeled_value(
+                    app.language.text("Platforms", "平台"),
+                    &platforms,
+                    Color::White,
+                ),
+                Line::raw(""),
+            ];
+            if let Some(evidence) = &form.generation_evidence {
+                let update_source = format!(
+                    "{} · {} · {}",
+                    evidence.update.provider.label(),
+                    evidence.update.identifier,
+                    evidence.update.latest_version,
+                );
+                let latest_source = format!(
+                    "{} · {} · {}",
+                    evidence.latest.provider.label(),
+                    evidence.latest.identifier,
+                    evidence.latest.latest_version,
+                );
+                let fetched_at = datetime::format_unix_ms(
+                    u128::from(evidence.collected_at_unix_secs).saturating_mul(1_000),
+                );
+                lines.extend([
+                    labeled_value(
+                        app.language
+                            .text("Verified update source", "已验证的更新来源"),
+                        &update_source,
+                        SUCCESS,
                     ),
-                    Line::raw(""),
-                    modal_actions(
-                        app.language,
-                        app.language.text("save", "保存"),
-                        app.language.text("go back", "返回"),
+                    labeled_value(
+                        app.language
+                            .text("Verified latest source", "已验证的最新版本来源"),
+                        &latest_source,
+                        SUCCESS,
                     ),
-                ])
-                .style(Style::default().bg(PANEL_BG))
-                .wrap(Wrap { trim: false }),
+                    labeled_value(
+                        app.language.text("Fetched at", "获取时间"),
+                        &fetched_at,
+                        Color::White,
+                    ),
+                    labeled_value(
+                        app.language.text("Evidence status", "证据状态"),
+                        app.language.text("verified", "已验证"),
+                        SUCCESS,
+                    ),
+                ]);
+            } else {
+                lines.push(Line::styled(
+                    app.language.text(
+                        "Manual configuration — no AI evidence attached",
+                        "手动配置——未附带 AI 权威证据",
+                    ),
+                    Style::default().fg(SUBTLE),
+                ));
+            }
+            lines.extend([
+                Line::raw(""),
+                Line::styled(
+                    app.language.text(
+                        "All tool fields will be written to TOML; the update command will not run now.",
+                        "所有工具字段都会写入 TOML；本次不会执行更新命令。",
+                    ),
+                    Style::default()
+                        .fg(WARNING_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                modal_actions(
+                    app.language,
+                    app.language.text("save", "保存"),
+                    app.language.text("go back", "返回"),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .style(Style::default().bg(PANEL_BG))
+                    .wrap(Wrap { trim: false }),
                 inner,
             );
         }
@@ -9749,10 +9940,13 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     CommandFormMode::Edit => app.language.text("Edit command", "编辑命令"),
                 },
                 112,
-                24,
+                27,
             );
             let labels: [&str; CommandFormField::ALL.len()] = [
                 app.language.text("Name", "名称"),
+                app.language.text("AI request", "AI 生成需求"),
+                app.language.text("Update provider", "更新来源"),
+                app.language.text("Update package", "更新包标识"),
                 app.language.text("Update command", "更新命令"),
                 app.language.text("Probe command", "探测命令"),
                 app.language.text("Latest source", "最新版本来源"),
@@ -9816,6 +10010,27 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     label(CommandFormField::Name),
                     &form.name,
                     "ripgrep",
+                    value_width,
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::AiRequest,
+                    label(CommandFormField::AiRequest),
+                    &form.ai_request,
+                    "Describe the required probe and process behavior",
+                    value_width,
+                ),
+                selector(
+                    form.field == CommandFormField::UpdateProvider,
+                    label(CommandFormField::UpdateProvider),
+                    form.update_provider
+                        .map(UpdateProvider::label)
+                        .unwrap_or("select"),
+                ),
+                modal_input_line(
+                    form.field == CommandFormField::UpdatePackage,
+                    label(CommandFormField::UpdatePackage),
+                    &form.update_package,
+                    "formula or package name",
                     value_width,
                 ),
                 modal_input_line(
@@ -11958,7 +12173,80 @@ where
     })
 }
 
+fn generation_request_issue_message(issue: &GenerationRequestIssue, language: Language) -> String {
+    if language == Language::English {
+        return issue.to_string();
+    }
+    match issue {
+        GenerationRequestIssue::InvalidField(field) => {
+            let field = match field {
+                GenerationRequestField::ToolName => "工具名称",
+                GenerationRequestField::Instructions => "AI 生成需求",
+                GenerationRequestField::UpdatePackage => "更新包标识",
+                GenerationRequestField::LatestIdentifier => "最新版本来源标识",
+            };
+            format!("{field}必须非空且不能包含首尾空白")
+        }
+        GenerationRequestIssue::InvalidLatestSource => {
+            "AI 生成请求中的 GitHub 仓库必须使用 owner/name 格式".to_owned()
+        }
+        GenerationRequestIssue::UnsupportedPlatform(platform) => {
+            format!("AI 生成请求包含不支持的平台 `{platform}`")
+        }
+    }
+}
+
 impl CommandForm {
+    fn generation_request(
+        &self,
+        language: Language,
+    ) -> std::result::Result<GenerationRequest, String> {
+        let update_provider = self.update_provider.ok_or_else(|| {
+            language
+                .text("Select an update provider", "请选择更新来源")
+                .to_owned()
+        })?;
+        let latest_value = self.latest_value.value.clone();
+        let latest = match self.latest_provider {
+            LatestProviderChoice::None => {
+                return Err(language
+                    .text("Select a latest-version provider", "请选择最新版本来源")
+                    .to_owned());
+            }
+            LatestProviderChoice::Npm => LatestVersionSource::Npm {
+                package: latest_value,
+            },
+            LatestProviderChoice::Pypi => LatestVersionSource::Pypi {
+                package: latest_value,
+            },
+            LatestProviderChoice::CratesIo => LatestVersionSource::CratesIo {
+                package: latest_value,
+            },
+            LatestProviderChoice::GithubRelease => LatestVersionSource::GithubRelease {
+                repository: latest_value,
+            },
+            LatestProviderChoice::GithubTag => LatestVersionSource::GithubTag {
+                repository: latest_value,
+            },
+        };
+        let request = GenerationRequest {
+            name: self.name.value.clone(),
+            instructions: self.ai_request.value.clone(),
+            update_provider,
+            update_package: self.update_package.value.clone(),
+            latest,
+            platforms: parse_csv(
+                &self.platforms.value,
+                language.text("Platforms", "平台"),
+                language,
+            )?,
+        };
+        if let Some(issue) = request.validation_issue() {
+            return Err(generation_request_issue_message(&issue, language));
+        }
+        Ok(request)
+    }
+
     fn submission(&self, language: Language) -> std::result::Result<CommandSubmission, String> {
         let name = self.name.value.trim().to_owned();
         if name.is_empty() {
@@ -12249,6 +12537,62 @@ mod tests {
                 resource_group: None,
             },
         }
+    }
+
+    fn test_generation_request(name: &str) -> GenerationRequest {
+        GenerationRequest {
+            name: name.to_owned(),
+            instructions: "Generate a complete probe and process policy".to_owned(),
+            update_provider: UpdateProvider::Npm,
+            update_package: "@colbymchenry/codegraph".to_owned(),
+            latest: LatestVersionSource::Npm {
+                package: "@colbymchenry/codegraph".to_owned(),
+            },
+            platforms: vec!["macos".to_owned(), "linux".to_owned()],
+        }
+    }
+
+    fn test_generation_evidence(request: &GenerationRequest) -> GenerationEvidence {
+        let LatestVersionSource::Npm { package } = &request.latest else {
+            panic!("test request must use npm latest evidence");
+        };
+        GenerationEvidence {
+            collected_at_unix_secs: 1_700_000_000,
+            update: generation::SourceEvidence {
+                provider: generation::EvidenceProvider::Npm,
+                identifier: request.update_package.clone(),
+                latest_version: "1.2.3".to_owned(),
+            },
+            latest: generation::SourceEvidence {
+                provider: generation::EvidenceProvider::Npm,
+                identifier: package.clone(),
+                latest_version: "1.2.3".to_owned(),
+            },
+        }
+    }
+
+    fn configure_form_for_generation(form: &mut CommandForm, request: &GenerationRequest) {
+        form.name = TextInput::new(request.name.clone());
+        form.ai_request = TextInput::new(request.instructions.clone());
+        form.update_provider = Some(request.update_provider);
+        form.update_package = TextInput::new(request.update_package.clone());
+        let (latest_provider, latest_value) =
+            LatestProviderChoice::from_source(Some(&request.latest));
+        form.latest_provider = latest_provider;
+        form.latest_value = TextInput::new(latest_value);
+        form.platforms = TextInput::new(request.platforms.join(", "));
+    }
+
+    fn test_generation_result(
+        request: GenerationRequest,
+        generated: ai::GeneratedCommand,
+    ) -> Box<AiCommandGenerationResult> {
+        let evidence = test_generation_evidence(&request);
+        Box::new(AiCommandGenerationResult {
+            request,
+            evidence,
+            generated,
+        })
     }
 
     fn render_test_screen(app: &mut App, width: u16, height: u16) -> String {
@@ -13462,7 +13806,7 @@ mod tests {
         };
         app.modal_input_hitboxes = vec![ModalInputHitbox {
             area: Rect::new(10, 5, 10, 1),
-            field: 1,
+            field: CommandFormField::Update.index(),
             visible_start: 0,
             visible_end: 4,
         }];
@@ -13641,6 +13985,278 @@ mod tests {
     }
 
     #[test]
+    fn command_form_cycles_only_the_supported_update_providers() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let mut form = test_command_form("example", "example update");
+        form.field = CommandFormField::UpdateProvider;
+        app.modal = Modal::AddCommand { form };
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.update_provider == Some(UpdateProvider::Homebrew)
+        ));
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form } if form.update_provider == Some(UpdateProvider::Uv)
+        ));
+    }
+
+    #[test]
+    fn ai_configuration_hint_excludes_fields_locked_by_authoritative_sources() {
+        let request = test_generation_request("codegraph");
+        let mut form = *test_command_form("codegraph", "untrusted update command");
+        configure_form_for_generation(&mut form, &request);
+        form.probe = TextInput::new("codegraph --version".to_owned());
+        form.update_version = TextInput::new("untrusted version command".to_owned());
+
+        let hint = form.configuration_hint();
+
+        assert!(hint.contains("probe=codegraph --version"));
+        assert!(hint.contains("background=auto"));
+        assert!(!hint.contains("untrusted update command"));
+        assert!(!hint.contains("untrusted version command"));
+        assert!(!hint.contains("latest_source="));
+        assert!(!hint.contains("latest_value="));
+        assert!(!hint.contains("platforms="));
+    }
+
+    #[test]
+    fn ai_generation_requires_explicit_update_source_and_user_request() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let mut form = test_command_form("example", "");
+        form.latest_provider = LatestProviderChoice::Npm;
+        form.latest_value = TextInput::new("example".to_owned());
+        form.update_package = TextInput::new("example".to_owned());
+        app.modal = Modal::AddCommand { form };
+
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.message, "Select an update provider");
+        assert!(!app.ai_generation_loading);
+
+        let Modal::AddCommand { form } = &mut app.modal else {
+            panic!("command form");
+        };
+        form.update_provider = Some(UpdateProvider::Npm);
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            app.message
+                .contains("AI generation request must be non-empty")
+        );
+        assert!(!app.ai_generation_loading);
+    }
+
+    #[test]
+    fn ai_generation_validation_errors_follow_the_tui_language() {
+        let mut form = *test_command_form("example", "");
+        form.update_provider = Some(UpdateProvider::Npm);
+        form.update_package = TextInput::new("example".to_owned());
+        form.latest_provider = LatestProviderChoice::Npm;
+        form.latest_value = TextInput::new("example".to_owned());
+
+        let error = form
+            .generation_request(Language::Chinese)
+            .expect_err("AI request is required");
+
+        assert_eq!(error, "AI 生成需求必须非空且不能包含首尾空白");
+    }
+
+    #[test]
+    fn editing_an_ai_generated_form_invalidates_verified_evidence() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let request = test_generation_request("codegraph");
+        let mut form = test_command_form("codegraph", "npm install codegraph");
+        configure_form_for_generation(&mut form, &request);
+        form.generation_evidence = Some(test_generation_evidence(&request));
+        form.field = CommandFormField::Probe;
+        app.modal = Modal::AddCommand { form };
+
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form } if form.generation_evidence.is_none()
+        ));
+    }
+
+    #[test]
+    fn pasting_into_an_ai_generated_form_invalidates_verified_evidence() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let request = test_generation_request("codegraph");
+        let mut form = test_command_form("codegraph", "npm install codegraph");
+        configure_form_for_generation(&mut form, &request);
+        form.generation_evidence = Some(test_generation_evidence(&request));
+        form.field = CommandFormField::Probe;
+        app.modal = Modal::AddCommand { form };
+
+        handle_paste(&mut app, " --json");
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form } if form.generation_evidence.is_none()
+        ));
+    }
+
+    #[test]
+    fn changing_a_generated_form_selector_invalidates_verified_evidence() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let request = test_generation_request("codegraph");
+        let mut form = test_command_form("codegraph", "npm install codegraph");
+        configure_form_for_generation(&mut form, &request);
+        form.generation_evidence = Some(test_generation_evidence(&request));
+        form.field = CommandFormField::LatestSource;
+        app.modal = Modal::AddCommand { form };
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.latest_provider == LatestProviderChoice::Pypi
+                    && form.generation_evidence.is_none()
+        ));
+    }
+
+    #[test]
+    fn clicking_update_provider_selects_a_supported_source() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::AddCommand {
+            form: test_command_form("example", "example update"),
+        };
+        render_test_screen(&mut app, 140, 30);
+        let provider_area = app
+            .modal_input_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.field == CommandFormField::UpdateProvider.index())
+            .expect("update provider hitbox")
+            .area;
+
+        handle_modal_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: provider_area.x,
+                row: provider_area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.field == CommandFormField::UpdateProvider
+                    && form.update_provider == Some(UpdateProvider::Homebrew)
+        ));
+    }
+
+    #[test]
+    fn confirm_generated_command_shows_authoritative_evidence() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        let mut active = *test_command_form("codegraph", "");
+        configure_form_for_generation(&mut active, &request);
+        let mut generated = generated_command(
+            "codegraph",
+            &[
+                "npm",
+                "install",
+                "--global",
+                "@colbymchenry/codegraph@latest",
+            ],
+        );
+        generated.tool.latest = Some(request.latest.clone());
+        generated.tool.update_version = request
+            .update_provider
+            .update_version_command(&request.update_package);
+        generated.tool.platforms = request.platforms.clone();
+        let form = CommandForm::from_generated(&active, generated, evidence);
+        let submission = form.submission(Language::English).expect("submission");
+        app.modal = Modal::ConfirmAdd {
+            form: Box::new(form),
+            submission,
+        };
+
+        let screen = render_test_screen(&mut app, 140, 36);
+
+        assert!(
+            screen.contains("Verified update source"),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("npm · @colbymchenry/codegraph · 1.2.3"),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("Verified latest source"),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("Fetched at"), "screen: {screen}");
+    }
+
+    #[test]
+    fn ai_request_and_evidence_are_not_written_to_custom_tool_toml() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        state.ensure().expect("state directories");
+        let mut app = App::new(state.clone(), None).expect("app");
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        let mut active = *test_command_form("codegraph", "");
+        configure_form_for_generation(&mut active, &request);
+        let mut generated = generated_command(
+            "codegraph",
+            &[
+                "npm",
+                "install",
+                "--global",
+                "@colbymchenry/codegraph@latest",
+            ],
+        );
+        generated.tool.latest = Some(request.latest.clone());
+        generated.tool.update_version = request
+            .update_provider
+            .update_version_command(&request.update_package);
+        generated.tool.platforms = request.platforms.clone();
+        let form = CommandForm::from_generated(&active, generated, evidence);
+        let submission = form.submission(Language::English).expect("submission");
+
+        app.save_command_form(form, submission);
+
+        let toml = std::fs::read_to_string(state.custom_config_path()).expect("custom TOML");
+        assert!(!toml.contains("Generate a complete probe and process policy"));
+        assert!(!toml.contains("generation_evidence"));
+        assert!(!toml.contains("collected_at_unix_secs"));
+        assert!(!toml.contains("1.2.3"));
+    }
+
+    #[test]
     fn edit_key_opens_the_selected_custom_command() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -13679,12 +14295,16 @@ mod tests {
                     && form.update.value == r#"example-cli update "two words""#
         ));
 
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        for _ in 0..CommandFormField::Update.index() {
+            handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
         assert!(matches!(
             &app.modal,
             Modal::AddCommand { form } if form.field == CommandFormField::Name
         ));
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        for _ in 0..CommandFormField::Update.index() {
+            handle_modal_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
         assert!(matches!(
             &app.modal,
             Modal::AddCommand { form } if form.field == CommandFormField::Update
@@ -13695,8 +14315,9 @@ mod tests {
             &app.modal,
             Modal::AddCommand { form } if form.field == CommandFormField::Probe
         ));
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        for _ in 0..CommandFormField::Probe.index() {
+            handle_modal_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
 
         handle_modal_key(
             &mut app,
@@ -14120,7 +14741,10 @@ mod tests {
         app.tx
             .send(AppEvent::AiCommandGenerated {
                 request_id: 15,
-                result: Ok(generated_command("stale", &["stale", "update"])),
+                result: Ok(test_generation_result(
+                    test_generation_request("stale"),
+                    generated_command("stale", &["stale", "update"]),
+                )),
             })
             .expect("stale generated command");
         app.process_events();
@@ -14144,7 +14768,10 @@ mod tests {
         app.tx
             .send(AppEvent::AiCommandGenerated {
                 request_id: 7,
-                result: Ok(generated_command("stale", &["stale", "update"])),
+                result: Ok(test_generation_result(
+                    test_generation_request("stale"),
+                    generated_command("stale", &["stale", "update"]),
+                )),
             })
             .expect("stale result");
         app.process_events();
@@ -14154,6 +14781,12 @@ mod tests {
             Modal::AddCommand { form } if form.name.value == "code"
         ));
 
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        let Modal::AddCommand { form } = &mut app.modal else {
+            panic!("command form");
+        };
+        configure_form_for_generation(form, &request);
         let mut generated = generated_command(
             "codegraph",
             &[
@@ -14188,7 +14821,11 @@ mod tests {
         app.tx
             .send(AppEvent::AiCommandGenerated {
                 request_id: 8,
-                result: Ok(generated),
+                result: Ok(Box::new(AiCommandGenerationResult {
+                    request,
+                    evidence,
+                    generated,
+                })),
             })
             .expect("current result");
         app.process_events();
@@ -14214,8 +14851,12 @@ mod tests {
                     && form.retry_delay_secs.value == "3"
                     && form.platforms.value == "macos, linux"
                     && form.resource_group.value == "node-global"
+                    && form.generation_evidence.as_ref().is_some_and(|evidence|
+                        evidence.update.latest_version == "1.2.3"
+                            && evidence.latest.latest_version == "1.2.3"
+                    )
         ));
-        assert!(app.message.contains("review"));
+        assert!(app.message.contains("verified authoritative sources"));
     }
 
     #[test]
@@ -14320,6 +14961,9 @@ mod tests {
         assert!(add.contains("Ctrl+G"), "screen: {add}");
         for label in [
             "Name",
+            "AI request",
+            "Update provider",
+            "Update package",
             "Update command",
             "Probe command",
             "Latest source",

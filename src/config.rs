@@ -382,7 +382,7 @@ pub enum LatestVersionSource {
 }
 
 impl LatestVersionSource {
-    fn validate(&self, context: &str) -> Result<()> {
+    pub(crate) fn validate(&self, context: &str) -> Result<()> {
         let value = match self {
             Self::Npm { package } | Self::Pypi { package } | Self::CratesIo { package } => package,
             Self::GithubRelease { repository } | Self::GithubTag { repository } => repository,
