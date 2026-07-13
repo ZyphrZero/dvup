@@ -10195,6 +10195,21 @@ fn next_index(current: usize, length: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn render_test_screen(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("render test screen");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn startup_loading_screen_renders_progress_before_tools_are_ready() {
         use ratatui::backend::TestBackend;
@@ -12398,40 +12413,16 @@ mod tests {
 
     #[test]
     fn footer_shows_ctrl_c_as_the_only_quit_shortcut_in_both_languages() {
-        use ratatui::backend::TestBackend;
-
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
-        let backend = TestBackend::new(140, 20);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("render English footer");
-        let english = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let english = render_test_screen(&mut app, 140, 20);
         assert!(english.contains("Ctrl+C quit"), "screen: {english}");
         assert!(!english.contains("q / Ctrl+C"), "screen: {english}");
         assert!(english.contains("t TOML"), "screen: {english}");
 
         app.language = Language::Chinese;
-        terminal.clear().expect("clear English footer");
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("render Chinese footer");
-        let chinese = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let chinese = render_test_screen(&mut app, 140, 20);
         assert!(chinese.contains("Ctrl+C"), "screen: {chinese}");
         assert!(!chinese.contains("q / Ctrl+C"), "screen: {chinese}");
         assert!(chinese.contains("t "), "screen: {chinese}");
@@ -12441,40 +12432,16 @@ mod tests {
 
     #[test]
     fn doctor_footer_omits_the_active_and_shadowed_legend() {
-        use ratatui::backend::TestBackend;
-
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         app.tab = Tab::Doctor;
-        let backend = TestBackend::new(160, 20);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("render English Doctor footer");
-        let english = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let english = render_test_screen(&mut app, 160, 20);
         assert!(!english.contains("active wins PATH"), "screen: {english}");
         assert!(!english.contains("shadowed is hidden"), "screen: {english}");
 
         app.language = Language::Chinese;
-        terminal.clear().expect("clear English footer");
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("render Chinese Doctor footer");
-        let chinese = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        let chinese = render_test_screen(&mut app, 160, 20);
         assert!(
             !chinese.contains("active 为当前生效项"),
             "screen: {chinese}"
