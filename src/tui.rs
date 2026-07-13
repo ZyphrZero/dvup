@@ -2872,6 +2872,13 @@ impl App {
         };
     }
 
+    fn report_refresh_error(&mut self, error: Error) {
+        self.message = match self.language {
+            Language::English => format!("Refresh failed: {error}"),
+            Language::Chinese => format!("刷新失败：{error}"),
+        };
+    }
+
     fn refresh_doctor(&mut self) -> Result<()> {
         if self.doctor_loading {
             self.message = self
@@ -4038,9 +4045,12 @@ fn dispatch_event(app: &mut App, event: Event) {
     if app.initial_load.is_some() {
         if let Event::Key(key) = event
             && key.kind != KeyEventKind::Release
-            && is_ctrl_c(&key)
         {
-            app.should_quit = true;
+            if is_ctrl_c(&key) {
+                request_ctrl_c_quit(app);
+            } else {
+                app.ctrl_c_armed = false;
+            }
         }
         return;
     }
@@ -5261,10 +5271,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('r') | KeyCode::Char('R') => {
             if let Err(error) = app.refresh_tools() {
-                app.message = match app.language {
-                    Language::English => format!("Refresh failed: {error}"),
-                    Language::Chinese => format!("刷新失败：{error}"),
-                };
+                app.report_refresh_error(error);
                 return;
             }
             if app.tab == Tab::Doctor {
@@ -5276,10 +5283,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             if let Err(error) = app.refresh_jobs() {
-                app.message = match app.language {
-                    Language::English => format!("Refresh failed: {error}"),
-                    Language::Chinese => format!("刷新失败：{error}"),
-                };
+                app.report_refresh_error(error);
             } else {
                 app.message = app.language.text("Refreshed", "已刷新").to_owned();
             }
@@ -10243,6 +10247,39 @@ mod tests {
         );
 
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn initial_loading_requires_two_consecutive_ctrl_c_presses_to_exit() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::empty(state, None).expect("empty app");
+        app.initial_load = Some(InitialLoadProgress {
+            phase: InitialLoadPhase::Configuration,
+            completed: 0,
+            total: 1,
+        });
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        dispatch_event(&mut app, ctrl_c.clone());
+
+        assert!(!app.should_quit);
+        assert!(app.ctrl_c_armed);
+        assert_eq!(app.message, "Press Ctrl+C again to quit");
+
+        dispatch_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        );
+        assert!(!app.ctrl_c_armed);
+
+        dispatch_event(&mut app, ctrl_c.clone());
+        assert!(!app.should_quit);
+        assert!(app.ctrl_c_armed);
+
+        dispatch_event(&mut app, ctrl_c);
+
+        assert!(app.should_quit);
     }
 
     #[test]
