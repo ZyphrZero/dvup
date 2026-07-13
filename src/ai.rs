@@ -25,6 +25,7 @@ const MAX_GITHUB_RELEASE_BYTES: u64 = 1024 * 1024;
 const MAX_GENERATED_NAME_BYTES: usize = 128;
 const MAX_GENERATED_COMMAND_BYTES: usize = 4 * 1024;
 const MAX_GENERATED_FIELD_BYTES: usize = 4 * 1024;
+const MACOS_APPLICATIONS_DIRECTORY: &str = "/Applications";
 const USER_AGENT: &str = concat!("dvup/", env!("CARGO_PKG_VERSION"));
 const PACKAGE_MANAGERS: &[&str] = &[
     "brew", "scoop", "winget", "apt", "dnf", "pacman", "npm", "pnpm", "bun", "cargo", "pipx", "uv",
@@ -180,14 +181,15 @@ pub(crate) fn generate_github_monitor(
     let system = concat!(
         "You generate one dvup GitHub Release monitor. Return one JSON object only with exactly ",
         "these properties: name (string), repository (owner/repo string), asset_regex (Rust regex ",
-        "string matching exactly one supplied asset), target_directory (absolute string path under ",
-        "the supplied user_writable_install_root), format (file, zip, tar_gz, or dmg), ",
+        "string matching exactly one supplied asset), target_directory (absolute string path; under ",
+        "the supplied user_writable_install_root for file, zip, and tar_gz, or ",
+        "/Applications/<Application>.app for dmg), format (file, zip, tar_gz, or dmg), ",
         "update_policy (manual), cleanup_installer (boolean), max_download_bytes (integer), ",
         "max_extracted_bytes (integer; 0 for file), max_extracted_files (integer; 0 for file), ",
         "strip_components (integer), and enabled (true). Select only an asset compatible with the ",
         "supplied operating system and architecture. Escape the exact stable filename shape into ",
-        "an anchored regex while allowing release version changes. For dmg, target_directory must ",
-        "end in .app. Do not include markdown or extra properties."
+        "an anchored regex while allowing release version changes. Do not include markdown or ",
+        "extra properties."
     );
     let user = format!(
         "Generate a monitor for this repository.\n{}\nrepository={}\nlatest_release_assets={}",
@@ -271,6 +273,7 @@ fn validate_generated_monitor(
             .unwrap_or(repository)
             .to_owned();
     }
+    normalize_generated_target_directory(&mut monitor);
     monitor.validate()?;
     if monitor.repository != *repository {
         return Err(Error::Message(format!(
@@ -293,12 +296,21 @@ fn validate_generated_monitor(
         ));
     }
     let install_root = Path::new(&context.install_root);
-    if monitor.target_directory == install_root
+    let contains_parent_traversal = monitor
+        .target_directory
+        .components()
+        .any(|component| component == Component::ParentDir);
+    if monitor.format == ReleaseAssetFormat::Dmg {
+        if monitor.target_directory.parent() != Some(Path::new(MACOS_APPLICATIONS_DIRECTORY))
+            || contains_parent_traversal
+        {
+            return Err(Error::Message(
+                "AI DMG target must be /Applications/<Application>.app".to_owned(),
+            ));
+        }
+    } else if monitor.target_directory == install_root
         || !monitor.target_directory.starts_with(install_root)
-        || monitor
-            .target_directory
-            .components()
-            .any(|component| component == Component::ParentDir)
+        || contains_parent_traversal
     {
         return Err(Error::Message(format!(
             "AI target directory must be a child of {} without parent traversal",
@@ -348,6 +360,21 @@ fn validate_generated_monitor(
         )));
     }
     Ok(monitor)
+}
+
+fn normalize_generated_target_directory(monitor: &mut GithubReleaseMonitor) {
+    if monitor.format != ReleaseAssetFormat::Dmg {
+        return;
+    }
+    let Some(bundle_name) = monitor.target_directory.file_name().filter(|name| {
+        Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("app")
+    }) else {
+        return;
+    };
+    monitor.target_directory = Path::new(MACOS_APPLICATIONS_DIRECTORY).join(bundle_name);
 }
 
 fn asset_matches_system(asset: &str, os: &str, arch: &str) -> bool {
@@ -917,6 +944,41 @@ mod tests {
         wrong_arch.format = ReleaseAssetFormat::Zip;
         assert!(
             validate_generated_monitor(wrong_arch, "owner/example", &context, &assets).is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generated_dmg_monitors_default_to_the_applications_directory() {
+        let install_root = std::path::PathBuf::from("/Users/test/.local/share/dvup/installs");
+        let context = SystemContext {
+            os: "macos",
+            arch: "aarch64",
+            available_package_managers: Vec::new(),
+            install_root: install_root.display().to_string(),
+        };
+        let monitor = GithubReleaseMonitor {
+            name: "example".to_owned(),
+            repository: "owner/example".to_owned(),
+            asset_regex: r"^Example-[0-9.]+-arm64\.dmg$".to_owned(),
+            target_directory: install_root.join("Example.app"),
+            format: ReleaseAssetFormat::Dmg,
+            update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled: true,
+        };
+        let assets = vec!["Example-1.2.3-arm64.dmg".to_owned()];
+
+        let generated = validate_generated_monitor(monitor, "owner/example", &context, &assets)
+            .expect("generated DMG monitor");
+
+        assert_eq!(
+            generated.target_directory,
+            std::path::PathBuf::from("/Applications/Example.app")
         );
     }
 
