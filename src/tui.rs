@@ -6597,11 +6597,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ],
         (Tab::Doctor, Language::English) => [
             "Enter scan/expand · r rescan · ↑↓/hover move · PgUp/PgDn scroll",
-            "Ctrl+C quit · active wins PATH · shadowed is hidden · ←/→ or click tab · L 中/EN",
+            "Ctrl+C quit · ←/→ or click tab · L 中/EN",
         ],
         (Tab::Doctor, Language::Chinese) => [
             "Enter 扫描/展开 · r 重新扫描 · ↑↓/悬停 移动 · PgUp/PgDn 滚动",
-            "Ctrl+C 退出 · active 为当前生效项 · shadowed 为被遮蔽项 · ←/→ 或点击标签页",
+            "Ctrl+C 退出 · ←/→ 或点击标签页",
         ],
         (Tab::Settings, Language::English) => [
             "↑↓/hover move · click/Space/Enter toggle setting",
@@ -12437,6 +12437,52 @@ mod tests {
         assert!(chinese.contains("t "), "screen: {chinese}");
         assert!(chinese.contains("TOML"), "screen: {chinese}");
         assert!(chinese.contains("退 出"), "screen: {chinese}");
+    }
+
+    #[test]
+    fn doctor_footer_omits_the_active_and_shadowed_legend() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.tab = Tab::Doctor;
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render English Doctor footer");
+        let english = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!english.contains("active wins PATH"), "screen: {english}");
+        assert!(!english.contains("shadowed is hidden"), "screen: {english}");
+
+        app.language = Language::Chinese;
+        terminal.clear().expect("clear English footer");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render Chinese Doctor footer");
+        let chinese = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            !chinese.contains("active 为当前生效项"),
+            "screen: {chinese}"
+        );
+        assert!(
+            !chinese.contains("shadowed 为被遮蔽项"),
+            "screen: {chinese}"
+        );
     }
 
     #[test]
