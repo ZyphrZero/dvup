@@ -4038,7 +4038,7 @@ fn dispatch_event(app: &mut App, event: Event) {
     if app.initial_load.is_some() {
         if let Event::Key(key) = event
             && key.kind != KeyEventKind::Release
-            && (key.code == KeyCode::Char('q') || is_ctrl_c(&key))
+            && is_ctrl_c(&key)
         {
             app.should_quit = true;
         }
@@ -5259,8 +5259,14 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => request_quit(app),
         KeyCode::Char('r') | KeyCode::Char('R') => {
+            if let Err(error) = app.refresh_tools() {
+                app.message = match app.language {
+                    Language::English => format!("Refresh failed: {error}"),
+                    Language::Chinese => format!("刷新失败：{error}"),
+                };
+                return;
+            }
             if app.tab == Tab::Doctor {
                 request_doctor_refresh(app);
                 return;
@@ -5269,8 +5275,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
                 app.start_release_probe(true);
                 return;
             }
-            let refresh = app.refresh_tools().and_then(|_| app.refresh_jobs());
-            if let Err(error) = refresh {
+            if let Err(error) = app.refresh_jobs() {
                 app.message = match app.language {
                     Language::English => format!("Refresh failed: {error}"),
                     Language::Chinese => format!("刷新失败：{error}"),
@@ -5381,22 +5386,6 @@ fn toggle_process_strategy(app: &mut App) {
             },
         },
     };
-}
-
-fn request_quit(app: &mut App) {
-    if app.running == 0 {
-        app.should_quit = true;
-    } else {
-        app.message = match app.language {
-            Language::English => format!(
-                "Wait for {} running operation(s) before quitting with q",
-                app.running
-            ),
-            Language::Chinese => {
-                format!("请等待 {} 项运行中的操作结束后再按 q 退出", app.running)
-            }
-        };
-    }
 }
 
 fn request_ctrl_c_quit(app: &mut App) {
@@ -6559,10 +6548,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let shared_tool_help = match app.language {
         Language::English => {
-            "q / Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab"
+            "Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab"
         }
         Language::Chinese => {
-            "q / Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页"
+            "Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页"
         }
     };
     let help = match (app.tab, app.language) {
@@ -6588,35 +6577,35 @@ fn draw(frame: &mut Frame, app: &mut App) {
         },
         (Tab::Activity, Language::English) => [
             "↑↓ scroll · click execution to expand · Home/End · r refresh",
-            "q / Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
+            "Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
         ],
         (Tab::Activity, Language::Chinese) => [
             "↑↓ 滚动 · 点击执行展开 · Home/End · r 刷新",
-            "q / Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
+            "Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
         ],
         (Tab::Jobs, Language::English) => [
             "↑↓/hover move · click/Enter expand result · PgUp/PgDn scroll · r refresh",
-            "q / Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
+            "Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
         ],
         (Tab::Jobs, Language::Chinese) => [
             "↑↓/悬停 移动 · 点击/Enter 展开结果 · PgUp/PgDn 滚动 · r 刷新",
-            "q / Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
+            "Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
         ],
         (Tab::Doctor, Language::English) => [
             "Enter scan/expand · r rescan · ↑↓/hover move · PgUp/PgDn scroll",
-            "q / Ctrl+C quit · active wins PATH · shadowed is hidden · ←/→ or click tab · L 中/EN",
+            "Ctrl+C quit · active wins PATH · shadowed is hidden · ←/→ or click tab · L 中/EN",
         ],
         (Tab::Doctor, Language::Chinese) => [
             "Enter 扫描/展开 · r 重新扫描 · ↑↓/悬停 移动 · PgUp/PgDn 滚动",
-            "q / Ctrl+C 退出 · active 为当前生效项 · shadowed 为被遮蔽项 · ←/→ 或点击标签页",
+            "Ctrl+C 退出 · active 为当前生效项 · shadowed 为被遮蔽项 · ←/→ 或点击标签页",
         ],
         (Tab::Settings, Language::English) => [
             "↑↓/hover move · click/Space/Enter toggle setting",
-            "q / Ctrl+C quit · settings save immediately · ←/→ or click tab · L 中/EN",
+            "Ctrl+C quit · settings save immediately · ←/→ or click tab · L 中/EN",
         ],
         (Tab::Settings, Language::Chinese) => [
             "↑↓/悬停 移动 · 点击/Space/Enter 切换设置",
-            "q / Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击标签页 · L 中/EN",
+            "Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击标签页 · L 中/EN",
         ],
     };
     let footer = Paragraph::new(vec![
@@ -10238,6 +10227,25 @@ mod tests {
     }
 
     #[test]
+    fn q_does_not_exit_during_initial_loading() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::empty(state, None).expect("empty app");
+        app.initial_load = Some(InitialLoadProgress {
+            phase: InitialLoadPhase::Configuration,
+            completed: 0,
+            total: 1,
+        });
+
+        dispatch_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        );
+
+        assert!(!app.should_quit);
+    }
+
+    #[test]
     fn main_view_paints_a_dark_background_across_the_entire_terminal() {
         use ratatui::backend::TestBackend;
 
@@ -12302,6 +12310,18 @@ mod tests {
     }
 
     #[test]
+    fn q_is_not_an_exit_shortcut() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+
+        for code in [KeyCode::Char('q'), KeyCode::Char('Q')] {
+            handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[test]
     fn non_ctrl_c_key_cancels_the_quit_confirmation() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -12340,7 +12360,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_both_quit_shortcuts_in_both_languages() {
+    fn footer_shows_ctrl_c_as_the_only_quit_shortcut_in_both_languages() {
         use ratatui::backend::TestBackend;
 
         let temporary = tempfile::TempDir::new().expect("temp dir");
@@ -12359,7 +12379,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(english.contains("q / Ctrl+C quit"), "screen: {english}");
+        assert!(english.contains("Ctrl+C quit"), "screen: {english}");
+        assert!(!english.contains("q / Ctrl+C"), "screen: {english}");
         assert!(english.contains("t TOML"), "screen: {english}");
 
         app.language = Language::Chinese;
@@ -12374,7 +12395,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(chinese.contains("q / Ctrl+C"), "screen: {chinese}");
+        assert!(chinese.contains("Ctrl+C"), "screen: {chinese}");
+        assert!(!chinese.contains("q / Ctrl+C"), "screen: {chinese}");
         assert!(chinese.contains("t "), "screen: {chinese}");
         assert!(chinese.contains("TOML"), "screen: {chinese}");
         assert!(chinese.contains("退 出"), "screen: {chinese}");
@@ -13747,6 +13769,73 @@ mod tests {
         assert_eq!(app.tool_view, ToolView::Github);
         handle_tools_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.tool_view, ToolView::Commands);
+    }
+
+    #[test]
+    fn github_refresh_reloads_repository_configuration_from_disk() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state.clone(), None).expect("app");
+        app.tool_view = ToolView::Github;
+        app.release_monitor_running = true;
+        assert!(app.github_monitors.is_empty());
+
+        let mut custom = UserConfig::empty();
+        custom.github.monitors.push(GithubReleaseMonitor {
+            name: "reloaded".to_owned(),
+            repository: "owner/reloaded".to_owned(),
+            asset_regex: r"^reloaded\.zip$".to_owned(),
+            target_directory: temporary.path().join("reloaded"),
+            format: ReleaseAssetFormat::Zip,
+            update_policy: ReleaseUpdatePolicy::Manual,
+            cleanup_installer: true,
+            max_download_bytes: 1024,
+            max_extracted_bytes: 2048,
+            max_extracted_files: 10,
+            strip_components: 0,
+            enabled: false,
+        });
+        custom
+            .save(&state.custom_config_path())
+            .expect("save external config change");
+
+        handle_normal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.github_monitors.len(), 1);
+        assert_eq!(app.github_monitors[0].name, "reloaded");
+    }
+
+    #[test]
+    fn doctor_refresh_reloads_tool_configuration_from_disk() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state.clone(), None).expect("app");
+        app.tab = Tab::Doctor;
+        app.doctor_loading = true;
+        assert!(!app.tools.iter().any(|tool| tool.name == "reloaded"));
+
+        let mut custom = UserConfig::empty();
+        custom.tools.insert(
+            "reloaded".to_owned(),
+            UserTool::custom(
+                "reloaded",
+                "missing-reloaded-command".to_owned(),
+                vec!["update".to_owned()],
+            ),
+        );
+        custom
+            .save(&state.custom_config_path())
+            .expect("save external config change");
+
+        handle_normal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+
+        assert!(app.tools.iter().any(|tool| tool.name == "reloaded"));
     }
 
     #[test]
