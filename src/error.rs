@@ -31,6 +31,13 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[error("configuration file {path} is locked or not writable: {source}")]
+    ConfigWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("command is empty")]
     EmptyCommand,
 

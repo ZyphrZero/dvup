@@ -11,9 +11,87 @@ use crate::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = concat!("dvup/", env!("CARGO_PKG_VERSION"));
 
+pub(crate) fn extract_versions(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
+    let mut output = String::from_utf8_lossy(stdout).into_owned();
+    if !stderr.is_empty() {
+        output.push('\n');
+        output.push_str(&String::from_utf8_lossy(stderr));
+    }
+    let plain = strip_terminal_escapes(&output);
+    let mut versions = plain
+        .split_whitespace()
+        .filter_map(version_token)
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+    versions
+}
+
+pub(crate) fn version_token(token: &str) -> Option<String> {
+    let candidate = token.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '.' | '-' | '+' | '_')
+    });
+    let numeric = candidate
+        .strip_prefix('v')
+        .or_else(|| candidate.strip_prefix('V'))
+        .unwrap_or(candidate);
+    (numeric.contains('.')
+        && numeric.chars().any(|character| character.is_ascii_digit())
+        && numeric.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | '_')
+        }))
+    .then(|| numeric.to_owned())
+}
+
+fn strip_terminal_escapes(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Escape {
+        None,
+        Start,
+        Csi,
+        Osc,
+        OscTerminator,
+    }
+
+    let mut state = Escape::None;
+    let mut output = String::with_capacity(input.len());
+    for character in input.chars() {
+        state = match state {
+            Escape::None if character == '\u{1b}' => Escape::Start,
+            Escape::None => {
+                if character == '\n' || character == '\t' || !character.is_control() {
+                    output.push(character);
+                }
+                Escape::None
+            }
+            Escape::Start if character == '[' => Escape::Csi,
+            Escape::Start if character == ']' => Escape::Osc,
+            Escape::Start => Escape::None,
+            Escape::Csi if ('@'..='~').contains(&character) => Escape::None,
+            Escape::Csi => Escape::Csi,
+            Escape::Osc if character == '\u{7}' => Escape::None,
+            Escape::Osc if character == '\u{1b}' => Escape::OscTerminator,
+            Escape::Osc => Escape::Osc,
+            Escape::OscTerminator if character == '\\' => Escape::None,
+            Escape::OscTerminator => Escape::Osc,
+        };
+    }
+    output
+}
+
 #[derive(Deserialize)]
 struct NpmRelease {
     version: String,
+}
+
+#[derive(Deserialize)]
+struct HomebrewFormula {
+    versions: HomebrewVersions,
+}
+
+#[derive(Deserialize)]
+struct HomebrewVersions {
+    stable: String,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +178,19 @@ pub fn fetch_latest(
     github_api_key: Option<&str>,
 ) -> std::result::Result<String, LatestVersionError> {
     let raw = match source {
+        LatestVersionSource::Homebrew { formula } => {
+            let url = format!(
+                "https://formulae.brew.sh/api/formula/{}.json",
+                encode_path_segment(formula)
+            );
+            let mut response = latest_request(agent, &url, None)?;
+            response
+                .body_mut()
+                .read_json::<HomebrewFormula>()
+                .map_err(LatestVersionError::invalid_response)?
+                .versions
+                .stable
+        }
         LatestVersionSource::Npm { package } => {
             let url = format!(
                 "https://registry.npmjs.org/{}/latest",
@@ -352,6 +443,15 @@ mod tests {
             "1.3.14"
         );
         assert!(normalize_release("release-without-version").is_err());
+    }
+
+    #[test]
+    fn extracts_versions_from_stdout_stderr_and_ansi_output() {
+        assert_eq!(
+            extract_versions(b"\x1b[32mtool 1.2.3\x1b[0m\n", b"runtime v4.5.6\n"),
+            ["1.2.3", "4.5.6"]
+        );
+        assert!(extract_versions(b"tool release", b"").is_empty());
     }
 
     #[test]

@@ -2,7 +2,9 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
-    process::{Command, ExitStatus},
+    process::{Command, ExitStatus, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(windows)]
@@ -22,6 +24,36 @@ pub enum ToolReadiness {
     TargetMissing,
     UpdaterMissing,
     Unsupported,
+}
+
+pub(crate) fn run_readonly_probe(program: &str, args: &[String]) -> Result<Output> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::CommandStart {
+            program: program.to_owned(),
+            source,
+        })?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(Into::into);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Err(Error::Message(format!(
+                "version probe `{program}` timed out after {} seconds",
+                PROBE_TIMEOUT.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 pub fn probe_spec(tool: &Tool, working_directory: &std::path::Path) -> CommandSpec {
@@ -215,7 +247,6 @@ fn capture_command(spec: &CommandSpec, mut command: Command) -> Result<CommandRe
 }
 
 /// Returns whether the command can be resolved without executing it.
-#[cfg(test)]
 pub fn is_available(spec: &CommandSpec) -> bool {
     commands_available(std::slice::from_ref(spec))[0]
 }

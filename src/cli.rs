@@ -12,8 +12,8 @@ use fs2::FileExt;
 use crate::{
     command,
     config::{
-        self, Config, ProcessAction, ProcessRule, Tool, ToolBackground, ToolProbe, UserConfig,
-        UserTool,
+        self, CommandSpec as UserCommandSpec, Config, ProcessAction, ProcessRule, Tool,
+        ToolBackground, ToolProbe, UserConfig,
     },
     datetime, detach, doctor,
     error::{Error, Result},
@@ -21,7 +21,7 @@ use crate::{
     process,
     settings::{AppSettings, NetworkSettings},
     state::StateDirs,
-    worker,
+    version, worker,
 };
 
 /// Lock-aware, cross-platform toolchain updater.
@@ -398,7 +398,8 @@ pub(crate) fn load_manifest(
     if let Some(path) = config_path {
         let working_directory = config_working_directory(&path)?;
         let mut manifest = Config::starter();
-        let custom = UserConfig::load(&path)?.resolve()?;
+        let custom = UserConfig::load(&path)?
+            .resolve_with_install_root(&state.root().join("github-tools"))?;
         manifest.tools.extend(custom.tools);
         manifest.github = custom.github;
         manifest.validate()?;
@@ -409,7 +410,8 @@ pub(crate) fn load_manifest(
     let mut customized = false;
     let custom_path = state.custom_config_path();
     if custom_path.is_file() {
-        let custom = UserConfig::load(&custom_path)?.resolve()?;
+        let custom = UserConfig::load(&custom_path)?
+            .resolve_with_install_root(&state.root().join("github-tools"))?;
         manifest.tools.extend(custom.tools);
         manifest.github = custom.github;
         customized = true;
@@ -467,9 +469,10 @@ fn add_custom_tool(
     command: Vec<String>,
     force: bool,
 ) -> Result<u8> {
-    let Some((program, args)) = command.split_first() else {
+    let Some((_program, _args)) = command.split_first() else {
         return Err(Error::EmptyCommand);
     };
+    validate_cli_probe(&name)?;
     state.ensure()?;
     let path = state.custom_config_path();
     let mut custom = if path.is_file() {
@@ -477,18 +480,19 @@ fn add_custom_tool(
     } else {
         UserConfig::empty()
     };
-    let conflicts = custom.tools.contains_key(&name) || Config::starter().tools.contains_key(&name);
+    let conflicts =
+        custom.commands.contains_key(&name) || Config::starter().tools.contains_key(&name);
     if conflicts && !force {
         return Err(Error::Message(format!(
             "tool `{name}` already exists; pass --force before the tool name to replace it"
         )));
     }
 
-    custom.tools.insert(
+    custom.save_command(
+        &path,
         name.clone(),
-        UserTool::custom(&name, program.clone(), args.to_vec()),
-    );
-    custom.save(&path)?;
+        UserCommandSpec::custom(&name, command.clone()),
+    )?;
     println!("added {name}: {}", command.join(" "));
     println!("stored: {}", path.display());
     println!("run: dvup update {name}");
@@ -501,9 +505,10 @@ fn edit_custom_tool(
     name: String,
     command: Vec<String>,
 ) -> Result<u8> {
-    let Some((program, args)) = command.split_first() else {
+    let Some((_program, _args)) = command.split_first() else {
         return Err(Error::EmptyCommand);
     };
+    validate_cli_probe(&name)?;
     let path = state.custom_config_path();
     if !path.is_file() {
         return Err(Error::Message(format!(
@@ -511,21 +516,21 @@ fn edit_custom_tool(
         )));
     }
     let mut custom = UserConfig::load(&path)?;
-    if !custom.tools.contains_key(original_name) {
+    if !custom.commands.contains_key(original_name) {
         return Err(Error::Message(format!(
             "custom tool `{original_name}` does not exist"
         )));
     }
     if name != original_name
-        && (custom.tools.contains_key(&name) || Config::starter().tools.contains_key(&name))
+        && (custom.commands.contains_key(&name) || Config::starter().tools.contains_key(&name))
     {
         return Err(Error::Message(format!("tool `{name}` already exists")));
     }
 
-    custom.tools.remove(original_name);
-    custom.tools.insert(
+    custom.commands.remove(original_name);
+    custom.commands.insert(
         name.clone(),
-        UserTool::custom(&name, program.clone(), args.to_vec()),
+        UserCommandSpec::custom(&name, command.clone()),
     );
     custom.save(&path)?;
     if name == original_name {
@@ -546,7 +551,7 @@ fn remove_custom_tool(state: StateDirs, name: &str) -> Result<u8> {
         )));
     }
     let mut custom = UserConfig::load(&path)?;
-    if custom.tools.remove(name).is_none() {
+    if custom.commands.remove(name).is_none() {
         return Err(Error::Message(format!(
             "custom tool `{name}` does not exist"
         )));
@@ -558,6 +563,22 @@ fn remove_custom_tool(state: StateDirs, name: &str) -> Result<u8> {
     }
     println!("removed {name}");
     Ok(0)
+}
+
+fn validate_cli_probe(name: &str) -> Result<()> {
+    let output = command::run_readonly_probe(name, &["--version".to_owned()])
+        .map_err(|error| {
+            Error::Message(format!(
+                "could not run `{name} --version`: {error}; use the TUI to configure a different version probe"
+            ))
+        })?;
+    let versions = version::extract_versions(&output.stdout, &output.stderr);
+    if !output.status.success() || versions.is_empty() {
+        return Err(Error::Message(format!(
+            "`{name} --version` did not return a detectable version; use the TUI to configure this command"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -773,11 +794,7 @@ fn init(state: &StateDirs, path: Option<PathBuf>, force: bool) -> Result<u8> {
         return Err(Error::FileExists(path));
     }
     let template = config::USER_TEMPLATE;
-    let _validated_template = UserConfig::parse(template)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, template)?;
+    UserConfig::save_template_text(&path, template)?;
     println!("created {}", path.display());
     Ok(0)
 }
@@ -1473,139 +1490,6 @@ mod tests {
     }
 
     #[test]
-    fn adds_merges_and_removes_user_tool() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let state = StateDirs::at(temporary.path().join("state"));
-
-        add_custom_tool(
-            state.clone(),
-            "claude".to_owned(),
-            vec!["claude".to_owned(), "install".to_owned()],
-            false,
-        )
-        .expect("add custom tool");
-        let stored = fs::read_to_string(state.custom_config_path()).expect("stored user manifest");
-        assert!(stored.contains("update = [\"claude\", \"install\"]"));
-        assert!(stored.contains("probe = [\"claude\", \"--version\"]"));
-        assert!(!stored.contains("program ="));
-        assert!(!stored.contains("background ="));
-        let (manifest, _, source) = load_manifest(None, &state).expect("merged manifest");
-        let claude = manifest.tools.get("claude").expect("custom tool");
-        assert_eq!(claude.program, "claude");
-        assert_eq!(claude.args, ["install"]);
-        assert_eq!(claude.processes.len(), 1);
-        assert_eq!(claude.processes[0].name, "claude");
-        assert_eq!(claude.processes[0].action, ProcessAction::Wait);
-        assert!(matches!(source, ManifestSource::Customized));
-
-        add_custom_tool(
-            state.clone(),
-            "claude".to_owned(),
-            vec![
-                "claude".to_owned(),
-                "install".to_owned(),
-                "--channel".to_owned(),
-                "stable".to_owned(),
-            ],
-            true,
-        )
-        .expect("edit custom tool");
-        let (manifest, _, _) = load_manifest(None, &state).expect("reload edited manifest");
-        assert_eq!(
-            manifest.tools["claude"].args,
-            ["install", "--channel", "stable"]
-        );
-
-        edit_custom_tool(
-            state.clone(),
-            "claude",
-            "claude-code".to_owned(),
-            vec!["claude".to_owned(), "update".to_owned()],
-        )
-        .expect("rename custom tool");
-        let custom =
-            UserConfig::load(&state.custom_config_path()).expect("load renamed custom tool");
-        assert!(!custom.tools.contains_key("claude"));
-        assert_eq!(custom.tools["claude-code"].update, ["claude", "update"]);
-        assert_eq!(custom.tools["claude-code"].wait_for, None);
-
-        assert!(
-            edit_custom_tool(
-                state.clone(),
-                "claude-code",
-                "brew".to_owned(),
-                vec!["brew".to_owned(), "upgrade".to_owned()],
-            )
-            .is_err()
-        );
-        let custom =
-            UserConfig::load(&state.custom_config_path()).expect("load after rejected rename");
-        assert!(custom.tools.contains_key("claude-code"));
-        assert!(!custom.tools.contains_key("brew"));
-
-        remove_custom_tool(state.clone(), "claude-code").expect("remove custom tool");
-        assert!(!state.custom_config_path().exists());
-    }
-
-    #[test]
-    fn removing_the_last_custom_tool_preserves_github_monitors() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let state = StateDirs::at(temporary.path().join("state"));
-        let mut custom = UserConfig::empty();
-        custom.tools.insert(
-            "example".to_owned(),
-            UserTool::custom("example", "example".to_owned(), vec!["update".to_owned()]),
-        );
-        custom.github.monitors.push(config::GithubReleaseMonitor {
-            name: "example-release".to_owned(),
-            repository: "owner/repository".to_owned(),
-            asset_regex: r"^example\.zip$".to_owned(),
-            target_directory: temporary.path().join("installed"),
-            format: config::ReleaseAssetFormat::Zip,
-            update_policy: config::ReleaseUpdatePolicy::Manual,
-            cleanup_installer: true,
-            max_download_bytes: 1024,
-            max_extracted_bytes: 2048,
-            max_extracted_files: 10,
-            strip_components: 0,
-            enabled: true,
-        });
-        custom
-            .save(&state.custom_config_path())
-            .expect("seed custom configuration");
-
-        remove_custom_tool(state.clone(), "example").expect("remove custom command");
-
-        let reloaded = UserConfig::load(&state.custom_config_path())
-            .expect("GitHub monitor keeps custom config alive");
-        assert!(reloaded.tools.is_empty());
-        assert_eq!(reloaded.github.monitors.len(), 1);
-        assert_eq!(reloaded.github.monitors[0].name, "example-release");
-    }
-
-    #[test]
-    fn explicit_user_manifest_layers_on_top_of_builtins() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let state = StateDirs::at(temporary.path().join("state"));
-        let path = temporary.path().join("tools.toml");
-        let mut user = UserConfig::empty();
-        user.tools.insert(
-            "example".to_owned(),
-            UserTool::custom("example", "example".to_owned(), vec!["update".to_owned()]),
-        );
-        user.save(&path).expect("save explicit user manifest");
-
-        let (manifest, _, source) =
-            load_manifest(Some(path), &state).expect("load layered explicit manifest");
-
-        assert!(matches!(source, ManifestSource::Explicit));
-        assert!(manifest.tools.contains_key("dvup"));
-        assert!(manifest.tools.contains_key("rustup"));
-        assert!(!manifest.tools.contains_key("codex"));
-        assert_eq!(manifest.tools["example"].args, ["update"]);
-    }
-
-    #[test]
     fn init_writes_only_the_clean_user_layer_template() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().join("state"));
@@ -1618,5 +1502,66 @@ mod tests {
         assert!(!contents.contains("[tools.dvup]"));
         assert!(!contents.contains("program ="));
         UserConfig::parse(&contents).expect("valid initialized user manifest");
+    }
+
+    #[test]
+    fn add_creates_a_custom_declaration_only_after_the_default_probe_succeeds() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let marker = temporary.path().join("update-was-run");
+
+        add_custom_tool(
+            state.clone(),
+            "rustc".to_owned(),
+            vec![marker.display().to_string()],
+            false,
+        )
+        .expect("rustc --version is available in the Rust test environment");
+
+        assert!(!marker.exists());
+        let saved = UserConfig::load(&state.custom_config_path()).expect("saved user config");
+        assert_eq!(
+            saved.commands.get("rustc"),
+            Some(&UserCommandSpec::Custom(config::CustomCommandSpec {
+                update: vec![marker.display().to_string()],
+                probe: vec!["rustc".to_owned(), "--version".to_owned()],
+                latest: None,
+            }))
+        );
+        assert!(saved.github.monitors.is_empty());
+    }
+
+    #[test]
+    fn default_cli_probe_rejects_output_without_a_version() {
+        let error = validate_cli_probe("this-dvup-test-command-does-not-exist")
+            .expect_err("missing probe must fail");
+
+        assert!(error.to_string().contains("use the TUI"));
+    }
+
+    #[test]
+    fn removing_the_last_command_preserves_the_github_partition() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        state.ensure().expect("state directory");
+        let path = state.custom_config_path();
+        let source = r#"
+[commands.example]
+type = "custom"
+update = ["example", "upgrade"]
+probe = ["example", "--version"]
+
+[github.monitors.example]
+repository = "owner/example"
+asset = { product = "example", os = "linux", arch = "x86_64", format = "tar_gz" }
+install = { type = "user_directory" }
+"#;
+        UserConfig::save_text(&path, source).expect("seed declarations");
+
+        remove_custom_tool(state, "example").expect("remove command");
+
+        let reloaded = UserConfig::load(&path).expect("GitHub partition remains");
+        assert!(reloaded.commands.is_empty());
+        assert!(reloaded.github.monitors.contains_key("example"));
     }
 }

@@ -10,7 +10,8 @@ fn default_loading_uses_global_custom_manifest_and_ignores_current_directory() {
     fs::write(
         state.join("dvup_custom.toml"),
         concat!(
-            "[tools.global_only]\n",
+            "[commands.global_only]\n",
+            "type = \"custom\"\n",
             "update = [\"global-updater\", \"update\"]\n",
             "probe = [\"global-tool\", \"--version\"]\n",
         ),
@@ -19,7 +20,8 @@ fn default_loading_uses_global_custom_manifest_and_ignores_current_directory() {
     fs::write(
         working_directory.join(".dvup.toml"),
         concat!(
-            "[tools.local_only]\n",
+            "[commands.local_only]\n",
+            "type = \"custom\"\n",
             "update = [\"local-updater\", \"update\"]\n",
             "probe = [\"local-tool\", \"--version\"]\n",
         ),

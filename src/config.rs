@@ -1,10 +1,10 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -88,14 +88,219 @@ pub struct Config {
     pub(crate) github: GithubMonitorConfig,
 }
 
-/// A user-authored manifest containing concise update and probe commands.
+/// A strict user-authored manifest containing concise declarations only.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {
-    #[serde(default)]
-    pub tools: BTreeMap<String, UserTool>,
-    #[serde(default, skip_serializing_if = "GithubMonitorConfig::is_empty")]
-    pub(crate) github: GithubMonitorConfig,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<String, CommandSpec>,
+    #[serde(default, skip_serializing_if = "GithubConfig::is_empty")]
+    pub(crate) github: GithubConfig,
+}
+
+/// One user-authored command declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CommandSpec {
+    Package(PackageCommandSpec),
+    Custom(CustomCommandSpec),
+}
+
+/// The package managers whose update behavior is locally deterministic.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PackageManager {
+    Homebrew,
+    Npm,
+    Pnpm,
+    Cargo,
+    Pipx,
+    Uv,
+}
+
+impl PackageManager {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Homebrew,
+        Self::Npm,
+        Self::Pnpm,
+        Self::Cargo,
+        Self::Pipx,
+        Self::Uv,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Homebrew => "homebrew",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Cargo => "cargo",
+            Self::Pipx => "pipx",
+            Self::Uv => "uv",
+        }
+    }
+
+    pub(crate) fn cycle(self, delta: isize) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|manager| *manager == self)
+            .expect("package manager belongs to ALL");
+        Self::ALL[(index as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize]
+    }
+
+    pub(crate) fn update_command(self, package: &str) -> Vec<String> {
+        match self {
+            Self::Homebrew => command_parts(&["brew", "upgrade", package]),
+            Self::Npm => {
+                command_parts(&["npm", "install", "--global", &format!("{package}@latest")])
+            }
+            Self::Pnpm => command_parts(&["pnpm", "add", "--global", &format!("{package}@latest")]),
+            Self::Cargo => command_parts(&["cargo", "install", package]),
+            Self::Pipx => command_parts(&["pipx", "upgrade", package]),
+            Self::Uv => command_parts(&["uv", "tool", "upgrade", package]),
+        }
+    }
+
+    pub(crate) fn update_version_command(self, package: &str) -> Option<Vec<String>> {
+        match self {
+            Self::Homebrew => None,
+            Self::Npm => Some(command_parts(&[
+                "npm",
+                "install",
+                "--global",
+                &format!("{package}@{{version}}"),
+            ])),
+            Self::Pnpm => Some(command_parts(&[
+                "pnpm",
+                "add",
+                "--global",
+                &format!("{package}@{{version}}"),
+            ])),
+            Self::Cargo => Some(command_parts(&[
+                "cargo",
+                "install",
+                package,
+                "--version",
+                "{version}",
+            ])),
+            Self::Pipx => Some(command_parts(&[
+                "pipx",
+                "install",
+                "--force",
+                &format!("{package}=={{version}}"),
+            ])),
+            Self::Uv => Some(command_parts(&[
+                "uv",
+                "tool",
+                "install",
+                "--force",
+                &format!("{package}=={{version}}"),
+            ])),
+        }
+    }
+
+    pub(crate) fn latest_source(self, package: &str) -> LatestVersionSource {
+        match self {
+            Self::Homebrew => LatestVersionSource::Homebrew {
+                formula: package.to_owned(),
+            },
+            Self::Npm | Self::Pnpm => LatestVersionSource::Npm {
+                package: package.to_owned(),
+            },
+            Self::Cargo => LatestVersionSource::CratesIo {
+                package: package.to_owned(),
+            },
+            Self::Pipx | Self::Uv => LatestVersionSource::Pypi {
+                package: package.to_owned(),
+            },
+        }
+    }
+
+    pub(crate) fn platforms(self) -> Vec<String> {
+        match self {
+            Self::Homebrew => vec!["macos".to_owned(), "linux".to_owned()],
+            Self::Npm | Self::Pnpm | Self::Cargo | Self::Pipx | Self::Uv => Vec::new(),
+        }
+    }
+
+    pub(crate) const fn resource_group(self) -> &'static str {
+        match self {
+            Self::Homebrew => "homebrew",
+            Self::Npm | Self::Pnpm => "node-global",
+            Self::Cargo => "cargo-global",
+            Self::Pipx | Self::Uv => "python-global",
+        }
+    }
+}
+
+fn command_parts(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn default_probe_args() -> Vec<String> {
+    vec!["--version".to_owned()]
+}
+
+fn is_default_probe_args(args: &[String]) -> bool {
+    args == ["--version"]
+}
+
+/// A package-manager-backed command declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageCommandSpec {
+    pub(crate) manager: PackageManager,
+    pub(crate) package: String,
+    pub(crate) executable: String,
+    #[serde(
+        default = "default_probe_args",
+        skip_serializing_if = "is_default_probe_args"
+    )]
+    pub(crate) probe_args: Vec<String>,
+}
+
+/// A self-updating command declaration with an optional authoritative source.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomCommandSpec {
+    pub(crate) update: Vec<String>,
+    pub(crate) probe: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) latest: Option<LatestVersionSource>,
+}
+
+/// GitHub Release declarations keyed by their monitor name.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GithubConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) monitors: BTreeMap<String, GithubMonitorSpec>,
+}
+
+impl GithubConfig {
+    fn is_empty(&self) -> bool {
+        self.monitors.is_empty()
+    }
+}
+
+/// One concise GitHub Release declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GithubMonitorSpec {
+    pub(crate) repository: String,
+    pub(crate) asset: AssetSelector,
+    pub(crate) install: GithubInstallSpec,
+    #[serde(default, skip_serializing_if = "is_manual_release_update_policy")]
+    pub(crate) update_policy: ReleaseUpdatePolicy,
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
+    pub(crate) enabled: bool,
+}
+
+/// Installation behavior inferred after the user chooses a real release asset.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum GithubInstallSpec {
+    UserDirectory,
+    MacosApplication { application: String },
 }
 
 /// GitHub Release repositories managed from the user-authored manifest.
@@ -113,6 +318,311 @@ pub(crate) enum ReleaseAssetFormat {
     Zip,
     TarGz,
     Dmg,
+}
+
+impl ReleaseAssetFormat {
+    pub(crate) fn matches_name(self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        match self {
+            Self::File => {
+                !name.ends_with(".zip")
+                    && !name.ends_with(".tar.gz")
+                    && !name.ends_with(".tgz")
+                    && !name.ends_with(".dmg")
+            }
+            Self::Zip => name.ends_with(".zip"),
+            Self::TarGz => name.ends_with(".tar.gz") || name.ends_with(".tgz"),
+            Self::Dmg => name.ends_with(".dmg"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AssetOperatingSystem {
+    Macos,
+    Linux,
+    Windows,
+}
+
+impl AssetOperatingSystem {
+    pub(crate) fn current() -> Option<Self> {
+        match std::env::consts::OS {
+            "macos" => Some(Self::Macos),
+            "linux" => Some(Self::Linux),
+            "windows" => Some(Self::Windows),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Macos => &["macos", "darwin", "osx", "apple-darwin"],
+            Self::Linux => &["linux", "unknown-linux"],
+            Self::Windows => &["windows", "win32", "win64", "pc-windows"],
+        }
+    }
+
+    pub(crate) fn matches_name(self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        self.aliases()
+            .iter()
+            .any(|alias| contains_identifier(&name, alias))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AssetArchitecture {
+    Aarch64,
+    X86_64,
+}
+
+impl AssetArchitecture {
+    pub(crate) fn current() -> Option<Self> {
+        match std::env::consts::ARCH {
+            "aarch64" => Some(Self::Aarch64),
+            "x86_64" => Some(Self::X86_64),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Aarch64 => &["aarch64", "arm64"],
+            Self::X86_64 => &["x86_64", "x86-64", "amd64", "x64"],
+        }
+    }
+
+    pub(crate) fn matches_name(self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        self.aliases()
+            .iter()
+            .any(|alias| contains_identifier(&name, alias))
+    }
+}
+
+/// A semantic selector derived from one explicitly chosen release asset.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssetSelector {
+    pub(crate) product: String,
+    pub(crate) os: AssetOperatingSystem,
+    pub(crate) arch: AssetArchitecture,
+    pub(crate) format: ReleaseAssetFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) variant: Option<String>,
+}
+
+impl AssetSelector {
+    pub(crate) fn from_release_asset(asset_name: &str, release_tag: &str) -> Result<Self> {
+        let os = AssetOperatingSystem::current().ok_or_else(|| {
+            Error::Message(format!(
+                "GitHub Release assets are unsupported on {}",
+                std::env::consts::OS
+            ))
+        })?;
+        let arch = AssetArchitecture::current().ok_or_else(|| {
+            Error::Message(format!(
+                "GitHub Release assets are unsupported on {}",
+                std::env::consts::ARCH
+            ))
+        })?;
+        let format = [
+            ReleaseAssetFormat::TarGz,
+            ReleaseAssetFormat::Zip,
+            ReleaseAssetFormat::Dmg,
+            ReleaseAssetFormat::File,
+        ]
+        .into_iter()
+        .find(|format| format.matches_name(asset_name))
+        .expect("plain file format matches every remaining name");
+        let lower = asset_name.to_ascii_lowercase();
+        let stem = lower
+            .strip_suffix(".tar.gz")
+            .or_else(|| lower.strip_suffix(".tgz"))
+            .or_else(|| lower.strip_suffix(".zip"))
+            .or_else(|| lower.strip_suffix(".dmg"))
+            .unwrap_or(&lower);
+        let tagged_boundary = release_version_boundary(stem, release_tag);
+        let inferred_boundaries = tagged_boundary.is_none().then(|| {
+            stem.char_indices().filter_map(|(index, character)| {
+                if !character.is_ascii_digit() || index == 0 {
+                    return None;
+                }
+                let previous = stem[..index].chars().next_back()?;
+                if "-_.".contains(previous) {
+                    return Some(index);
+                }
+                if matches!(previous, 'v' | 'V') {
+                    let version_prefix = index - previous.len_utf8();
+                    if version_prefix > 0
+                        && stem[..version_prefix]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|separator| "-_.".contains(separator))
+                    {
+                        return Some(version_prefix);
+                    }
+                }
+                None
+            })
+        });
+        let boundary = tagged_boundary
+            .into_iter()
+            .chain(inferred_boundaries.into_iter().flatten())
+            .chain(
+                os.aliases()
+                    .iter()
+                    .chain(arch.aliases())
+                    .filter_map(|alias| {
+                        stem.match_indices(alias)
+                            .map(|(index, _)| index)
+                            .find(|index| {
+                                *index > 0
+                                    && stem[..*index]
+                                        .chars()
+                                        .next_back()
+                                        .is_some_and(|previous| "-_.".contains(previous))
+                            })
+                    }),
+            )
+            .min()
+            .unwrap_or(stem.len());
+        let product = stem[..boundary]
+            .trim_end_matches(|character| "-_.".contains(character))
+            .to_owned();
+        if product.is_empty() {
+            return Err(Error::Message(format!(
+                "could not infer a product identifier from release asset `{asset_name}`"
+            )));
+        }
+        let variant = ["musl", "gnu", "portable"]
+            .into_iter()
+            .find(|variant| contains_identifier(stem, variant))
+            .map(str::to_owned);
+        let selector = Self {
+            product,
+            os,
+            arch,
+            format,
+            variant,
+        };
+        selector.validate("selected release asset")?;
+        Ok(selector)
+    }
+
+    pub(crate) fn matches(&self, asset_name: &str) -> bool {
+        let normalized = asset_name.to_ascii_lowercase();
+        contains_identifier(&normalized, &self.product)
+            && self
+                .os
+                .aliases()
+                .iter()
+                .any(|alias| contains_identifier(&normalized, alias))
+            && self
+                .arch
+                .aliases()
+                .iter()
+                .any(|alias| contains_identifier(&normalized, alias))
+            && self.format.matches_name(&normalized)
+            && self
+                .variant
+                .as_deref()
+                .is_none_or(|variant| contains_identifier(&normalized, variant))
+    }
+
+    pub(crate) fn select_unique<'a, I>(&self, assets: I) -> Result<&'a str>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let matches = assets
+            .into_iter()
+            .filter(|asset| self.matches(asset))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [only] => Ok(*only),
+            [] => Err(Error::Message(
+                "no compatible release asset matches the semantic selector".to_owned(),
+            )),
+            _ => Err(Error::Message(format!(
+                "semantic selector matches {} release assets; choose the release asset again",
+                matches.len()
+            ))),
+        }
+    }
+
+    fn validate(&self, context: &str) -> Result<()> {
+        validate_identifier(context, "asset product", &self.product)?;
+        if let Some(variant) = &self.variant {
+            validate_identifier(context, "asset variant", variant)?;
+        }
+        Ok(())
+    }
+}
+
+fn release_version_boundary(stem: &str, release_tag: &str) -> Option<usize> {
+    let tag = release_tag.trim().to_ascii_lowercase();
+    let mut candidates = vec![tag.clone()];
+    if let Some(version_start) = tag.find(|character: char| character.is_ascii_digit()) {
+        let version = &tag[version_start..];
+        candidates.push(version.to_owned());
+        candidates.push(format!("v{version}"));
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
+    candidates.dedup();
+    candidates.into_iter().find_map(|candidate| {
+        if candidate.is_empty() {
+            return None;
+        }
+        stem.match_indices(&candidate)
+            .filter_map(|(start, value)| {
+                let end = start + value.len();
+                let left_boundary = stem[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|character| !character.is_ascii_alphanumeric());
+                let right_boundary = stem[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_ascii_alphanumeric());
+                (left_boundary && right_boundary).then_some(start)
+            })
+            .max()
+    })
+}
+
+fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(&needle).any(|(start, value)| {
+        let end = start + value.len();
+        let left = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric());
+        let right = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric());
+        left && right
+    })
+}
+
+fn validate_identifier(context: &str, label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.trim() != value
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(Error::InvalidConfig(format!(
+            "{context} has an invalid {label} `{value}`"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,18 +650,10 @@ fn is_enabled(value: &bool) -> bool {
 pub(crate) struct GithubReleaseMonitor {
     pub(crate) name: String,
     pub(crate) repository: String,
-    pub(crate) asset_regex: String,
+    pub(crate) asset: AssetSelector,
     pub(crate) target_directory: PathBuf,
-    pub(crate) format: ReleaseAssetFormat,
     #[serde(default, skip_serializing_if = "is_manual_release_update_policy")]
     pub(crate) update_policy: ReleaseUpdatePolicy,
-    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
-    pub(crate) cleanup_installer: bool,
-    pub(crate) max_download_bytes: u64,
-    pub(crate) max_extracted_bytes: u64,
-    pub(crate) max_extracted_files: usize,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub(crate) strip_components: usize,
     pub(crate) enabled: bool,
 }
 
@@ -177,37 +679,15 @@ impl GithubReleaseMonitor {
                 self.name
             )));
         }
-        if self.asset_regex.is_empty() || self.asset_regex.trim() != self.asset_regex {
-            return Err(Error::InvalidConfig(format!(
-                "GitHub release monitor `{}` asset_regex cannot be empty or contain surrounding whitespace",
-                self.name
-            )));
-        }
-        Regex::new(&self.asset_regex).map_err(|error| {
-            Error::InvalidConfig(format!(
-                "GitHub release monitor `{}` has invalid asset_regex: {error}",
-                self.name
-            ))
-        })?;
+        self.asset
+            .validate(&format!("GitHub release monitor `{}`", self.name))?;
         if !self.target_directory.is_absolute() {
             return Err(Error::InvalidConfig(format!(
                 "GitHub release monitor `{}` target_directory must be an absolute path",
                 self.name
             )));
         }
-        if self.format == ReleaseAssetFormat::File && self.strip_components != 0 {
-            return Err(Error::InvalidConfig(format!(
-                "GitHub release monitor `{}` cannot strip components from a plain file",
-                self.name
-            )));
-        }
-        if self.format == ReleaseAssetFormat::Dmg {
-            if self.strip_components != 0 {
-                return Err(Error::InvalidConfig(format!(
-                    "GitHub release monitor `{}` cannot strip components from a DMG",
-                    self.name
-                )));
-            }
+        if self.asset.format == ReleaseAssetFormat::Dmg {
             #[cfg(not(target_os = "macos"))]
             return Err(Error::InvalidConfig(format!(
                 "GitHub release monitor `{}` uses DMG installation outside macOS",
@@ -225,40 +705,6 @@ impl GithubReleaseMonitor {
                     self.name
                 )));
             }
-        }
-        if self.max_download_bytes == 0 || self.max_download_bytes > 8 * 1024 * 1024 * 1024 {
-            return Err(Error::InvalidConfig(format!(
-                "GitHub release monitor `{}` max_download_bytes must be between 1 and 8589934592",
-                self.name
-            )));
-        }
-        match self.format {
-            ReleaseAssetFormat::File
-                if self.max_extracted_bytes != 0 || self.max_extracted_files != 0 =>
-            {
-                return Err(Error::InvalidConfig(format!(
-                    "GitHub release monitor `{}` plain files cannot set extraction limits",
-                    self.name
-                )));
-            }
-            ReleaseAssetFormat::Zip | ReleaseAssetFormat::TarGz | ReleaseAssetFormat::Dmg
-                if self.max_extracted_bytes == 0
-                    || self.max_extracted_bytes > 16 * 1024 * 1024 * 1024
-                    || self.max_extracted_files == 0
-                    || self.max_extracted_files > 100_000 =>
-            {
-                return Err(Error::InvalidConfig(format!(
-                    "GitHub release monitor `{}` archive limits must allow 1..=17179869184 bytes and 1..=100000 files",
-                    self.name
-                )));
-            }
-            _ => {}
-        }
-        if self.strip_components > 16 {
-            return Err(Error::InvalidConfig(format!(
-                "GitHub release monitor `{}` strip_components cannot exceed 16",
-                self.name
-            )));
         }
         Ok(())
     }
@@ -290,47 +736,6 @@ impl GithubMonitorConfig {
         }
         Ok(())
     }
-}
-
-const fn is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
-/// One user-authored tool definition.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct UserTool {
-    pub update: Vec<String>,
-    pub probe: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest: Option<LatestVersionSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub update_version: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "is_auto_background")]
-    pub background: ToolBackground,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait_for: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub processes: Vec<ProcessRule>,
-    #[serde(
-        default = "default_lock_timeout_secs",
-        skip_serializing_if = "is_default_lock_timeout_secs"
-    )]
-    pub lock_timeout_secs: u64,
-    #[serde(
-        default = "default_retries",
-        skip_serializing_if = "is_default_retries"
-    )]
-    pub retries: u32,
-    #[serde(
-        default = "default_retry_delay_secs",
-        skip_serializing_if = "is_default_retry_delay_secs"
-    )]
-    pub retry_delay_secs: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub platforms: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource_group: Option<String>,
 }
 
 /// One tool update definition.
@@ -374,6 +779,7 @@ pub struct ToolProbe {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LatestVersionSource {
+    Homebrew { formula: String },
     Npm { package: String },
     Pypi { package: String },
     CratesIo { package: String },
@@ -384,19 +790,28 @@ pub enum LatestVersionSource {
 impl LatestVersionSource {
     pub(crate) fn validate(&self, context: &str) -> Result<()> {
         let value = match self {
+            Self::Homebrew { formula } => formula,
             Self::Npm { package } | Self::Pypi { package } | Self::CratesIo { package } => package,
             Self::GithubRelease { repository } | Self::GithubTag { repository } => repository,
         };
-        if value.trim().is_empty() {
+        if value.is_empty()
+            || value.trim() != value
+            || value.chars().any(char::is_whitespace)
+            || value.chars().any(char::is_control)
+        {
             return Err(Error::InvalidConfig(format!(
-                "{context} has an empty latest-version source"
+                "{context} has an invalid latest-version source identifier"
             )));
         }
         if matches!(self, Self::GithubRelease { .. } | Self::GithubTag { .. }) {
-            let mut parts = value.split('/');
-            if parts.next().is_none_or(str::is_empty)
-                || parts.next().is_none_or(str::is_empty)
-                || parts.next().is_some()
+            let parts = value.split('/').collect::<Vec<_>>();
+            if parts.len() != 2
+                || parts.iter().any(|part| {
+                    part.is_empty()
+                        || !part.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || "-_.".contains(character)
+                        })
+                })
             {
                 return Err(Error::InvalidConfig(format!(
                     "{context} GitHub repository must use owner/name"
@@ -609,6 +1024,7 @@ fn inferred_resource_group(program: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn inferred_platforms(program: &str) -> &'static [&'static str] {
     match normalized_executable_name(program).as_str() {
         "brew" => &["macos", "linux"],
@@ -617,116 +1033,181 @@ fn inferred_platforms(program: &str) -> &'static [&'static str] {
     }
 }
 
-impl UserTool {
-    /// Validates one complete user-authored tool in its name-dependent context.
-    pub(crate) fn validate_for_name(&self, name: &str) -> Result<()> {
-        let mut candidate = UserConfig::empty();
-        candidate.tools.insert(name.to_owned(), self.clone());
-        candidate.resolve().map(|_| ())
+impl CommandSpec {
+    pub(crate) fn compile(&self, name: &str) -> Result<Tool> {
+        validate_identifier("command declaration", "name", name)?;
+        let tool = match self {
+            Self::Package(spec) => {
+                validate_package_name(name, &spec.package)?;
+                validate_identifier(name, "executable", &spec.executable)?;
+                if spec.probe_args.iter().any(|argument| argument.is_empty()) {
+                    return Err(Error::InvalidConfig(format!(
+                        "command `{name}` probe_args cannot contain an empty argument"
+                    )));
+                }
+                let update = spec.manager.update_command(&spec.package);
+                let (program, args) = split_user_command(name, "update", update)?;
+                Tool {
+                    program,
+                    args,
+                    probe: ToolProbe {
+                        program: spec.executable.clone(),
+                        args: spec.probe_args.clone(),
+                    },
+                    latest: Some(spec.manager.latest_source(&spec.package)),
+                    update_version: spec.manager.update_version_command(&spec.package),
+                    background: ToolBackground::Auto,
+                    processes: vec![ProcessRule::wait(spec.executable.clone())],
+                    lock_timeout_secs: default_lock_timeout_secs(),
+                    retries: default_retries(),
+                    retry_delay_secs: default_retry_delay_secs(),
+                    platforms: spec.manager.platforms(),
+                    resource_group: Some(spec.manager.resource_group().to_owned()),
+                }
+            }
+            Self::Custom(spec) => {
+                if matches!(
+                    spec.latest.as_ref(),
+                    Some(LatestVersionSource::Homebrew { .. })
+                ) {
+                    return Err(Error::InvalidConfig(format!(
+                        "custom command `{name}` does not support a Homebrew latest-version source"
+                    )));
+                }
+                let (program, args) = split_user_command(name, "update", spec.update.clone())?;
+                let (probe_program, probe_args) =
+                    split_user_command(name, "probe", spec.probe.clone())?;
+                let resource_group = inferred_resource_group(&program).map(str::to_owned);
+                Tool {
+                    program,
+                    args,
+                    probe: ToolProbe {
+                        program: probe_program.clone(),
+                        args: probe_args,
+                    },
+                    latest: spec.latest.clone(),
+                    update_version: None,
+                    background: ToolBackground::Auto,
+                    processes: vec![ProcessRule::wait(probe_program)],
+                    lock_timeout_secs: default_lock_timeout_secs(),
+                    retries: default_retries(),
+                    retry_delay_secs: default_retry_delay_secs(),
+                    platforms: Vec::new(),
+                    resource_group,
+                }
+            }
+        };
+        if let Some(latest) = &tool.latest {
+            latest.validate(&format!("command `{name}`"))?;
+        }
+        validate_update_version_template(name, tool.update_version.as_deref())?;
+        Ok(tool)
     }
 
-    /// Creates a concise user definition with an explicit version probe.
-    pub fn custom(name: &str, program: String, args: Vec<String>) -> Self {
-        let mut update = Vec::with_capacity(args.len() + 1);
-        update.push(program.clone());
-        update.extend(args);
-        Self {
+    pub(crate) fn custom(name: &str, update: Vec<String>) -> Self {
+        Self::Custom(CustomCommandSpec {
             update,
             probe: vec![name.to_owned(), "--version".to_owned()],
             latest: None,
-            update_version: None,
-            background: ToolBackground::Auto,
-            wait_for: None,
-            processes: Vec::new(),
-            lock_timeout_secs: default_lock_timeout_secs(),
-            retries: default_retries(),
-            retry_delay_secs: default_retry_delay_secs(),
-            platforms: inferred_platforms(&program)
-                .iter()
-                .map(|platform| (*platform).to_owned())
-                .collect(),
-            resource_group: inferred_resource_group(&program).map(str::to_owned),
-        }
-    }
-
-    /// Converts a resolved tool back into the concise user representation.
-    pub fn from_tool(name: &str, tool: &Tool) -> Self {
-        let mut update = Vec::with_capacity(tool.args.len() + 1);
-        update.push(tool.program.clone());
-        update.extend(tool.args.clone());
-        let mut probe = Vec::with_capacity(tool.probe.args.len() + 1);
-        probe.push(tool.probe.program.clone());
-        probe.extend(tool.probe.args.clone());
-        let default_wait = [name.to_owned()];
-        let mut wait_for = Vec::new();
-        let mut processes = Vec::new();
-        for rule in &tool.processes {
-            if rule.action == ProcessAction::Wait
-                && rule.command_contains.is_none()
-                && rule.terminate_grace_secs == default_terminate_grace_secs()
-            {
-                wait_for.push(rule.name.clone());
-            } else {
-                processes.push(rule.clone());
-            }
-        }
-        Self {
-            update,
-            probe,
-            latest: tool.latest.clone(),
-            update_version: tool.update_version.clone(),
-            background: tool.background,
-            wait_for: (wait_for.as_slice() != default_wait).then_some(wait_for),
-            processes,
-            lock_timeout_secs: tool.lock_timeout_secs,
-            retries: tool.retries,
-            retry_delay_secs: tool.retry_delay_secs,
-            platforms: tool.platforms.clone(),
-            resource_group: tool.resource_group.clone(),
-        }
-    }
-
-    fn resolve(self, name: &str) -> Result<Tool> {
-        let (program, args) = split_user_command(name, "update", self.update)?;
-        let (probe_program, probe_args) = split_user_command(name, "probe", self.probe)?;
-        let mut processes = self.processes;
-        processes.extend(
-            self.wait_for
-                .unwrap_or_else(|| vec![name.to_owned()])
-                .into_iter()
-                .map(ProcessRule::wait),
-        );
-        Ok(Tool {
-            program,
-            args,
-            probe: ToolProbe {
-                program: probe_program,
-                args: probe_args,
-            },
-            latest: self.latest,
-            update_version: self.update_version,
-            background: self.background,
-            processes,
-            lock_timeout_secs: self.lock_timeout_secs,
-            retries: self.retries,
-            retry_delay_secs: self.retry_delay_secs,
-            platforms: self.platforms,
-            resource_group: self.resource_group,
         })
     }
 }
+
+fn validate_package_name(context: &str, package: &str) -> Result<()> {
+    if package.is_empty()
+        || package.trim() != package
+        || package.chars().any(char::is_whitespace)
+        || package.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidConfig(format!(
+            "command `{context}` has an invalid package name"
+        )));
+    }
+    Ok(())
+}
+
+impl GithubMonitorSpec {
+    fn validate(&self, name: &str) -> Result<()> {
+        validate_identifier("GitHub monitor declaration", "name", name)?;
+        LatestVersionSource::GithubRelease {
+            repository: self.repository.clone(),
+        }
+        .validate(&format!("GitHub monitor `{name}`"))?;
+        self.asset.validate(&format!("GitHub monitor `{name}`"))?;
+        match (&self.install, self.asset.format) {
+            (GithubInstallSpec::UserDirectory, ReleaseAssetFormat::Dmg) => {
+                return Err(Error::InvalidConfig(format!(
+                    "GitHub monitor `{name}` must install a DMG as a macOS application"
+                )));
+            }
+            (GithubInstallSpec::MacosApplication { application }, ReleaseAssetFormat::Dmg) => {
+                if application.trim() != application
+                    || !application.ends_with(".app")
+                    || Path::new(application)
+                        .file_name()
+                        .and_then(|part| part.to_str())
+                        != Some(application)
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "GitHub monitor `{name}` application must be one .app directory name"
+                    )));
+                }
+                if self.asset.os != AssetOperatingSystem::Macos {
+                    return Err(Error::InvalidConfig(format!(
+                        "GitHub monitor `{name}` DMG asset must target macOS"
+                    )));
+                }
+            }
+            (GithubInstallSpec::MacosApplication { .. }, _) => {
+                return Err(Error::InvalidConfig(format!(
+                    "GitHub monitor `{name}` macOS application install requires a DMG asset"
+                )));
+            }
+            (GithubInstallSpec::UserDirectory, _) => {}
+        }
+        Ok(())
+    }
+
+    fn compile(&self, name: &str, install_root: &Path) -> Result<GithubReleaseMonitor> {
+        self.validate(name)?;
+        let target_directory = match &self.install {
+            GithubInstallSpec::UserDirectory => install_root.join(name),
+            GithubInstallSpec::MacosApplication { application } => {
+                Path::new("/Applications").join(application)
+            }
+        };
+        if !target_directory.is_absolute() {
+            return Err(Error::InvalidConfig(format!(
+                "GitHub install root must be absolute: {}",
+                install_root.display()
+            )));
+        }
+        Ok(GithubReleaseMonitor {
+            name: name.to_owned(),
+            repository: self.repository.clone(),
+            asset: self.asset.clone(),
+            target_directory,
+            update_policy: self.update_policy,
+            enabled: self.enabled,
+        })
+    }
+}
+
+pub(crate) const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_EXTRACTED_FILES: usize = 50_000;
 
 impl UserConfig {
     /// Returns an empty user manifest ready to receive custom tools.
     pub fn empty() -> Self {
         Self {
-            tools: BTreeMap::new(),
-            github: GithubMonitorConfig::default(),
+            commands: BTreeMap::new(),
+            github: GithubConfig::default(),
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.tools.is_empty() && self.github.is_empty()
+        self.commands.is_empty() && self.github.is_empty()
     }
 
     /// Reads and validates a user-authored manifest.
@@ -739,40 +1220,101 @@ impl UserConfig {
 
     /// Parses and validates a user-authored manifest.
     pub fn parse(contents: &str) -> Result<Self> {
-        let config: Self = toml::from_str(contents)?;
-        config.clone().resolve()?;
+        let config: Self = toml::from_str(contents).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "user TOML must use the current [commands.<name>] and [github.monitors.<name>] schema; legacy user formats are unsupported: {error}"
+            ))
+        })?;
+        config.validate_and_compile()?;
         Ok(config)
     }
 
-    /// Resolves concise user definitions into the complete runtime model.
-    pub fn resolve(self) -> Result<Config> {
+    fn validate(&self) -> Result<()> {
+        for (name, command) in &self.commands {
+            command.compile(name)?;
+        }
+        for (name, monitor) in &self.github.monitors {
+            monitor.validate(name)?;
+        }
+        Ok(())
+    }
+
+    fn validate_and_compile(&self) -> Result<()> {
+        self.validate()?;
+        let install_root = std::env::current_dir()?.join(".dvup-github-validation");
+        self.clone().resolve_with_install_root(&install_root)?;
+        Ok(())
+    }
+
+    pub(crate) fn resolve_with_install_root(self, install_root: &Path) -> Result<Config> {
         let mut tools = BTreeMap::new();
-        for (name, user_tool) in self.tools {
-            if name.trim().is_empty() {
-                return Err(Error::InvalidConfig(
-                    "tool names cannot be empty".to_owned(),
-                ));
-            }
-            tools.insert(name.clone(), user_tool.resolve(&name)?);
+        for (name, command) in self.commands {
+            tools.insert(name.clone(), command.compile(&name)?);
+        }
+        let mut monitors = Vec::with_capacity(self.github.monitors.len());
+        for (name, monitor) in self.github.monitors {
+            monitors.push(monitor.compile(&name, install_root)?);
         }
         let config = Config {
             tools,
-            github: self.github,
+            github: GithubMonitorConfig { monitors },
         };
         config.validate_inner(false)?;
         Ok(config)
     }
 
+    pub(crate) fn save_command(
+        &mut self,
+        path: &Path,
+        name: String,
+        command: CommandSpec,
+    ) -> Result<()> {
+        command.compile(&name)?;
+        self.commands.insert(name, command);
+        self.save(path)
+    }
+
+    pub(crate) fn save_github_monitor(
+        &mut self,
+        path: &Path,
+        name: String,
+        monitor: GithubMonitorSpec,
+    ) -> Result<()> {
+        monitor.validate(&name)?;
+        self.github.monitors.insert(name, monitor);
+        self.save(path)
+    }
+
     /// Validates and atomically saves a user-authored manifest.
     pub fn save(&self, path: &Path) -> Result<()> {
-        self.clone().resolve()?;
+        self.validate_and_compile()?;
+        if self.is_empty() {
+            return remove_user_config(path);
+        }
         write_atomic(path, toml::to_string(self)?.as_bytes())
     }
 
     /// Validates and atomically saves TOML while preserving editor formatting.
     pub fn save_text(path: &Path, contents: &str) -> Result<()> {
+        let config = Self::parse(contents)?;
+        if config.is_empty() {
+            return remove_user_config(path);
+        }
+        write_atomic(path, contents.as_bytes())
+    }
+
+    /// Validates and atomically writes the comment-only starter created by `dvup init`.
+    pub(crate) fn save_template_text(path: &Path, contents: &str) -> Result<()> {
         Self::parse(contents)?;
         write_atomic(path, contents.as_bytes())
+    }
+}
+
+fn remove_user_config(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -901,16 +1443,52 @@ fn validate_target_version(version: &str) -> Result<()> {
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".dvup-config.")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+    persist_config_file(temporary, path)
+}
+
+#[cfg(windows)]
+fn persist_config_file(mut temporary: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    let mut retry = 0_u32;
+    loop {
+        match temporary.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if retry < 4 && matches!(error.error.raw_os_error(), Some(5 | 32)) {
+                    temporary = error.file;
+                    retry += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(retry) * 25));
+                    continue;
+                }
+                return Err(Error::ConfigWrite {
+                    path: path.to_path_buf(),
+                    source: error.error,
+                });
+            }
+        }
     }
-    let temporary = path.with_extension("toml.tmp");
-    fs::write(&temporary, contents)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temporary, path)?;
-    Ok(())
+}
+
+#[cfg(not(windows))]
+fn persist_config_file(temporary: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| Error::ConfigWrite {
+            path: path.to_path_buf(),
+            source: error.error,
+        })
 }
 
 fn normalize_process_name(name: &str) -> String {
@@ -925,28 +1503,12 @@ pub(crate) const fn default_lock_timeout_secs() -> u64 {
     86_400
 }
 
-fn is_default_lock_timeout_secs(value: &u64) -> bool {
-    *value == default_lock_timeout_secs()
-}
-
 pub(crate) const fn default_retries() -> u32 {
     8
 }
 
-fn is_default_retries(value: &u32) -> bool {
-    *value == default_retries()
-}
-
 pub(crate) const fn default_retry_delay_secs() -> u64 {
     2
-}
-
-fn is_default_retry_delay_secs(value: &u64) -> bool {
-    *value == default_retry_delay_secs()
-}
-
-fn is_auto_background(value: &ToolBackground) -> bool {
-    *value == ToolBackground::Auto
 }
 
 const fn default_terminate_grace_secs() -> u64 {
@@ -1172,392 +1734,6 @@ args = ["--version"]
     }
 
     #[test]
-    fn user_manifest_requires_update_and_probe_commands() {
-        let missing_probe = r#"
-[tools.example]
-update = ["example", "update"]
-"#;
-        let missing_update = r#"
-[tools.example]
-probe = ["example", "--version"]
-"#;
-
-        assert!(
-            UserConfig::parse(missing_probe)
-                .expect_err("probe must be explicit")
-                .to_string()
-                .contains("missing field `probe`")
-        );
-        assert!(
-            UserConfig::parse(missing_update)
-                .expect_err("update must be explicit")
-                .to_string()
-                .contains("missing field `update`")
-        );
-    }
-
-    #[test]
-    fn user_manifest_is_concise_and_resolves_to_the_runtime_model() {
-        let input = r#"[tools.claude]
-update = ["claude", "update"]
-probe = ["claude", "--version"]
-"#;
-
-        let user = UserConfig::parse(input).expect("parse concise user manifest");
-        let encoded = toml::to_string(&user).expect("serialize user manifest");
-        let runtime = user.resolve().expect("resolve user manifest");
-        let claude = &runtime.tools["claude"];
-
-        assert!(encoded.contains("update = [\"claude\", \"update\"]"));
-        assert!(encoded.contains("probe = [\"claude\", \"--version\"]"));
-        assert!(!encoded.contains("background"));
-        assert!(!encoded.contains("lock_timeout_secs"));
-        assert_eq!(claude.program, "claude");
-        assert_eq!(claude.args, ["update"]);
-        assert_eq!(claude.probe.program, "claude");
-        assert_eq!(claude.probe.args, ["--version"]);
-        assert_eq!(claude.background, ToolBackground::Auto);
-        assert_eq!(claude.processes.len(), 1);
-        assert_eq!(claude.processes[0].name, "claude");
-        assert_eq!(claude.processes[0].action, ProcessAction::Wait);
-    }
-
-    #[test]
-    fn user_manifest_resolves_latest_source_and_versioned_update_template() {
-        let input = r#"[tools.codex]
-update = ["npm", "install", "--global", "@openai/codex@latest"]
-probe = ["codex", "--version"]
-latest = { provider = "npm", package = "@openai/codex" }
-update_version = ["npm", "install", "--global", "@openai/codex@{version}"]
-"#;
-
-        let runtime = UserConfig::parse(input)
-            .expect("parse version-aware user manifest")
-            .resolve()
-            .expect("resolve version-aware user manifest");
-        let codex = &runtime.tools["codex"];
-
-        assert!(matches!(
-            &codex.latest,
-            Some(LatestVersionSource::Npm { package }) if package == "@openai/codex"
-        ));
-        assert_eq!(
-            codex.update_version.as_deref(),
-            Some(
-                ["npm", "install", "--global", "@openai/codex@{version}"]
-                    .map(str::to_owned)
-                    .as_slice()
-            )
-        );
-        assert_eq!(
-            codex
-                .update_for_version("codex", "0.143.0")
-                .expect("render target-version command"),
-            (
-                "npm".to_owned(),
-                ["install", "--global", "@openai/codex@0.143.0"]
-                    .map(str::to_owned)
-                    .to_vec()
-            )
-        );
-        assert!(codex.update_for_version("codex", "1.2.3;remove").is_err());
-
-        let unsupported = Tool::custom("plain", "plain".to_owned(), vec!["update".to_owned()]);
-        assert!(unsupported.update_for_version("plain", "1.2.3").is_err());
-    }
-
-    #[test]
-    fn user_manifest_accepts_an_explicit_pypi_latest_source() {
-        let input = r#"[tools.hermes]
-update = ["hermes", "update"]
-probe = ["hermes", "--version"]
-latest = { provider = "pypi", package = "hermes-agent" }
-"#;
-
-        let runtime = UserConfig::parse(input)
-            .expect("parse PyPI latest source")
-            .resolve()
-            .expect("resolve PyPI latest source");
-
-        assert!(matches!(
-            &runtime.tools["hermes"].latest,
-            Some(LatestVersionSource::Pypi { package }) if package == "hermes-agent"
-        ));
-    }
-
-    #[test]
-    fn versioned_update_template_requires_exactly_one_placeholder() {
-        for update_version in [
-            r#"["npm", "install", "package"]"#,
-            r#"["npm", "install", "package@{version}", "{version}"]"#,
-        ] {
-            let input = format!(
-                r#"[tools.example]
-update = ["example", "update"]
-probe = ["example", "--version"]
-update_version = {update_version}
-"#
-            );
-            assert!(UserConfig::parse(&input).is_err(), "input: {input}");
-        }
-    }
-
-    #[test]
-    fn user_manifest_rejects_internal_builtin_fields() {
-        let internal_format = r#"[tools.example]
-program = "example"
-args = ["update"]
-background = "auto"
-
-[tools.example.probe]
-program = "example"
-args = ["--version"]
-"#;
-
-        let error = UserConfig::parse(internal_format)
-            .expect_err("internal tool fields must not parse as a user manifest");
-
-        let message = error.to_string();
-        assert!(message.contains("program") || message.contains("update"));
-    }
-
-    #[test]
-    fn empty_user_template_is_valid_and_contains_no_builtin_tools() {
-        let user = UserConfig::parse(USER_TEMPLATE).expect("valid user template");
-
-        assert!(user.tools.is_empty());
-        assert!(
-            user.resolve()
-                .expect("resolve empty user layer")
-                .tools
-                .is_empty()
-        );
-        assert!(!USER_TEMPLATE.contains("[tools.dvup]"));
-        for name in ["codex", "claude", "opencode", "hermes"] {
-            assert!(USER_TEMPLATE.contains(&format!("# [tools.{name}]")));
-            assert!(!STARTER_TEMPLATE.contains(&format!("[tools.{name}]")));
-        }
-    }
-
-    #[test]
-    fn user_manifest_round_trips_github_release_monitors() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let target = toml::Value::String(temporary.path().join("example").display().to_string());
-        let input = format!(
-            r#"[[github.monitors]]
-name = "example"
-repository = "owner/repository"
-asset_regex = '^example-[0-9]+\.[0-9]+\.[0-9]+-windows-x86_64\.zip$'
-target_directory = {target}
-format = "zip"
-max_download_bytes = 104857600
-max_extracted_bytes = 314572800
-max_extracted_files = 1000
-strip_components = 1
-enabled = true
-"#
-        );
-
-        let user = UserConfig::parse(&input).expect("parse GitHub monitor user manifest");
-        let encoded = toml::to_string_pretty(&user).expect("serialize GitHub monitor manifest");
-        let decoded = UserConfig::parse(&encoded).expect("reload GitHub monitor manifest");
-
-        assert_eq!(decoded.github.monitors.len(), 1);
-        let monitor = &decoded.github.monitors[0];
-        assert_eq!(monitor.name, "example");
-        assert_eq!(monitor.repository, "owner/repository");
-        assert_eq!(
-            monitor.asset_regex,
-            r"^example-[0-9]+\.[0-9]+\.[0-9]+-windows-x86_64\.zip$"
-        );
-        assert_eq!(monitor.target_directory, temporary.path().join("example"));
-    }
-
-    #[test]
-    fn github_release_update_policy_is_manual_by_default_and_can_be_automatic() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let target = toml::Value::String(temporary.path().join("example").display().to_string());
-        let input = format!(
-            r#"[[github.monitors]]
-name = "example"
-repository = "owner/repository"
-asset_regex = '^example\.zip$'
-target_directory = {target}
-format = "zip"
-max_download_bytes = 1024
-max_extracted_bytes = 2048
-max_extracted_files = 10
-enabled = true
-"#
-        );
-
-        let manual = UserConfig::parse(&input).expect("manual policy by default");
-        assert_eq!(
-            manual.github.monitors[0].update_policy,
-            ReleaseUpdatePolicy::Manual
-        );
-        assert!(
-            !toml::to_string(&manual)
-                .expect("serialize manual policy")
-                .contains("update_policy")
-        );
-
-        let automatic = UserConfig::parse(&input.replace(
-            "enabled = true",
-            "update_policy = \"automatic\"\nenabled = true",
-        ))
-        .expect("explicit automatic policy");
-        assert_eq!(
-            automatic.github.monitors[0].update_policy,
-            ReleaseUpdatePolicy::Automatic
-        );
-    }
-
-    #[test]
-    fn github_installer_cleanup_is_enabled_by_default_and_can_be_disabled() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let target = toml::Value::String(temporary.path().join("example").display().to_string());
-        let input = format!(
-            r#"[[github.monitors]]
-name = "example"
-repository = "owner/repository"
-asset_regex = '^example\.zip$'
-target_directory = {target}
-format = "zip"
-max_download_bytes = 1024
-max_extracted_bytes = 2048
-max_extracted_files = 10
-enabled = true
-"#
-        );
-
-        let cleanup = UserConfig::parse(&input).expect("cleanup by default");
-        assert!(cleanup.github.monitors[0].cleanup_installer);
-        assert!(
-            !toml::to_string(&cleanup)
-                .expect("serialize cleanup default")
-                .contains("cleanup_installer")
-        );
-
-        let retained = UserConfig::parse(&input.replace(
-            "enabled = true",
-            "cleanup_installer = false\nenabled = true",
-        ))
-        .expect("retain installer");
-        assert!(!retained.github.monitors[0].cleanup_installer);
-    }
-
-    #[test]
-    fn user_manifest_rejects_legacy_github_asset_pattern() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let target = toml::Value::String(temporary.path().join("example").display().to_string());
-        let input = format!(
-            r#"[[github.monitors]]
-name = "example"
-repository = "owner/repository"
-asset_pattern = '^example\.zip$'
-target_directory = {target}
-format = "zip"
-max_download_bytes = 1024
-max_extracted_bytes = 2048
-max_extracted_files = 10
-enabled = true
-"#
-        );
-
-        let error = UserConfig::parse(&input)
-            .expect_err("legacy asset_pattern must not parse in dvup_custom.toml");
-        assert!(error.to_string().contains("asset_pattern"));
-    }
-
-    #[test]
-    fn github_release_monitors_require_unique_names_valid_regex_and_absolute_targets() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let monitor = GithubReleaseMonitor {
-            name: "example".to_owned(),
-            repository: "owner/repository".to_owned(),
-            asset_regex: r"^tool-[0-9.]+-windows\.zip$".to_owned(),
-            target_directory: temporary.path().join("tool"),
-            format: ReleaseAssetFormat::Zip,
-            update_policy: ReleaseUpdatePolicy::Manual,
-            cleanup_installer: true,
-            max_download_bytes: 100 * 1024 * 1024,
-            max_extracted_bytes: 300 * 1024 * 1024,
-            max_extracted_files: 1_000,
-            strip_components: 1,
-            enabled: true,
-        };
-        let mut github = GithubMonitorConfig {
-            monitors: vec![monitor.clone()],
-        };
-        assert!(github.validate().is_ok());
-
-        github.monitors.push(monitor);
-        assert!(github.validate().is_err());
-        github.monitors[1].name = "second".to_owned();
-        github.monitors[1].target_directory = PathBuf::from("relative");
-        assert!(github.validate().is_err());
-
-        github.monitors.truncate(1);
-        github.monitors[0].asset_regex = "[unterminated".to_owned();
-        let error = github.validate().expect_err("invalid regex must fail");
-        assert!(error.to_string().contains("invalid asset_regex"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_dmg_monitor_requires_an_app_target_and_archive_limits() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let mut monitor = GithubReleaseMonitor {
-            name: "reqable".to_owned(),
-            repository: "reqable/reqable-app".to_owned(),
-            asset_regex: r"^reqable-app-macos-arm64\.dmg$".to_owned(),
-            target_directory: temporary.path().join("Reqable.app"),
-            format: ReleaseAssetFormat::Dmg,
-            update_policy: ReleaseUpdatePolicy::Automatic,
-            cleanup_installer: true,
-            max_download_bytes: 100 * 1024 * 1024,
-            max_extracted_bytes: 500 * 1024 * 1024,
-            max_extracted_files: 20_000,
-            strip_components: 0,
-            enabled: true,
-        };
-
-        assert!(monitor.validate().is_ok());
-
-        monitor.target_directory = temporary.path().join("Reqable");
-        assert!(monitor.validate().is_err());
-        monitor.target_directory = temporary.path().join("Reqable.app");
-        monitor.max_extracted_bytes = 0;
-        assert!(monitor.validate().is_err());
-        monitor.max_extracted_bytes = 500 * 1024 * 1024;
-        monitor.strip_components = 1;
-        assert!(monitor.validate().is_err());
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn dmg_monitors_are_rejected_outside_macos() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let monitor = GithubReleaseMonitor {
-            name: "example".to_owned(),
-            repository: "owner/repository".to_owned(),
-            asset_regex: r"^example\.dmg$".to_owned(),
-            target_directory: temporary.path().join("Example.app"),
-            format: ReleaseAssetFormat::Dmg,
-            update_policy: ReleaseUpdatePolicy::Manual,
-            cleanup_installer: true,
-            max_download_bytes: 1024,
-            max_extracted_bytes: 2048,
-            max_extracted_files: 10,
-            strip_components: 0,
-            enabled: true,
-        };
-
-        assert!(monitor.validate().is_err());
-    }
-
-    #[test]
     fn npm_and_pnpm_commands_share_the_node_global_resource() {
         for program in ["npm", "npm.cmd", "pnpm", "C:\\tools\\pnpm.cmd"] {
             let tool = Tool::custom(
@@ -1614,5 +1790,466 @@ enabled = true
         assert!(bun.platforms.is_empty());
         assert_eq!(scoop.resource_group.as_deref(), Some("scoop"));
         assert_eq!(scoop.platforms, ["windows"]);
+    }
+
+    #[test]
+    fn package_declarations_compile_all_supported_managers_deterministically() {
+        let cases = [
+            (
+                PackageManager::Homebrew,
+                vec!["brew", "upgrade", "example"],
+                None,
+                Some("homebrew"),
+                vec!["macos", "linux"],
+            ),
+            (
+                PackageManager::Npm,
+                vec!["npm", "install", "--global", "example@latest"],
+                Some(vec!["npm", "install", "--global", "example@{version}"]),
+                Some("node-global"),
+                vec![],
+            ),
+            (
+                PackageManager::Pnpm,
+                vec!["pnpm", "add", "--global", "example@latest"],
+                Some(vec!["pnpm", "add", "--global", "example@{version}"]),
+                Some("node-global"),
+                vec![],
+            ),
+            (
+                PackageManager::Cargo,
+                vec!["cargo", "install", "example"],
+                Some(vec![
+                    "cargo",
+                    "install",
+                    "example",
+                    "--version",
+                    "{version}",
+                ]),
+                Some("cargo-global"),
+                vec![],
+            ),
+            (
+                PackageManager::Pipx,
+                vec!["pipx", "upgrade", "example"],
+                Some(vec!["pipx", "install", "--force", "example=={version}"]),
+                Some("python-global"),
+                vec![],
+            ),
+            (
+                PackageManager::Uv,
+                vec!["uv", "tool", "upgrade", "example"],
+                Some(vec![
+                    "uv",
+                    "tool",
+                    "install",
+                    "--force",
+                    "example=={version}",
+                ]),
+                Some("python-global"),
+                vec![],
+            ),
+        ];
+
+        for (manager, update, update_version, resource_group, platforms) in cases {
+            let command = CommandSpec::Package(PackageCommandSpec {
+                manager,
+                package: "example".to_owned(),
+                executable: "example".to_owned(),
+                probe_args: vec!["--version".to_owned()],
+            });
+            let tool = command
+                .compile("example")
+                .expect("compile package declaration");
+            let actual_update = std::iter::once(tool.program.as_str())
+                .chain(tool.args.iter().map(String::as_str))
+                .collect::<Vec<_>>();
+
+            assert_eq!(actual_update, update, "manager: {manager:?}");
+            assert_eq!(
+                tool.update_version
+                    .as_ref()
+                    .map(|parts| { parts.iter().map(String::as_str).collect::<Vec<_>>() }),
+                update_version,
+                "manager: {manager:?}"
+            );
+            assert_eq!(
+                tool.resource_group.as_deref(),
+                resource_group,
+                "manager: {manager:?}"
+            );
+            assert_eq!(tool.platforms, platforms, "manager: {manager:?}");
+            let expected_latest = match manager {
+                PackageManager::Homebrew => LatestVersionSource::Homebrew {
+                    formula: "example".to_owned(),
+                },
+                PackageManager::Npm | PackageManager::Pnpm => LatestVersionSource::Npm {
+                    package: "example".to_owned(),
+                },
+                PackageManager::Cargo => LatestVersionSource::CratesIo {
+                    package: "example".to_owned(),
+                },
+                PackageManager::Pipx | PackageManager::Uv => LatestVersionSource::Pypi {
+                    package: "example".to_owned(),
+                },
+            };
+            assert_eq!(tool.latest, Some(expected_latest), "manager: {manager:?}");
+            assert_eq!(tool.background, ToolBackground::Auto);
+            assert_eq!(tool.processes.len(), 1);
+            assert_eq!(tool.processes[0].name, "example");
+            assert_eq!(tool.processes[0].action, ProcessAction::Wait);
+            assert_eq!(tool.lock_timeout_secs, default_lock_timeout_secs());
+            assert_eq!(tool.retries, default_retries());
+            assert_eq!(tool.retry_delay_secs, default_retry_delay_secs());
+        }
+    }
+
+    #[test]
+    fn new_user_manifest_round_trips_and_rejects_removed_formats() {
+        let input = r#"
+[commands.codegraph]
+type = "package"
+manager = "npm"
+package = "@colbymchenry/codegraph"
+executable = "codegraph"
+
+[commands.deno]
+type = "custom"
+update = ["deno", "upgrade"]
+probe = ["deno", "--version"]
+latest = { provider = "github_release", repository = "denoland/deno" }
+
+[github.monitors.ripgrep]
+repository = "BurntSushi/ripgrep"
+asset = { product = "ripgrep", os = "macos", arch = "aarch64", format = "tar_gz" }
+install = { type = "user_directory" }
+"#;
+        let user = UserConfig::parse(input).expect("parse new user manifest");
+        assert_eq!(user.commands.len(), 2);
+        assert_eq!(user.github.monitors.len(), 1);
+        let encoded = toml::to_string_pretty(&user).expect("serialize new user manifest");
+        assert!(!encoded.contains("probe_args"));
+        assert!(UserConfig::parse(&encoded).is_ok());
+
+        for legacy in [
+            "[tools.old]\nupdate = [\"old\", \"update\"]\nprobe = [\"old\", \"--version\"]\n",
+            "[[github.monitors]]\nname = \"old\"\nrepository = \"owner/repo\"\n",
+            "[github.monitors.old]\nrepository = \"owner/repo\"\nasset_regex = \"old\"\n",
+        ] {
+            let error = UserConfig::parse(legacy).expect_err("legacy format must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("legacy user formats are unsupported"),
+                "legacy: {legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_declarations_compile_each_optional_official_source_without_target_versions() {
+        let sources = [
+            LatestVersionSource::Npm {
+                package: "example".to_owned(),
+            },
+            LatestVersionSource::Pypi {
+                package: "example".to_owned(),
+            },
+            LatestVersionSource::CratesIo {
+                package: "example".to_owned(),
+            },
+            LatestVersionSource::GithubRelease {
+                repository: "owner/example".to_owned(),
+            },
+            LatestVersionSource::GithubTag {
+                repository: "owner/example".to_owned(),
+            },
+        ];
+
+        for source in sources {
+            let tool = CommandSpec::Custom(CustomCommandSpec {
+                update: vec!["example".to_owned(), "upgrade".to_owned()],
+                probe: vec!["example".to_owned(), "--version".to_owned()],
+                latest: Some(source.clone()),
+            })
+            .compile("example")
+            .expect("compile custom declaration");
+
+            assert_eq!(tool.latest, Some(source));
+            assert!(tool.update_version.is_none());
+        }
+
+        assert!(
+            CommandSpec::Custom(CustomCommandSpec {
+                update: vec!["example".to_owned(), "upgrade".to_owned()],
+                probe: vec!["example".to_owned(), "--version".to_owned()],
+                latest: Some(LatestVersionSource::Homebrew {
+                    formula: "example".to_owned(),
+                }),
+            })
+            .compile("example")
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn concise_declarations_reject_missing_required_identity_and_commands() {
+        for invalid in [
+            "[commands.example]\ntype = \"package\"\npackage = \"example\"\nexecutable = \"example\"\n",
+            "[commands.example]\ntype = \"package\"\nmanager = \"cargo\"\nexecutable = \"example\"\n",
+            "[commands.example]\ntype = \"package\"\nmanager = \"cargo\"\npackage = \"example\"\n",
+            "[commands.example]\ntype = \"custom\"\nprobe = [\"example\", \"--version\"]\n",
+            "[commands.example]\ntype = \"custom\"\nupdate = [\"example\", \"upgrade\"]\n",
+        ] {
+            assert!(
+                UserConfig::parse(invalid).is_err(),
+                "invalid declaration: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_asset_selector_handles_aliases_and_requires_one_match() {
+        let selector = AssetSelector {
+            product: "ripgrep".to_owned(),
+            os: AssetOperatingSystem::Macos,
+            arch: AssetArchitecture::Aarch64,
+            format: ReleaseAssetFormat::TarGz,
+            variant: None,
+        };
+        let assets = [
+            "ripgrep-14.1.1-aarch64-apple-darwin.tar.gz",
+            "ripgrep-14.1.1-x86_64-apple-darwin.tar.gz",
+            "ripgrep-14.1.1-aarch64-unknown-linux-gnu.tar.gz",
+        ];
+
+        assert_eq!(
+            selector.select_unique(assets).expect("one matching asset"),
+            assets[0]
+        );
+        assert!(
+            selector
+                .select_unique([assets[0], "ripgrep-14.1.1-arm64-macos.tgz"])
+                .is_err()
+        );
+        assert!(
+            selector
+                .select_unique(["ripgrep-14.1.1-amd64-windows.zip"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn asset_selector_infers_numeric_and_hyphenated_product_names() {
+        let os = AssetOperatingSystem::current().expect("supported test OS");
+        let arch = AssetArchitecture::current().expect("supported test architecture");
+        let os_name = os.aliases()[0];
+        let arch_name = arch.aliases()[0];
+        let numeric = format!("7zip-24.09-{os_name}-{arch_name}.tar.gz");
+        let without_version = format!("my-tool-{os_name}-{arch_name}.zip");
+
+        assert_eq!(
+            AssetSelector::from_release_asset(&numeric, "v24.09")
+                .expect("numeric product selector")
+                .product,
+            "7zip"
+        );
+        assert_eq!(
+            AssetSelector::from_release_asset(&without_version, "v1.0.0")
+                .expect("hyphenated product selector")
+                .product,
+            "my-tool"
+        );
+    }
+
+    #[test]
+    fn asset_selector_uses_the_release_tag_without_capturing_v_prefixed_versions() {
+        let os = AssetOperatingSystem::current().expect("supported test OS");
+        let arch = AssetArchitecture::current().expect("supported test architecture");
+        let os_name = os.aliases()[0];
+        let arch_name = arch.aliases()[0];
+        let selected = format!("python-3-launcher-v10.2.0-{os_name}-{arch_name}.tar.gz");
+        let future = format!("python-3-launcher-v11.0.0-{os_name}-{arch_name}.tar.gz");
+
+        let selector = AssetSelector::from_release_asset(&selected, "v10.2.0")
+            .expect("selector from tagged release asset");
+
+        assert_eq!(selector.product, "python-3-launcher");
+        assert!(selector.matches(&future));
+    }
+
+    #[test]
+    fn semantic_selector_matches_os_arch_format_and_libc_aliases() {
+        let mac_arm = AssetSelector {
+            product: "tool".to_owned(),
+            os: AssetOperatingSystem::Macos,
+            arch: AssetArchitecture::Aarch64,
+            format: ReleaseAssetFormat::TarGz,
+            variant: None,
+        };
+        for asset in [
+            "tool-arm64-macos.tgz",
+            "tool-aarch64-darwin.tar.gz",
+            "tool-arm64-osx.tar.gz",
+            "tool-aarch64-apple-darwin.tgz",
+        ] {
+            assert!(mac_arm.matches(asset), "asset: {asset}");
+        }
+
+        let windows_x64 = AssetSelector {
+            product: "tool".to_owned(),
+            os: AssetOperatingSystem::Windows,
+            arch: AssetArchitecture::X86_64,
+            format: ReleaseAssetFormat::Zip,
+            variant: None,
+        };
+        for asset in [
+            "tool-x86_64-windows.zip",
+            "tool-amd64-win32.zip",
+            "tool-x64-win64.zip",
+            "tool-x86-64-pc-windows.zip",
+        ] {
+            assert!(windows_x64.matches(asset), "asset: {asset}");
+        }
+
+        let linux_musl = AssetSelector {
+            product: "tool".to_owned(),
+            os: AssetOperatingSystem::Linux,
+            arch: AssetArchitecture::X86_64,
+            format: ReleaseAssetFormat::TarGz,
+            variant: Some("musl".to_owned()),
+        };
+        assert!(linux_musl.matches("tool-amd64-unknown-linux-musl.tar.gz"));
+        assert!(!linux_musl.matches("tool-amd64-unknown-linux-gnu.tar.gz"));
+    }
+
+    #[test]
+    fn command_and_github_save_interfaces_only_change_their_own_partitions() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let path = temporary.path().join("dvup_custom.toml");
+        let mut config = UserConfig::empty();
+        config
+            .save_github_monitor(
+                &path,
+                "shared".to_owned(),
+                GithubMonitorSpec {
+                    repository: "owner/repository".to_owned(),
+                    asset: AssetSelector {
+                        product: "shared".to_owned(),
+                        os: AssetOperatingSystem::Linux,
+                        arch: AssetArchitecture::X86_64,
+                        format: ReleaseAssetFormat::TarGz,
+                        variant: Some("gnu".to_owned()),
+                    },
+                    install: GithubInstallSpec::UserDirectory,
+                    update_policy: ReleaseUpdatePolicy::Manual,
+                    enabled: true,
+                },
+            )
+            .expect("save GitHub monitor");
+        config
+            .save_command(
+                &path,
+                "shared".to_owned(),
+                CommandSpec::Custom(CustomCommandSpec {
+                    update: vec!["shared".to_owned(), "upgrade".to_owned()],
+                    probe: vec!["shared".to_owned(), "--version".to_owned()],
+                    latest: None,
+                }),
+            )
+            .expect("save same-named command");
+
+        let reloaded = UserConfig::load(&path).expect("reload both partitions");
+        assert_eq!(reloaded.commands.len(), 1);
+        assert_eq!(reloaded.github.monitors.len(), 1);
+        assert!(reloaded.commands.contains_key("shared"));
+        assert!(reloaded.github.monitors.contains_key("shared"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_declaration_compiles_to_the_fixed_applications_target() {
+        let monitor = GithubMonitorSpec {
+            repository: "owner/example".to_owned(),
+            asset: AssetSelector {
+                product: "example".to_owned(),
+                os: AssetOperatingSystem::Macos,
+                arch: AssetArchitecture::Aarch64,
+                format: ReleaseAssetFormat::Dmg,
+                variant: None,
+            },
+            install: GithubInstallSpec::MacosApplication {
+                application: "Example.app".to_owned(),
+            },
+            update_policy: ReleaseUpdatePolicy::Manual,
+            enabled: true,
+        };
+
+        let runtime = monitor
+            .compile("example", Path::new("/tmp/dvup-test"))
+            .expect("compile DMG declaration");
+
+        assert_eq!(
+            runtime.target_directory,
+            Path::new("/Applications/Example.app")
+        );
+    }
+
+    #[test]
+    fn saving_an_empty_user_config_removes_the_file() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let path = temporary.path().join("dvup_custom.toml");
+        fs::write(&path, "stale").expect("seed file");
+
+        UserConfig::empty()
+            .save(&path)
+            .expect("remove empty config");
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn saving_semantically_empty_editor_text_removes_the_file() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let path = temporary.path().join("dvup_custom.toml");
+        fs::write(&path, "[commands.old]\ntype = \"custom\"\nupdate = [\"old\"]\nprobe = [\"old\", \"--version\"]\n")
+            .expect("seed user config");
+
+        UserConfig::save_text(&path, "# no declarations remain\n").expect("save empty editor text");
+
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_atomic_replace_preserves_the_previous_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let path = temporary.path().join("dvup_custom.toml");
+        fs::write(&path, "old configuration").expect("seed config");
+        let mut replacement = tempfile::Builder::new()
+            .prefix(".dvup-config.")
+            .tempfile_in(temporary.path())
+            .expect("replacement file");
+        replacement
+            .write_all(b"new configuration")
+            .expect("write replacement");
+        replacement.as_file().sync_all().expect("sync replacement");
+        let original_permissions = fs::metadata(temporary.path())
+            .expect("directory metadata")
+            .permissions();
+        let mut locked_permissions = original_permissions.clone();
+        locked_permissions.set_mode(0o500);
+        fs::set_permissions(temporary.path(), locked_permissions).expect("lock directory");
+
+        let result = persist_config_file(replacement, &path);
+
+        fs::set_permissions(temporary.path(), original_permissions).expect("unlock directory");
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("read retained config"),
+            "old configuration"
+        );
     }
 }

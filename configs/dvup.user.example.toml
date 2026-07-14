@@ -1,68 +1,53 @@
-# dvup_custom.toml: strict user-owned command tools and GitHub Release repositories.
-# Uncomment complete entries only. Unknown fields, missing required fields, duplicate
-# monitor names, invalid regexes, and relative target directories are rejected.
+# dvup_custom.toml: strict, concise user declarations.
+# Uncomment complete entries only. Unknown fields and removed legacy formats are rejected.
 
-# Minimal custom command
+# Package-manager command. probe_args defaults to ["--version"].
+# The update command, official latest-version source, target-version support,
+# process wait rule, retry policy, platform limits, and resource group are compiled locally.
 #
-# [tools.example]
-# update = ["example", "self-update"]
-# probe = ["example", "--version"]
+# [commands.codegraph]
+# type = "package"
+# manager = "npm"
+# package = "@colbymchenry/codegraph"
+# executable = "codegraph"
 
-# Optional command examples
+# Override probe_args only when the executable does not support --version.
 #
-# [tools.codex]
-# update = ["npm", "install", "--global", "@openai/codex@latest"]
-# probe = ["codex", "--version"]
-# latest = { provider = "npm", package = "@openai/codex" }
-# update_version = ["npm", "install", "--global", "@openai/codex@{version}"]
-# resource_group = "node-global"
-#
-# [[tools.codex.processes]]
-# name = "node"
-# command_contains = "@openai/codex"
-# action = "terminate"
-#
-# [tools.claude]
-# update = ["claude", "update"]
-# probe = ["claude", "--version"]
-# latest = { provider = "npm", package = "@anthropic-ai/claude-code" }
-# update_version = ["claude", "install", "{version}"]
-#
-# [tools.opencode]
-# update = ["opencode", "upgrade"]
-# probe = ["opencode", "--version"]
-# latest = { provider = "npm", package = "opencode-ai" }
-# update_version = ["opencode", "upgrade", "{version}"]
-#
-# [tools.hermes]
-# update = ["hermes", "update"]
-# probe = ["hermes", "--version"]
-# latest = { provider = "pypi", package = "hermes-agent" }
+# [commands.example]
+# type = "package"
+# manager = "cargo"
+# package = "example-cli"
+# executable = "example"
+# probe_args = ["version"]
 
-# GitHub Release repository examples
-# asset_regex uses Rust regex syntax and must match exactly one latest-release asset.
-# Single-quoted TOML paths keep Windows backslashes literal.
+# Self-updating custom command. Commands are argv arrays and are never joined through a shell.
 #
-# [[github.monitors]]
-# name = "reqable-windows-x64"
-# repository = "reqable/reqable-app"
-# asset_regex = '^reqable-app-windows-x86_64\.zip$'
-# target_directory = 'C:\Tools\Reqable'
-# format = "zip"
-# max_download_bytes = 104857600
-# max_extracted_bytes = 314572800
-# max_extracted_files = 1000
-# strip_components = 0
-# enabled = true
+# [commands.deno]
+# type = "custom"
+# update = ["deno", "upgrade"]
+# probe = ["deno", "--version"]
+
+# A custom command may compare against one explicit official source.
+# Supported providers are npm, pypi, crates_io, github_release, and github_tag.
 #
-# [[github.monitors]]
-# name = "wsl-dashboard-windows-x64"
-# repository = "owu/wsl-dashboard"
-# asset_regex = '^WSLDashboard\.[0-9]+\.[0-9]+\.[0-9]+\.Setup\.x64\.zip$'
-# target_directory = 'C:\Tools\WSLDashboard'
-# format = "zip"
-# max_download_bytes = 104857600
-# max_extracted_bytes = 314572800
-# max_extracted_files = 1000
-# strip_components = 0
-# enabled = true
+# [commands.deno]
+# type = "custom"
+# update = ["deno", "upgrade"]
+# probe = ["deno", "--version"]
+# latest = { provider = "github_release", repository = "denoland/deno" }
+
+# GitHub Release monitor. The semantic asset selector is generated after the user
+# chooses one real asset from the latest Release; every future Release must match exactly once.
+# ZIP, TAR.GZ, and plain files install below dvup's user-level github-tools directory.
+#
+# [github.monitors.ripgrep]
+# repository = "BurntSushi/ripgrep"
+# asset = { product = "ripgrep", os = "macos", arch = "aarch64", format = "tar_gz" }
+# install = { type = "user_directory" }
+
+# A DMG always installs one named application to /Applications/<application>.
+#
+# [github.monitors.example]
+# repository = "owner/example"
+# asset = { product = "example", os = "macos", arch = "aarch64", format = "dmg" }
+# install = { type = "macos_application", application = "Example.app" }

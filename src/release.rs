@@ -6,14 +6,17 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
 use crate::{
-    config::{GithubReleaseMonitor, ReleaseAssetFormat},
+    config::{
+        AssetArchitecture, AssetOperatingSystem, DEFAULT_MAX_DOWNLOAD_BYTES,
+        DEFAULT_MAX_EXTRACTED_BYTES, DEFAULT_MAX_EXTRACTED_FILES, GithubReleaseMonitor,
+        LatestVersionSource, ReleaseAssetFormat,
+    },
     credential,
     error::{Error, Result},
     settings::{GithubSettings, NetworkSettings},
@@ -21,6 +24,7 @@ use crate::{
 };
 
 const USER_AGENT: &str = concat!("dvup/", env!("CARGO_PKG_VERSION"));
+const MAX_GITHUB_RELEASE_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MonitorOutcome {
@@ -48,16 +52,124 @@ pub(crate) struct MonitorStatus {
     pub(crate) error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
     assets: Vec<GithubAsset>,
 }
 
-#[derive(Debug, Deserialize)]
-struct GithubAsset {
-    name: String,
-    url: String,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct GithubAsset {
+    pub(crate) name: String,
+    pub(crate) url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GithubReleaseInfo {
+    pub(crate) tag: String,
+    pub(crate) assets: Vec<GithubAsset>,
+}
+
+pub(crate) fn normalize_github_repository(input: &str) -> Result<String> {
+    let input = input.trim().trim_end_matches('/');
+    let repository = input
+        .strip_prefix("https://github.com/")
+        .or_else(|| input.strip_prefix("http://github.com/"))
+        .unwrap_or(input);
+    let repository = repository
+        .strip_suffix(".git")
+        .unwrap_or(repository)
+        .to_owned();
+    LatestVersionSource::GithubRelease {
+        repository: repository.clone(),
+    }
+    .validate("GitHub repository")?;
+    Ok(repository)
+}
+
+pub(crate) fn fetch_latest_release(
+    repository: &str,
+    github: &GithubSettings,
+    network: &NetworkSettings,
+) -> Result<GithubReleaseInfo> {
+    let repository = normalize_github_repository(repository)?;
+    github.validate()?;
+    let api_key = credential::github_api_key(github.encrypted_api_key.as_deref())?;
+    let agent = version::network_agent(network)?;
+    let release = fetch_latest_release_with_agent(
+        &repository,
+        api_key.as_ref().map(|key| key.as_str()),
+        &agent,
+    )?;
+    if release.assets.is_empty() {
+        return Err(Error::Message(format!(
+            "GitHub repository `{repository}` latest Release has no assets"
+        )));
+    }
+    Ok(GithubReleaseInfo {
+        tag: release.tag_name,
+        assets: release.assets,
+    })
+}
+
+pub(crate) fn compatible_release_assets(release: &GithubReleaseInfo) -> Result<Vec<GithubAsset>> {
+    let os = AssetOperatingSystem::current().ok_or_else(|| {
+        Error::Message(format!(
+            "unsupported operating system `{}`",
+            std::env::consts::OS
+        ))
+    })?;
+    let arch = AssetArchitecture::current().ok_or_else(|| {
+        Error::Message(format!(
+            "unsupported CPU architecture `{}`",
+            std::env::consts::ARCH
+        ))
+    })?;
+    let mut assets = release
+        .assets
+        .iter()
+        .filter(|asset| {
+            let lower = asset.name.to_ascii_lowercase();
+            !is_release_metadata_asset(&lower)
+                && os.matches_name(&lower)
+                && arch.matches_name(&lower)
+                && [
+                    ReleaseAssetFormat::File,
+                    ReleaseAssetFormat::Zip,
+                    ReleaseAssetFormat::TarGz,
+                    ReleaseAssetFormat::Dmg,
+                ]
+                .into_iter()
+                .any(|format| format.matches_name(&lower))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assets.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(assets)
+}
+
+fn is_release_metadata_asset(name: &str) -> bool {
+    let known_metadata = [
+        "checksum",
+        "checksums",
+        "sha256",
+        "sha512",
+        ".sha256",
+        ".sha512",
+        ".minisig",
+        ".sig",
+        ".asc",
+        "sbom",
+        "provenance",
+        "attestation",
+        "source-code",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker));
+    let source_package = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| matches!(part, "source" | "src"));
+    known_metadata || source_package
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -143,10 +255,6 @@ pub(crate) fn run_selected_monitors(
     let agent = version::network_agent(network)?;
     let api_key = credential::github_api_key(github.encrypted_api_key.as_deref())?;
     let mut state = load_state(state_path)?;
-    let installer_root = state_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("github-installers");
     let mut changed = false;
     let outcomes = monitors
         .iter()
@@ -157,7 +265,6 @@ pub(crate) fn run_selected_monitors(
                 api_key.as_ref().map(|key| key.as_str()),
                 &agent,
                 &state,
-                &installer_root,
             ) {
                 Ok(MonitorOutcome::Updated { name, tag, asset }) => {
                     state.releases.insert(name.clone(), tag.clone());
@@ -183,7 +290,6 @@ fn update_monitor(
     api_key: Option<&str>,
     agent: &ureq::Agent,
     state: &ReleaseState,
-    installer_root: &Path,
 ) -> Result<MonitorOutcome> {
     let release = resolve_latest_asset(monitor, api_key, agent)?;
     if installed_monitor_version(monitor, state)?
@@ -196,7 +302,7 @@ fn update_monitor(
         });
     }
 
-    install_asset(monitor, api_key, agent, &release.asset, installer_root)?;
+    install_asset(monitor, api_key, agent, &release.asset)?;
 
     Ok(MonitorOutcome::Updated {
         name: monitor.name.clone(),
@@ -209,7 +315,7 @@ fn installed_monitor_version(
     monitor: &GithubReleaseMonitor,
     state: &ReleaseState,
 ) -> Result<Option<String>> {
-    match monitor.format {
+    match monitor.asset.format {
         ReleaseAssetFormat::Dmg => {
             #[cfg(target_os = "macos")]
             return installed_macos_app_version(&monitor.target_directory);
@@ -291,26 +397,34 @@ fn resolve_latest_asset(
     api_key: Option<&str>,
     agent: &ureq::Agent,
 ) -> Result<ResolvedRelease> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        monitor.repository
-    );
-    let mut response = github_get(agent, &url, api_key, "application/vnd.github+json")?;
-    let release = response
-        .body_mut()
-        .read_json::<GithubRelease>()
-        .map_err(release_error)?;
-    let asset_regex = Regex::new(&monitor.asset_regex).map_err(release_error)?;
-    let mut assets = release
-        .assets
+    let release = fetch_latest_release_with_agent(&monitor.repository, api_key, agent)?;
+    let asset = select_monitor_asset(&monitor.name, &monitor.asset, release.assets)?;
+    Ok(ResolvedRelease {
+        tag: release.tag_name,
+        asset,
+    })
+}
+
+fn select_monitor_asset(
+    monitor_name: &str,
+    selector: &crate::config::AssetSelector,
+    assets: Vec<GithubAsset>,
+) -> Result<GithubAsset> {
+    let mut assets = assets
         .into_iter()
-        .filter(|asset| asset_regex.is_match(&asset.name))
+        .filter(|asset| !is_release_metadata_asset(&asset.name.to_ascii_lowercase()))
+        .filter(|asset| selector.matches(&asset.name))
         .collect::<Vec<_>>();
-    if assets.len() != 1 {
+    if assets.is_empty() {
         return Err(Error::Message(format!(
-            "GitHub release monitor `{}` expected exactly one asset matching regex `{}`, found {}",
-            monitor.name,
-            monitor.asset_regex,
+            "GitHub release monitor `{}` has no compatible release asset",
+            monitor_name
+        )));
+    }
+    if assets.len() > 1 {
+        return Err(Error::Message(format!(
+            "GitHub release monitor `{}` must revisit its release asset selection; the semantic selector matched {} assets",
+            monitor_name,
             assets.len()
         )));
     }
@@ -322,14 +436,25 @@ fn resolve_latest_asset(
     {
         return Err(Error::Message(format!(
             "GitHub release monitor `{}` returned an unsafe asset name",
-            monitor.name
+            monitor_name
         )));
     }
+    Ok(asset)
+}
 
-    Ok(ResolvedRelease {
-        tag: release.tag_name,
-        asset,
-    })
+fn fetch_latest_release_with_agent(
+    repository: &str,
+    api_key: Option<&str>,
+    agent: &ureq::Agent,
+) -> Result<GithubRelease> {
+    let url = format!("https://api.github.com/repos/{repository}/releases/latest");
+    let mut response = github_get(agent, &url, api_key, "application/vnd.github+json")?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(MAX_GITHUB_RELEASE_METADATA_BYTES)
+        .read_json::<GithubRelease>()
+        .map_err(release_error)
 }
 
 fn install_asset(
@@ -337,9 +462,8 @@ fn install_asset(
     api_key: Option<&str>,
     agent: &ureq::Agent,
     asset: &GithubAsset,
-    installer_root: &Path,
 ) -> Result<()> {
-    if monitor.format != ReleaseAssetFormat::Dmg {
+    if monitor.asset.format != ReleaseAssetFormat::Dmg {
         fs::create_dir_all(&monitor.target_directory)?;
     }
     let parent = monitor
@@ -362,62 +486,44 @@ fn install_asset(
         &mut download
             .body_mut()
             .as_reader()
-            .take(monitor.max_download_bytes.saturating_add(1)),
+            .take(DEFAULT_MAX_DOWNLOAD_BYTES.saturating_add(1)),
         &mut downloaded,
     )?;
-    if copied > monitor.max_download_bytes {
+    if copied > DEFAULT_MAX_DOWNLOAD_BYTES {
         return Err(Error::Message(format!(
-            "GitHub release monitor `{}` asset exceeds max_download_bytes",
+            "GitHub release monitor `{}` asset exceeds the fixed download safety limit",
             monitor.name
         )));
     }
     downloaded.flush()?;
     downloaded.as_file().sync_all()?;
-    apply_installer_retention(
-        downloaded.path(),
-        installer_root,
-        &monitor.name,
-        &asset.name,
-        monitor.cleanup_installer,
-    )?;
-
-    match monitor.format {
+    match monitor.asset.format {
         ReleaseAssetFormat::File => {
             install_file(downloaded, &monitor.target_directory, &asset.name)?
         }
-        ReleaseAssetFormat::Zip => install_archive(
-            &monitor.target_directory,
-            monitor.strip_components,
-            |staging| {
-                extract_zip(
-                    downloaded.path(),
-                    staging,
-                    monitor.strip_components,
-                    monitor.max_extracted_bytes,
-                    monitor.max_extracted_files,
-                )
-            },
-        )?,
-        ReleaseAssetFormat::TarGz => install_archive(
-            &monitor.target_directory,
-            monitor.strip_components,
-            |staging| {
-                extract_tar_gz(
-                    downloaded.path(),
-                    staging,
-                    monitor.strip_components,
-                    monitor.max_extracted_bytes,
-                    monitor.max_extracted_files,
-                )
-            },
-        )?,
+        ReleaseAssetFormat::Zip => install_archive(&monitor.target_directory, |staging| {
+            extract_zip(
+                downloaded.path(),
+                staging,
+                DEFAULT_MAX_EXTRACTED_BYTES,
+                DEFAULT_MAX_EXTRACTED_FILES,
+            )
+        })?,
+        ReleaseAssetFormat::TarGz => install_archive(&monitor.target_directory, |staging| {
+            extract_tar_gz(
+                downloaded.path(),
+                staging,
+                DEFAULT_MAX_EXTRACTED_BYTES,
+                DEFAULT_MAX_EXTRACTED_FILES,
+            )
+        })?,
         ReleaseAssetFormat::Dmg => {
             #[cfg(target_os = "macos")]
             install_dmg(
                 downloaded.path(),
                 &monitor.target_directory,
-                monitor.max_extracted_bytes,
-                monitor.max_extracted_files,
+                DEFAULT_MAX_EXTRACTED_BYTES,
+                DEFAULT_MAX_EXTRACTED_FILES,
             )?;
             #[cfg(not(target_os = "macos"))]
             return Err(Error::Message(
@@ -426,55 +532,6 @@ fn install_asset(
         }
     }
 
-    Ok(())
-}
-
-fn apply_installer_retention(
-    downloaded: &Path,
-    cache_root: &Path,
-    monitor_name: &str,
-    asset_name: &str,
-    cleanup: bool,
-) -> Result<()> {
-    let monitor_cache = cache_root.join(monitor_name);
-    if cleanup {
-        match fs::symlink_metadata(&monitor_cache) {
-            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-                fs::remove_dir_all(&monitor_cache)?;
-            }
-            Ok(_) => fs::remove_file(&monitor_cache)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        return Ok(());
-    }
-
-    fs::create_dir_all(&monitor_cache)?;
-    let target = monitor_cache.join(asset_name);
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".installer-")
-        .suffix(".tmp")
-        .tempfile_in(&monitor_cache)?;
-    io::copy(&mut File::open(downloaded)?, &mut temporary)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    match fs::symlink_metadata(&target) {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            return Err(Error::Message(format!(
-                "installer cache target is a directory: {}",
-                target.display()
-            )));
-        }
-        Ok(_) => fs::remove_file(&target)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    temporary.persist(&target).map_err(|error| {
-        Error::Message(format!(
-            "failed to retain installer {}: {error}",
-            target.display()
-        ))
-    })?;
     Ok(())
 }
 
@@ -751,6 +808,7 @@ fn install_file(
     if target.exists() {
         fs::remove_file(&target)?;
     }
+    set_installed_file_mode(downloaded.path(), 0o755)?;
     downloaded.persist(&target).map_err(|error| {
         Error::Message(format!("failed to install {}: {}", target.display(), error))
     })?;
@@ -759,7 +817,6 @@ fn install_file(
 
 fn install_archive(
     target_directory: &Path,
-    _strip_components: usize,
     extract: impl FnOnce(&Path) -> Result<usize>,
 ) -> Result<()> {
     let parent = target_directory.parent().ok_or_else(|| {
@@ -778,6 +835,7 @@ fn install_archive(
             "release archive contained no files".to_owned(),
         ));
     }
+    let install_root = archive_install_root(&staging)?;
 
     let backup_owner = tempfile::Builder::new()
         .prefix(".dvup-backup-")
@@ -788,7 +846,7 @@ fn install_archive(
     if had_target {
         fs::rename(target_directory, &backup)?;
     }
-    if let Err(error) = fs::rename(&staging, target_directory) {
+    if let Err(error) = fs::rename(&install_root, target_directory) {
         if had_target {
             let _ = fs::rename(&backup, target_directory);
         }
@@ -800,10 +858,23 @@ fn install_archive(
     Ok(())
 }
 
+fn archive_install_root(staging: &Path) -> Result<PathBuf> {
+    let mut entries = fs::read_dir(staging)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    if entries.len() != 1 {
+        return Ok(staging.to_path_buf());
+    }
+    let entry = entries.pop().expect("one archive top-level entry");
+    let file_type = entry.file_type()?;
+    if file_type.is_dir() && !file_type.is_symlink() {
+        Ok(entry.path())
+    } else {
+        Ok(staging.to_path_buf())
+    }
+}
+
 fn extract_zip(
     archive: &Path,
     target: &Path,
-    strip_components: usize,
     max_extracted_bytes: u64,
     max_extracted_files: usize,
 ) -> Result<usize> {
@@ -816,7 +887,7 @@ fn extract_zip(
         let source = entry
             .enclosed_name()
             .ok_or_else(|| Error::Message(format!("unsafe ZIP entry `{}`", entry.name())))?;
-        let Some(relative) = stripped_path(&source, strip_components)? else {
+        let Some(relative) = safe_archive_path(&source)? else {
             continue;
         };
         let destination = target.join(relative);
@@ -838,7 +909,8 @@ fn extract_zip(
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut output = File::create(destination)?;
+        let mode = entry.unix_mode().unwrap_or(0o755);
+        let mut output = File::create(&destination)?;
         let copied = io::copy(
             &mut entry.by_ref().take(remaining.saturating_add(1)),
             &mut output,
@@ -849,6 +921,8 @@ fn extract_zip(
             ));
         }
         output.flush()?;
+        drop(output);
+        set_installed_file_mode(&destination, mode)?;
         extracted_bytes += copied;
         extracted_files += 1;
     }
@@ -858,7 +932,6 @@ fn extract_zip(
 fn extract_tar_gz(
     archive: &Path,
     target: &Path,
-    strip_components: usize,
     max_extracted_bytes: u64,
     max_extracted_files: usize,
 ) -> Result<usize> {
@@ -870,7 +943,7 @@ fn extract_tar_gz(
     for entry in archive.entries().map_err(release_error)? {
         let mut entry = entry.map_err(release_error)?;
         let source = entry.path().map_err(release_error)?.into_owned();
-        let Some(relative) = stripped_path(&source, strip_components)? else {
+        let Some(relative) = safe_archive_path(&source)? else {
             continue;
         };
         let destination = target.join(relative);
@@ -892,7 +965,8 @@ fn extract_tar_gz(
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let mut output = File::create(destination)?;
+            let mode = entry.header().mode().map_err(release_error)?;
+            let mut output = File::create(&destination)?;
             let copied = io::copy(
                 &mut entry.by_ref().take(remaining.saturating_add(1)),
                 &mut output,
@@ -903,6 +977,8 @@ fn extract_tar_gz(
                 ));
             }
             output.flush()?;
+            drop(output);
+            set_installed_file_mode(&destination, mode)?;
             extracted_bytes += copied;
             extracted_files += 1;
         } else {
@@ -915,7 +991,20 @@ fn extract_tar_gz(
     Ok(extracted_files)
 }
 
-fn stripped_path(path: &Path, strip_components: usize) -> Result<Option<PathBuf>> {
+#[cfg(unix)]
+fn set_installed_file_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_installed_file_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+fn safe_archive_path(path: &Path) -> Result<Option<PathBuf>> {
     let components = path.components().collect::<Vec<_>>();
     if components
         .iter()
@@ -928,7 +1017,6 @@ fn stripped_path(path: &Path, strip_components: usize) -> Result<Option<PathBuf>
     }
     let stripped = components
         .into_iter()
-        .skip(strip_components)
         .filter_map(|component| match component {
             Component::Normal(value) => Some(value),
             _ => None,
@@ -975,6 +1063,21 @@ fn release_error(error: impl std::fmt::Display) -> Error {
 mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
+
+    #[test]
+    fn normalizes_supported_github_repository_inputs_without_changing_repositories() {
+        assert_eq!(
+            normalize_github_repository("https://github.com/owner/repository.git/")
+                .expect("GitHub URL"),
+            "owner/repository"
+        );
+        assert_eq!(
+            normalize_github_repository("owner/repository").expect("owner/repo"),
+            "owner/repository"
+        );
+        assert!(normalize_github_repository("repository").is_err());
+        assert!(normalize_github_repository("owner/repository/extra").is_err());
+    }
 
     #[cfg(target_os = "macos")]
     fn create_signed_test_app(parent: &Path, name: &str, marker: &str) -> PathBuf {
@@ -1063,185 +1166,119 @@ mod tests {
     }
 
     #[test]
-    fn asset_regex_supports_anchored_versions_platforms_and_extensions() {
-        let asset_regex =
-            Regex::new(r"^tool-[0-9]+\.[0-9]+\.[0-9]+-windows\.zip$").expect("valid asset regex");
-
-        assert!(asset_regex.is_match("tool-1.2.3-windows.zip"));
-        assert!(!asset_regex.is_match("prefix-tool-1.2.3-windows.zip"));
-        assert!(!asset_regex.is_match("tool-1.2.3-linux.zip"));
-        assert!(!asset_regex.is_match("tool-1x2x3-windows.zip"));
-    }
-
-    #[test]
-    fn installer_cache_can_retain_an_asset_and_cleanup_the_monitor_cache() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let downloaded = temporary.path().join("downloaded.dmg");
-        fs::write(&downloaded, b"installer bytes").expect("downloaded installer");
-        let cache_root = temporary.path().join("github-installers");
-
-        apply_installer_retention(
-            &downloaded,
-            &cache_root,
-            "reqable-macos-arm64",
-            "reqable-app-macos-arm64.dmg",
-            false,
-        )
-        .expect("retain installer");
-        let retained = cache_root
-            .join("reqable-macos-arm64")
-            .join("reqable-app-macos-arm64.dmg");
+    fn archive_paths_preserve_layout_without_allowing_traversal() {
         assert_eq!(
-            fs::read(&retained).expect("retained asset"),
-            b"installer bytes"
+            safe_archive_path(Path::new("package/bin/tool.exe")).expect("safe path"),
+            Some(PathBuf::from("package/bin/tool.exe"))
         );
-
-        apply_installer_retention(
-            &downloaded,
-            &cache_root,
-            "reqable-macos-arm64",
-            "next-release.dmg",
-            true,
-        )
-        .expect("cleanup installers");
-        assert!(!cache_root.join("reqable-macos-arm64").exists());
+        assert!(safe_archive_path(Path::new("../tool.exe")).is_err());
     }
 
     #[test]
-    fn disabled_monitor_probe_reads_installed_tag_without_network_access() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let state_path = temporary.path().join("github-releases.json");
-        let mut state = ReleaseState::default();
-        state
-            .releases
-            .insert("example".to_owned(), "v1.2.3".to_owned());
-        save_state(&state_path, &state).expect("save release state");
-        let github = GithubSettings {
-            poll_interval_secs: 300,
-            encrypted_api_key: None,
+    fn compatible_assets_exclude_metadata_and_incompatible_platforms() {
+        let os = crate::config::AssetOperatingSystem::current().expect("supported test OS");
+        let arch = crate::config::AssetArchitecture::current().expect("supported test arch");
+        let compatible_name = format!(
+            "tool-1.0.0-{}-{}.tar.gz",
+            os.aliases()[0],
+            arch.aliases()[0]
+        );
+        let incompatible_arch = match arch {
+            crate::config::AssetArchitecture::Aarch64 => "amd64",
+            crate::config::AssetArchitecture::X86_64 => "arm64",
         };
-        let monitors = [GithubReleaseMonitor {
-            name: "example".to_owned(),
-            repository: "owner/repository".to_owned(),
-            asset_regex: r"^example\.zip$".to_owned(),
-            target_directory: temporary.path().join("installed"),
-            format: ReleaseAssetFormat::Zip,
-            update_policy: crate::config::ReleaseUpdatePolicy::Manual,
-            cleanup_installer: true,
-            max_download_bytes: 1024,
-            max_extracted_bytes: 2048,
-            max_extracted_files: 10,
-            strip_components: 0,
-            enabled: false,
-        }];
-
-        let statuses = probe_monitors(&monitors, &github, &NetworkSettings::default(), &state_path)
-            .expect("probe disabled monitor");
+        let release = GithubReleaseInfo {
+            tag: "v1.0.0".to_owned(),
+            assets: vec![
+                GithubAsset {
+                    name: compatible_name.clone(),
+                    url: "https://example.invalid/tool".to_owned(),
+                },
+                GithubAsset {
+                    name: format!("{compatible_name}.sha256"),
+                    url: "https://example.invalid/checksum".to_owned(),
+                },
+                GithubAsset {
+                    name: format!(
+                        "tool-source-{}-{}.tar.gz",
+                        os.aliases()[0],
+                        arch.aliases()[0]
+                    ),
+                    url: "https://example.invalid/source".to_owned(),
+                },
+                GithubAsset {
+                    name: format!("tool-1.0.0-{}-{incompatible_arch}.tar.gz", os.aliases()[0]),
+                    url: "https://example.invalid/wrong-arch".to_owned(),
+                },
+            ],
+        };
 
         assert_eq!(
-            statuses,
-            [MonitorStatus {
-                name: "example".to_owned(),
-                installed_tag: Some("v1.2.3".to_owned()),
-                latest_tag: None,
-                asset: None,
-                error: None,
+            compatible_release_assets(&release).expect("compatible assets"),
+            [GithubAsset {
+                name: compatible_name,
+                url: "https://example.invalid/tool".to_owned(),
             }]
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn dmg_probe_reports_the_real_app_version_instead_of_stale_install_history() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let state_path = temporary.path().join("github-releases.json");
-        let mut state = ReleaseState::default();
-        state
-            .releases
-            .insert("reqable".to_owned(), "3.2.7".to_owned());
-        save_state(&state_path, &state).expect("save stale release state");
-
-        let app = temporary.path().join("Reqable.app");
-        fs::create_dir_all(app.join("Contents")).expect("create app bundle");
-        fs::write(
-            app.join("Contents/Info.plist"),
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-<key>CFBundleShortVersionString</key><string>3.2.2</string>
-<key>CFBundleVersion</key><string>200</string>
-</dict></plist>"#,
-        )
-        .expect("write Info.plist");
-        let monitors = [GithubReleaseMonitor {
-            name: "reqable".to_owned(),
-            repository: "reqable/reqable-app".to_owned(),
-            asset_regex: r"^reqable-app-macos-arm64\.dmg$".to_owned(),
-            target_directory: app.clone(),
-            format: ReleaseAssetFormat::Dmg,
-            update_policy: crate::config::ReleaseUpdatePolicy::Manual,
-            cleanup_installer: true,
-            max_download_bytes: 1024,
-            max_extracted_bytes: 2048,
-            max_extracted_files: 10,
-            strip_components: 0,
-            enabled: false,
-        }];
-        let github = GithubSettings {
-            poll_interval_secs: 300,
-            encrypted_api_key: None,
+    fn monitor_asset_selection_rejects_zero_and_multiple_matches() {
+        let os = crate::config::AssetOperatingSystem::current().expect("supported test OS");
+        let arch = crate::config::AssetArchitecture::current().expect("supported test arch");
+        let selector = crate::config::AssetSelector {
+            product: "tool".to_owned(),
+            os,
+            arch,
+            format: ReleaseAssetFormat::TarGz,
+            variant: None,
+        };
+        let first = GithubAsset {
+            name: format!(
+                "tool-1.0.0-{}-{}.tar.gz",
+                os.aliases()[0],
+                arch.aliases()[0]
+            ),
+            url: "https://example.invalid/one".to_owned(),
+        };
+        let second = GithubAsset {
+            name: format!(
+                "tool-2.0.0-{}-{}.tar.gz",
+                os.aliases()[0],
+                arch.aliases()[0]
+            ),
+            url: "https://example.invalid/two".to_owned(),
         };
 
-        let installed =
-            probe_monitors(&monitors, &github, &NetworkSettings::default(), &state_path)
-                .expect("probe installed app");
-        assert_eq!(installed[0].installed_tag.as_deref(), Some("3.2.2"));
-
-        fs::write(
-            app.join("Contents/Info.plist"),
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-<key>CFBundleVersion</key><string>200</string>
-</dict></plist>"#,
-        )
-        .expect("write build-only Info.plist");
-        let fallback = probe_monitors(&monitors, &github, &NetworkSettings::default(), &state_path)
-            .expect("probe build version fallback");
-        assert_eq!(fallback[0].installed_tag.as_deref(), Some("200"));
-
-        fs::remove_dir_all(&app).expect("remove app");
-        let missing = probe_monitors(&monitors, &github, &NetworkSettings::default(), &state_path)
-            .expect("probe missing app");
-        assert_eq!(missing[0].installed_tag, None);
-    }
-
-    #[test]
-    fn archive_paths_are_stripped_without_allowing_traversal() {
-        assert_eq!(
-            stripped_path(Path::new("package/bin/tool.exe"), 1).expect("safe path"),
-            Some(PathBuf::from("bin/tool.exe"))
+        let none = select_monitor_asset("tool", &selector, Vec::new())
+            .expect_err("zero matches must fail");
+        let many = select_monitor_asset("tool", &selector, vec![first, second])
+            .expect_err("multiple matches must fail");
+        assert!(none.to_string().contains("no compatible release asset"));
+        assert!(
+            many.to_string()
+                .contains("revisit its release asset selection")
         );
-        assert!(stripped_path(Path::new("../tool.exe"), 0).is_err());
     }
 
     #[test]
-    fn zip_and_tar_gz_extract_into_staging_with_explicit_component_stripping() {
+    fn archives_drop_one_common_top_level_directory_and_otherwise_preserve_layout() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let zip_path = temporary.path().join("release.zip");
         let zip_file = File::create(&zip_path).expect("ZIP file");
         let mut zip = zip::ZipWriter::new(zip_file);
         zip.start_file(
             "package/bin/tool.exe",
-            zip::write::SimpleFileOptions::default(),
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755),
         )
         .expect("ZIP entry");
         zip.write_all(b"zip binary").expect("ZIP contents");
         zip.finish().expect("finish ZIP");
         let zip_target = temporary.path().join("zip-target");
-        fs::create_dir(&zip_target).expect("ZIP target");
-        assert_eq!(
-            extract_zip(&zip_path, &zip_target, 1, 1_024, 10).expect("extract ZIP"),
-            1
-        );
+        install_archive(&zip_target, |staging| {
+            extract_zip(&zip_path, staging, 1_024, 10)
+        })
+        .expect("install ZIP");
         assert_eq!(
             fs::read(zip_target.join("bin/tool.exe")).expect("ZIP output"),
             b"zip binary"
@@ -1257,19 +1294,82 @@ mod tests {
         header.set_cksum();
         tar.append_data(&mut header, "package/bin/tool", &b"tar binary"[..])
             .expect("TAR entry");
+        let mut second_header = tar::Header::new_gnu();
+        second_header.set_size(7);
+        second_header.set_mode(0o644);
+        second_header.set_cksum();
+        tar.append_data(&mut second_header, "LICENSE", &b"license"[..])
+            .expect("second TAR entry");
         tar.into_inner()
             .expect("finish TAR")
             .finish()
             .expect("finish GZIP");
         let tar_target = temporary.path().join("tar-target");
-        fs::create_dir(&tar_target).expect("TAR target");
+        install_archive(&tar_target, |staging| {
+            extract_tar_gz(&tar_path, staging, 1_024, 10)
+        })
+        .expect("install TAR.GZ");
         assert_eq!(
-            extract_tar_gz(&tar_path, &tar_target, 1, 1_024, 10).expect("extract TAR.GZ"),
-            1
+            fs::read(tar_target.join("package/bin/tool")).expect("TAR output"),
+            b"tar binary"
         );
         assert_eq!(
-            fs::read(tar_target.join("bin/tool")).expect("TAR output"),
-            b"tar binary"
+            fs::read(tar_target.join("LICENSE")).expect("preserved top-level file"),
+            b"license"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(zip_target.join("bin/tool.exe"))
+                    .expect("ZIP executable metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+            assert_eq!(
+                fs::metadata(tar_target.join("package/bin/tool"))
+                    .expect("TAR executable metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+            assert_eq!(
+                fs::metadata(tar_target.join("LICENSE"))
+                    .expect("TAR data metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_release_files_are_installed_as_user_executables() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let target = temporary.path().join("target");
+        fs::create_dir(&target).expect("target directory");
+        let mut downloaded =
+            tempfile::NamedTempFile::new_in(temporary.path()).expect("downloaded release file");
+        downloaded.write_all(b"binary").expect("download contents");
+
+        install_file(downloaded, &target, "tool").expect("install plain release file");
+
+        assert_eq!(
+            fs::metadata(target.join("tool"))
+                .expect("installed file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
         );
     }
 }
