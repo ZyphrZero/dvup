@@ -2,3 +2,4 @@
 *.log
 .codegraph/
 AGENTS.md
+.DS_Store
