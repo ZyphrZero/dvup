@@ -45,8 +45,8 @@ use crate::{
     credential, datetime, detach, doctor,
     error::{Error, Result},
     generation::{
-        self, GenerationEvidence, GenerationRequest, GenerationRequestField,
-        GenerationRequestIssue, UpdateProvider,
+        self, CandidateVerification, GenerationEvidence, GenerationRequest, GenerationRequestField,
+        GenerationRequestIssue, RejectedCandidate, UpdateProvider, VerifiedCandidate,
     },
     job::{CommandSpec, JobStatus, JobStore},
     release::{self, MonitorOutcome, MonitorStatus},
@@ -1662,6 +1662,7 @@ struct CommandForm {
     retry_delay_secs: TextInput,
     platforms: TextInput,
     resource_group: TextInput,
+    locked_request: Option<GenerationRequest>,
     generation_evidence: Option<GenerationEvidence>,
 }
 
@@ -1688,6 +1689,7 @@ impl CommandForm {
             retry_delay_secs: TextInput::new(default_retry_delay_secs().to_string()),
             platforms: TextInput::new(String::new()),
             resource_group: TextInput::new(String::new()),
+            locked_request: None,
             generation_evidence: None,
         }
     }
@@ -1729,12 +1731,14 @@ impl CommandForm {
             retry_delay_secs: TextInput::new(tool.retry_delay_secs.to_string()),
             platforms: TextInput::new(tool.platforms.join(", ")),
             resource_group: TextInput::new(tool.resource_group.clone().unwrap_or_default()),
+            locked_request: None,
             generation_evidence: None,
         }
     }
 
     fn from_generated(
         active: &CommandForm,
+        request: &GenerationRequest,
         generated: ai::GeneratedCommand,
         evidence: GenerationEvidence,
     ) -> Self {
@@ -1743,8 +1747,54 @@ impl CommandForm {
         form.ai_request = active.ai_request.clone();
         form.update_provider = active.update_provider;
         form.update_package = active.update_package.clone();
+        form.locked_request = Some(request.clone());
         form.generation_evidence = Some(evidence);
         form
+    }
+
+    fn from_verified_command(request: &GenerationRequest, evidence: &GenerationEvidence) -> Self {
+        let (latest_provider, latest_value) =
+            LatestProviderChoice::from_source(Some(&request.latest));
+        let mut form = Self::new_add();
+        form.field = CommandFormField::Update;
+        form.name = TextInput::new(request.name.clone());
+        form.ai_request = TextInput::new(request.instructions.clone());
+        form.update_provider = Some(request.update_provider);
+        form.update_package = TextInput::new(request.update_package.clone());
+        form.update = TextInput::new(format_command_parts(
+            &request
+                .update_provider
+                .update_command(&request.update_package),
+        ));
+        form.latest_provider = latest_provider;
+        form.latest_value = TextInput::new(latest_value);
+        form.update_version = TextInput::new(
+            request
+                .update_provider
+                .update_version_command(&request.update_package)
+                .as_deref()
+                .map(format_command_parts)
+                .unwrap_or_default(),
+        );
+        form.platforms = TextInput::new(request.platforms.join(", "));
+        form.locked_request = Some(request.clone());
+        form.generation_evidence = Some(evidence.clone());
+        form
+    }
+
+    fn field_is_locked(&self, field: CommandFormField) -> bool {
+        self.locked_request.is_some()
+            && matches!(
+                field,
+                CommandFormField::Name
+                    | CommandFormField::UpdateProvider
+                    | CommandFormField::UpdatePackage
+                    | CommandFormField::Update
+                    | CommandFormField::LatestSource
+                    | CommandFormField::LatestValue
+                    | CommandFormField::UpdateVersion
+                    | CommandFormField::Platforms
+            )
     }
 
     fn input(&self, field: CommandFormField) -> Option<&TextInput> {
@@ -1843,6 +1893,12 @@ enum MonitorFormMode {
     Edit,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LockedGithubMonitorIdentity {
+    name: String,
+    repository: String,
+}
+
 #[derive(Clone)]
 enum Modal {
     None,
@@ -1857,6 +1913,15 @@ enum Modal {
     TargetVersion {
         name: String,
         version: TextInput,
+    },
+    AiToolIntent {
+        intent: TextInput,
+    },
+    AiCandidateSelection {
+        intent: String,
+        candidates: Vec<VerifiedCandidate>,
+        selected: usize,
+        rejected: Vec<RejectedCandidate>,
     },
     AddCommand {
         form: Box<CommandForm>,
@@ -1895,6 +1960,7 @@ enum Modal {
     GithubMonitorForm {
         mode: MonitorFormMode,
         original_index: Option<usize>,
+        locked_identity: Option<Box<LockedGithubMonitorIdentity>>,
         field: usize,
         name: TextInput,
         repository: TextInput,
@@ -1969,6 +2035,12 @@ struct AiCommandGenerationResult {
 }
 
 #[derive(Debug)]
+struct AiCandidateDiscoveryResult {
+    intent: String,
+    verification: CandidateVerification,
+}
+
+#[derive(Debug)]
 enum AppEvent {
     InitialLoadProgress(InitialLoadProgress),
     InitialLoadFinished(std::result::Result<InitialLoadData, String>),
@@ -2011,6 +2083,10 @@ enum AppEvent {
     AiCommandGenerated {
         request_id: u64,
         result: std::result::Result<Box<AiCommandGenerationResult>, String>,
+    },
+    AiCandidatesVerified {
+        request_id: u64,
+        result: std::result::Result<Box<AiCandidateDiscoveryResult>, String>,
     },
     AiGithubMonitorGenerated {
         request_id: u64,
@@ -2957,6 +3033,7 @@ impl App {
     fn start_ai_command_generation(
         &mut self,
         request: GenerationRequest,
+        verified_evidence: Option<GenerationEvidence>,
         configuration_hint: String,
     ) {
         if self.ai_generation_in_flight_request_id.is_some() {
@@ -3007,12 +3084,15 @@ impl App {
                     .duration_since(UNIX_EPOCH)
                     .map_err(|error| Error::Message(format!("system clock is invalid: {error}")))?
                     .as_secs();
-                let evidence = generation::collect_live_evidence(
-                    &request,
-                    &network,
-                    github_api_key.as_ref().map(|value| value.as_str()),
-                    collected_at_unix_secs,
-                )?;
+                let evidence = match verified_evidence {
+                    Some(evidence) => evidence,
+                    None => generation::collect_live_evidence(
+                        &request,
+                        &network,
+                        github_api_key.as_ref().map(|value| value.as_str()),
+                        collected_at_unix_secs,
+                    )?,
+                };
                 let generated = ai::generate_command(
                     &settings,
                     &network,
@@ -3032,7 +3112,85 @@ impl App {
         });
     }
 
-    fn start_ai_github_monitor_generation(&mut self, repository: String) {
+    fn start_ai_candidate_discovery(&mut self, intent: String) {
+        if self.ai_generation_in_flight_request_id.is_some() {
+            self.message = self
+                .language
+                .text(
+                    "The previous AI generation request is still finishing",
+                    "上一次 AI 生成请求仍在结束中",
+                )
+                .to_owned();
+            return;
+        }
+        if !self.settings.ai.configured() {
+            self.message = self
+                .language
+                .text(
+                    "Enable AI and configure its Base URL and model in Settings first",
+                    "请先在设置中启用 AI，并配置 Base URL 和模型",
+                )
+                .to_owned();
+            return;
+        }
+        let intent = intent.trim().to_owned();
+        if intent.is_empty() {
+            self.message = self
+                .language
+                .text(
+                    "Describe the tool you want to update first",
+                    "请先描述你想更新的工具",
+                )
+                .to_owned();
+            return;
+        }
+        self.ai_generation_request_id = self.ai_generation_request_id.wrapping_add(1).max(1);
+        let request_id = self.ai_generation_request_id;
+        self.ai_generation_loading = true;
+        self.ai_generation_in_flight_request_id = Some(request_id);
+        self.message = self
+            .language
+            .text(
+                "Analyzing the request and verifying authoritative candidates…",
+                "正在分析需求并验证权威候选…",
+            )
+            .to_owned();
+        let tx = self.tx.clone();
+        let settings = self.settings.ai.clone();
+        let network = self.settings.network.clone();
+        let encrypted_github_api_key = self.settings.github.encrypted_api_key.clone();
+        let context = ai::SystemContext::detect(&self.state.root().join("installs"));
+        thread::spawn(move || {
+            let result: Result<AiCandidateDiscoveryResult> = (|| {
+                let candidates = ai::analyze_tool_intent(&settings, &network, &context, &intent)?;
+                let github_api_key =
+                    credential::github_api_key(encrypted_github_api_key.as_deref())?;
+                let collected_at_unix_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|error| Error::Message(format!("system clock is invalid: {error}")))?
+                    .as_secs();
+                let verification = generation::verify_live_candidates(
+                    candidates,
+                    &network,
+                    github_api_key.as_ref().map(|value| value.as_str()),
+                    collected_at_unix_secs,
+                )?;
+                Ok(AiCandidateDiscoveryResult {
+                    intent,
+                    verification,
+                })
+            })();
+            let result = result.map(Box::new).map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::AiCandidatesVerified { request_id, result });
+        });
+    }
+
+    fn start_ai_github_monitor_generation(
+        &mut self,
+        name: String,
+        instructions: Option<String>,
+        repository: String,
+    ) {
         if self.ai_generation_in_flight_request_id.is_some() {
             self.message = self
                 .language
@@ -3088,6 +3246,8 @@ impl App {
                     &network,
                     github_api_key.as_deref().map(|value| value.as_str()),
                     &context,
+                    (!name.is_empty()).then_some(name.as_str()),
+                    instructions.as_deref(),
                     &repository,
                 )
             })()
@@ -3101,6 +3261,7 @@ impl App {
         self.modal = Modal::GithubMonitorForm {
             mode,
             original_index: index,
+            locked_identity: None,
             field: 0,
             name: TextInput::new(monitor.map(|value| value.name.clone()).unwrap_or_default()),
             repository: TextInput::new(
@@ -4037,6 +4198,86 @@ impl App {
                         }
                     }
                 }
+                AppEvent::AiCandidatesVerified { request_id, result } => {
+                    if self.ai_generation_in_flight_request_id == Some(request_id) {
+                        self.ai_generation_in_flight_request_id = None;
+                    }
+                    if request_id != self.ai_generation_request_id {
+                        continue;
+                    }
+                    self.ai_generation_loading = false;
+                    match result {
+                        Ok(discovery) => {
+                            let AiCandidateDiscoveryResult {
+                                intent,
+                                verification,
+                            } = *discovery;
+                            let Modal::AiToolIntent {
+                                intent: active_intent,
+                            } = &self.modal
+                            else {
+                                continue;
+                            };
+                            if active_intent.value.trim() != intent {
+                                self.message = self
+                                    .language
+                                    .text(
+                                        "Candidate result discarded because the request changed",
+                                        "需求已变化，已丢弃候选结果",
+                                    )
+                                    .to_owned();
+                                continue;
+                            }
+                            if verification.verified.is_empty() {
+                                self.message = match self.language {
+                                    Language::English => verification
+                                        .rejected
+                                        .first()
+                                        .map(|candidate| {
+                                            format!(
+                                                "No candidate could be verified: {}",
+                                                candidate.error
+                                            )
+                                        })
+                                        .unwrap_or_else(|| {
+                                            "No candidate could be verified".to_owned()
+                                        }),
+                                    Language::Chinese => {
+                                        "没有候选通过权威来源验证，请检查工具名称、网络或来源信息"
+                                            .to_owned()
+                                    }
+                                };
+                                continue;
+                            }
+                            let count = verification.verified.len();
+                            let rejected = verification.rejected;
+                            self.modal = Modal::AiCandidateSelection {
+                                intent,
+                                candidates: verification.verified,
+                                selected: 0,
+                                rejected,
+                            };
+                            self.message = match self.language {
+                                Language::English => {
+                                    format!("Choose from {count} verified update candidate(s)")
+                                }
+                                Language::Chinese => {
+                                    format!("请从 {count} 个已验证更新候选中选择")
+                                }
+                            };
+                        }
+                        Err(error) => {
+                            self.message = match self.language {
+                                Language::English => {
+                                    format!("AI candidate analysis failed: {error}")
+                                }
+                                Language::Chinese => {
+                                    "AI 候选分析失败，请检查 AI 设置、响应格式或网络连接".to_owned()
+                                }
+                            };
+                        }
+                    }
+                }
                 AppEvent::AiCommandGenerated { request_id, result } => {
                     if self.ai_generation_in_flight_request_id == Some(request_id) {
                         self.ai_generation_in_flight_request_id = None;
@@ -4052,8 +4293,38 @@ impl App {
                                 evidence,
                                 generated,
                             } = *generation_result;
-                            let Modal::AddCommand { form: active_form } = &self.modal else {
-                                continue;
+                            let active_form = match &self.modal {
+                                Modal::AddCommand { form } => (**form).clone(),
+                                Modal::AiCandidateSelection {
+                                    candidates,
+                                    selected,
+                                    ..
+                                } => {
+                                    let Some(VerifiedCandidate::Command {
+                                        request: selected_request,
+                                        evidence: selected_evidence,
+                                    }) = candidates.get(*selected)
+                                    else {
+                                        continue;
+                                    };
+                                    if selected_request != &request
+                                        || selected_evidence != &evidence
+                                    {
+                                        self.message = self
+                                            .language
+                                            .text(
+                                                "AI result discarded because the selected candidate changed",
+                                                "所选候选已变化，已丢弃 AI 结果",
+                                            )
+                                            .to_owned();
+                                        continue;
+                                    }
+                                    CommandForm::from_verified_command(
+                                        selected_request,
+                                        selected_evidence,
+                                    )
+                                }
+                                _ => continue,
                             };
                             let Ok(active_request) = active_form.generation_request(self.language)
                             else {
@@ -4099,8 +4370,12 @@ impl App {
                                 self.message = error;
                                 continue;
                             }
-                            let mut form =
-                                CommandForm::from_generated(active_form, generated, evidence);
+                            let mut form = CommandForm::from_generated(
+                                &active_form,
+                                &request,
+                                generated,
+                                evidence,
+                            );
                             if let Err(error) = form.submission(self.language) {
                                 self.message = match self.language {
                                     Language::English => format!(
@@ -4144,7 +4419,50 @@ impl App {
                     self.ai_generation_loading = false;
                     match result {
                         Ok(monitor) => {
+                            let locked_identity = match &self.modal {
+                                Modal::GithubMonitorForm {
+                                    locked_identity, ..
+                                } => locked_identity.clone(),
+                                _ => None,
+                            };
+                            if locked_identity.as_ref().is_some_and(|identity| {
+                                identity.name != monitor.name
+                                    || identity.repository != monitor.repository
+                            }) {
+                                self.message = self
+                                    .language
+                                    .text(
+                                        "AI changed the locked monitor identity; the generated result was rejected",
+                                        "AI 修改了锁定的监控名称或仓库，生成结果已拒绝",
+                                    )
+                                    .to_owned();
+                                continue;
+                            }
+                            let locked_name = match &self.modal {
+                                Modal::GithubMonitorForm { name, .. } if !name.value.is_empty() => {
+                                    Some(name.value.clone())
+                                }
+                                _ => None,
+                            };
+                            if locked_name
+                                .as_ref()
+                                .is_some_and(|name| name != &monitor.name)
+                            {
+                                self.message = self
+                                    .language
+                                    .text(
+                                        "AI changed the locked monitor name; the generated result was rejected",
+                                        "AI 修改了锁定的监控名称，生成结果已拒绝",
+                                    )
+                                    .to_owned();
+                                continue;
+                            }
+                            let generated_identity = LockedGithubMonitorIdentity {
+                                name: monitor.name.clone(),
+                                repository: monitor.repository.clone(),
+                            };
                             if let Modal::GithubMonitorForm {
+                                locked_identity,
                                 field,
                                 name,
                                 repository,
@@ -4161,6 +4479,7 @@ impl App {
                                 ..
                             } = &mut self.modal
                             {
+                                *locked_identity = Some(Box::new(generated_identity));
                                 *name = TextInput::new(monitor.name);
                                 *repository = TextInput::new(monitor.repository);
                                 *asset_regex = TextInput::new(monitor.asset_regex);
@@ -5543,17 +5862,27 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         && matches!(key.code, KeyCode::Char('g' | 'G'));
     if ctrl_g {
         match &app.modal {
+            Modal::AiToolIntent { intent } => {
+                let intent = intent.value.clone();
+                app.start_ai_candidate_discovery(intent);
+                return;
+            }
             Modal::AddCommand { form } => {
                 let configuration_hint = form.configuration_hint();
                 match form.generation_request(app.language) {
-                    Ok(request) => app.start_ai_command_generation(request, configuration_hint),
+                    Ok(request) => {
+                        app.start_ai_command_generation(request, None, configuration_hint)
+                    }
                     Err(error) => app.message = error,
                 }
                 return;
             }
-            Modal::GithubMonitorForm { repository, .. } => {
+            Modal::GithubMonitorForm {
+                name, repository, ..
+            } => {
+                let name = name.value.clone();
                 let repository = repository.value.clone();
-                app.start_ai_github_monitor_generation(repository);
+                app.start_ai_github_monitor_generation(name, None, repository);
                 return;
             }
             _ => {}
@@ -5562,7 +5891,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     if app.ai_generation_loading
         && matches!(
             app.modal,
-            Modal::AddCommand { .. } | Modal::GithubMonitorForm { .. }
+            Modal::AiToolIntent { .. }
+                | Modal::AiCandidateSelection { .. }
+                | Modal::AddCommand { .. }
+                | Modal::GithubMonitorForm { .. }
         )
     {
         app.cancel_ai_generation();
@@ -5615,6 +5947,119 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 }
             }
             app.modal = Modal::TargetVersion { name, version };
+        }
+        Modal::AiToolIntent { mut intent } => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.cancel_ai_generation();
+                    app.modal = Modal::None;
+                    return;
+                }
+                KeyCode::F(3) => {
+                    app.cancel_ai_generation();
+                    app.modal = Modal::AddCommand {
+                        form: Box::new(CommandForm::new_add()),
+                    };
+                    app.message = app
+                        .language
+                        .text("Advanced manual tool form opened", "已打开高级手工工具表单")
+                        .to_owned();
+                    return;
+                }
+                KeyCode::Enter => {
+                    let value = intent.value.clone();
+                    app.modal = Modal::AiToolIntent { intent };
+                    app.start_ai_candidate_discovery(value);
+                    return;
+                }
+                _ => {
+                    handle_text_input_key(&mut intent, key);
+                }
+            }
+            app.modal = Modal::AiToolIntent { intent };
+        }
+        Modal::AiCandidateSelection {
+            intent,
+            candidates,
+            mut selected,
+            rejected,
+        } => {
+            match key.code {
+                KeyCode::Esc => {
+                    app.modal = Modal::AiToolIntent {
+                        intent: TextInput::new(intent),
+                    };
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = previous_index(selected, candidates.len());
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = next_index(selected, candidates.len());
+                }
+                KeyCode::Enter => {
+                    let Some(candidate) = candidates.get(selected).cloned() else {
+                        app.message = app
+                            .language
+                            .text("No verified candidate is selected", "未选择已验证候选")
+                            .to_owned();
+                        app.modal = Modal::AiCandidateSelection {
+                            intent,
+                            candidates,
+                            selected,
+                            rejected,
+                        };
+                        return;
+                    };
+                    match candidate {
+                        VerifiedCandidate::Command { request, evidence } => {
+                            let configuration_hint =
+                                CommandForm::from_verified_command(&request, &evidence)
+                                    .configuration_hint();
+                            app.start_ai_command_generation(
+                                request,
+                                Some(evidence),
+                                configuration_hint,
+                            );
+                        }
+                        VerifiedCandidate::GithubRelease {
+                            name,
+                            repository,
+                            instructions,
+                            ..
+                        } => {
+                            app.open_github_monitor_form(MonitorFormMode::Add, None);
+                            if let Modal::GithubMonitorForm {
+                                locked_identity,
+                                name: form_name,
+                                repository: form_repository,
+                                ..
+                            } = &mut app.modal
+                            {
+                                *form_name = TextInput::new(name.clone());
+                                *form_repository = TextInput::new(repository.clone());
+                                *locked_identity = Some(Box::new(LockedGithubMonitorIdentity {
+                                    name: name.clone(),
+                                    repository: repository.clone(),
+                                }));
+                            }
+                            app.start_ai_github_monitor_generation(
+                                name,
+                                Some(instructions),
+                                repository,
+                            );
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            app.modal = Modal::AiCandidateSelection {
+                intent,
+                candidates,
+                selected,
+                rejected,
+            };
         }
         Modal::ConfirmAdd {
             mut form,
@@ -5671,6 +6116,15 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     form.field = form.field.cycle(1);
                     form.clear_selections();
                 }
+                _ if !save && form.field_is_locked(form.field) => {
+                    app.message = app
+                        .language
+                        .text(
+                            "This verified source field is locked",
+                            "此已验证来源字段已锁定",
+                        )
+                        .to_owned();
+                }
                 KeyCode::Left if form.field == CommandFormField::UpdateProvider && !ctrl => {
                     form.update_provider = Some(cycle_update_provider(form.update_provider, -1));
                     form.generation_evidence = None;
@@ -5698,7 +6152,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         ToolBackground::Auto => ToolBackground::Always,
                         ToolBackground::Always => ToolBackground::Auto,
                     };
-                    form.generation_evidence = None;
+                    if form.locked_request.is_none() {
+                        form.generation_evidence = None;
+                    }
                 }
                 _ if save => match form.submission(app.language) {
                     Ok(submission) => {
@@ -5711,7 +6167,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     if let Some(input) = form.input_mut(form.field) {
                         let previous_value = input.value.clone();
                         handle_text_input_key(input, key);
-                        if input.value != previous_value {
+                        let changed = input.value != previous_value;
+                        if changed && form.locked_request.is_none() {
                             form.generation_evidence = None;
                         }
                     }
@@ -5801,6 +6258,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::GithubMonitorForm {
             mode,
             original_index,
+            locked_identity,
             mut field,
             mut name,
             mut repository,
@@ -5830,6 +6288,15 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 KeyCode::BackTab | KeyCode::Up => {
                     field = (field + GITHUB_MONITOR_FORM_FIELD_COUNT - 1)
                         % GITHUB_MONITOR_FORM_FIELD_COUNT;
+                }
+                _ if !save && locked_identity.is_some() && matches!(field, 0 | 1) => {
+                    app.message = app
+                        .language
+                        .text(
+                            "The verified monitor name and repository are locked",
+                            "已验证的监控名称和仓库已锁定",
+                        )
+                        .to_owned();
                 }
                 KeyCode::Left if field == 4 => format = previous_release_format(format),
                 KeyCode::Right | KeyCode::Char(' ') if field == 4 => {
@@ -5877,8 +6344,21 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     &strip_components,
                     enabled,
                 )
-                .and_then(|monitor| app.save_github_monitor(original_index, monitor))
-                {
+                .and_then(|monitor| {
+                    if locked_identity.as_ref().is_some_and(|identity| {
+                        identity.name != monitor.name || identity.repository != monitor.repository
+                    }) {
+                        return Err(Error::Message(
+                            app.language
+                                .text(
+                                    "The verified monitor name and repository are locked",
+                                    "已验证的监控名称和仓库已锁定",
+                                )
+                                .to_owned(),
+                        ));
+                    }
+                    app.save_github_monitor(original_index, monitor)
+                }) {
                     Ok(index) => {
                         app.github_monitor_index = index;
                         app.tool_view = ToolView::Github;
@@ -5911,6 +6391,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             app.modal = Modal::GithubMonitorForm {
                 mode,
                 original_index,
+                locked_identity,
                 field,
                 name,
                 repository,
@@ -6335,7 +6816,10 @@ fn handle_paste(app: &mut App, text: &str) {
     if app.ai_generation_loading
         && matches!(
             app.modal,
-            Modal::AddCommand { .. } | Modal::GithubMonitorForm { .. }
+            Modal::AiToolIntent { .. }
+                | Modal::AiCandidateSelection { .. }
+                | Modal::AddCommand { .. }
+                | Modal::GithubMonitorForm { .. }
         )
     {
         app.cancel_ai_generation();
@@ -6343,13 +6827,25 @@ fn handle_paste(app: &mut App, text: &str) {
     match &mut app.modal {
         Modal::TomlEditor { editor } => editor.insert_text(text),
         Modal::TargetVersion { version, .. } => version.insert_text(text),
+        Modal::AiToolIntent { intent } => intent.insert_text(text),
         Modal::AddCommand { form } => {
+            if form.field_is_locked(form.field) {
+                app.message = app
+                    .language
+                    .text(
+                        "This verified source field is locked",
+                        "此已验证来源字段已锁定",
+                    )
+                    .to_owned();
+                return;
+            }
             let Some(input) = form.input_mut(form.field) else {
                 return;
             };
             let previous_value = input.value.clone();
             input.insert_text(text);
-            if input.value != previous_value {
+            let changed = input.value != previous_value;
+            if changed && form.locked_request.is_none() {
                 form.generation_evidence = None;
             }
         }
@@ -6419,6 +6915,7 @@ fn handle_paste(app: &mut App, text: &str) {
         }
         Modal::GithubMonitorForm {
             field,
+            locked_identity,
             name,
             repository,
             asset_regex,
@@ -6429,6 +6926,16 @@ fn handle_paste(app: &mut App, text: &str) {
             strip_components,
             ..
         } => {
+            if locked_identity.is_some() && matches!(*field, 0 | 1) {
+                app.message = app
+                    .language
+                    .text(
+                        "The verified monitor name and repository are locked",
+                        "已验证的监控名称和仓库已锁定",
+                    )
+                    .to_owned();
+                return;
+            }
             let input = match *field {
                 0 => Some(name),
                 1 => Some(repository),
@@ -6739,8 +7246,8 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
                     )
                     .to_owned();
             } else {
-                app.modal = Modal::AddCommand {
-                    form: Box::new(CommandForm::new_add()),
+                app.modal = Modal::AiToolIntent {
+                    intent: TextInput::new(String::new()),
                 };
             }
         }
@@ -7219,7 +7726,10 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
     if app.ai_generation_loading
         && matches!(
             app.modal,
-            Modal::AddCommand { .. } | Modal::GithubMonitorForm { .. }
+            Modal::AiToolIntent { .. }
+                | Modal::AiCandidateSelection { .. }
+                | Modal::AddCommand { .. }
+                | Modal::GithubMonitorForm { .. }
         )
         && matches!(
             mouse.kind,
@@ -7241,6 +7751,8 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 if let Modal::AddCommand { form } = &mut app.modal {
                     form.field = CommandFormField::from_index(hitbox.field)
                         .expect("editable command form field");
+                } else if let Modal::AiCandidateSelection { selected, .. } = &mut app.modal {
+                    *selected = hitbox.field;
                 } else if let Modal::NetworkProxy { field, .. } = &mut app.modal {
                     *field = hitbox.field;
                 } else if let Modal::GithubSettings { field, .. } = &mut app.modal {
@@ -7258,6 +7770,11 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 return;
             };
             if !modal_field_is_editable(&app.modal, hitbox.field) {
+                return;
+            }
+            if let Modal::AiCandidateSelection { selected, .. } = &mut app.modal {
+                *selected = hitbox.field;
+                app.modal_drag = None;
                 return;
             }
             if hitbox.field == 0
@@ -7386,6 +7903,10 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 version.cursor = target;
                 version.clear_selection();
                 app.modal_drag = Some((0, target));
+            } else if let Modal::AiToolIntent { intent } = &mut app.modal {
+                intent.cursor = target;
+                intent.clear_selection();
+                app.modal_drag = Some((0, target));
             } else if let Modal::GithubMonitorForm {
                 field,
                 name,
@@ -7486,6 +8007,9 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
             } else if let Modal::TargetVersion { version, .. } = &mut app.modal {
                 version.cursor = target;
                 version.selection_anchor = (target != anchor).then_some(anchor);
+            } else if let Modal::AiToolIntent { intent } = &mut app.modal {
+                intent.cursor = target;
+                intent.selection_anchor = (target != anchor).then_some(anchor);
             } else if let Modal::GithubMonitorForm {
                 name,
                 repository,
@@ -7608,11 +8132,20 @@ fn toml_editor_cursor_at(
 
 fn modal_field_is_editable(modal: &Modal, field: usize) -> bool {
     match modal {
-        Modal::AddCommand { .. } => CommandFormField::from_index(field).is_some(),
-        Modal::TargetVersion { .. } | Modal::GithubSettings { .. } | Modal::AiSettings { .. } => {
-            true
+        Modal::AddCommand { form } => {
+            CommandFormField::from_index(field).is_some_and(|field| !form.field_is_locked(field))
         }
-        Modal::GithubMonitorForm { .. } => field < GITHUB_MONITOR_FORM_FIELD_COUNT,
+        Modal::TargetVersion { .. }
+        | Modal::AiToolIntent { .. }
+        | Modal::GithubSettings { .. }
+        | Modal::AiSettings { .. } => true,
+        Modal::AiCandidateSelection { candidates, .. } => field < candidates.len(),
+        Modal::GithubMonitorForm {
+            locked_identity, ..
+        } => {
+            field < GITHUB_MONITOR_FORM_FIELD_COUNT
+                && !(locked_identity.is_some() && matches!(field, 0 | 1))
+        }
         Modal::NetworkProxy { proxy_mode, .. } => {
             field == 0 || (*proxy_mode == ProxyMode::Explicit && field <= 2)
         }
@@ -7624,6 +8157,7 @@ fn modal_cursor_at(app: &App, hitbox: ModalInputHitbox, column: u16) -> Option<u
     let input = match &app.modal {
         Modal::AddCommand { form } => form.input(CommandFormField::from_index(hitbox.field)?)?,
         Modal::TargetVersion { version, .. } => version,
+        Modal::AiToolIntent { intent } => intent,
         Modal::GithubSettings {
             api_key,
             poll_interval,
@@ -9570,6 +10104,195 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
 
     match &app.modal {
         Modal::None => {}
+        Modal::AiToolIntent { intent } => {
+            let inner = modal_panel(
+                frame,
+                area,
+                app.language.text("AI add tool", "AI 添加工具"),
+                100,
+                15,
+            );
+            let label = app.language.text("Request", "需求");
+            let value_width = input_value_width(inner.width, label);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        app.language.text(
+                            "Describe the tool you want to update in natural language.",
+                            "请用自然语言描述你想更新的工具。",
+                        ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw(""),
+                    modal_input_line(
+                        true,
+                        label,
+                        intent,
+                        app.language.text(
+                            "Update ripgrep installed with Cargo",
+                            "更新通过 Cargo 安装的 ripgrep",
+                        ),
+                        value_width,
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        app.language.text(
+                            "Examples: update CodeGraph · update my Python tool ruff",
+                            "示例：更新 CodeGraph · 更新我的 Python 工具 ruff",
+                        ),
+                        Style::default().fg(SUBTLE),
+                    ),
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("[Ctrl+G/Enter]", Style::default().fg(ACCENT)),
+                        Span::raw(app.language.text(" analyze candidates", " 分析候选")),
+                        Span::raw("    "),
+                        Span::styled("[F3]", Style::default().fg(ACCENT)),
+                        Span::raw(app.language.text(" advanced manual form", " 高级手工表单")),
+                        Span::raw("    "),
+                        Span::styled("[Esc]", Style::default().fg(ACCENT)),
+                        Span::raw(app.language.text(" cancel", " 取消")),
+                    ]),
+                ])
+                .style(Style::default().bg(PANEL_BG))
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+            if inner.height > 2 && value_width > 0 {
+                let label_width = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
+                let (visible_start, visible_end) = intent.visible_range(value_width);
+                app.modal_input_hitboxes.push(ModalInputHitbox {
+                    area: Rect::new(
+                        inner
+                            .x
+                            .saturating_add(2)
+                            .saturating_add(label_width)
+                            .saturating_add(2),
+                        inner.y.saturating_add(2),
+                        u16::try_from(value_width).unwrap_or(u16::MAX),
+                        1,
+                    ),
+                    field: 0,
+                    visible_start,
+                    visible_end,
+                });
+                let cursor_width =
+                    u16::try_from(display_width(&intent.value[visible_start..intent.cursor]))
+                        .unwrap_or(u16::MAX);
+                let cursor_x = inner
+                    .x
+                    .saturating_add(2)
+                    .saturating_add(label_width)
+                    .saturating_add(2)
+                    .saturating_add(cursor_width)
+                    .min(inner.right().saturating_sub(1));
+                frame.set_cursor_position(Position::new(cursor_x, inner.y.saturating_add(2)));
+            }
+        }
+        Modal::AiCandidateSelection {
+            candidates,
+            selected,
+            rejected,
+            ..
+        } => {
+            let panel_height = u16::try_from(candidates.len().saturating_mul(2).saturating_add(9))
+                .unwrap_or(u16::MAX)
+                .min(24);
+            let inner = modal_panel(
+                frame,
+                area,
+                app.language
+                    .text("Choose verified candidate", "选择已验证候选"),
+                112,
+                panel_height,
+            );
+            let mut lines = vec![
+                Line::styled(
+                    app.language.text(
+                        "Choose a verified update method. No source will be selected automatically.",
+                        "请选择一个已验证的更新方式；程序不会自动替你选择来源。",
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+            ];
+            for (index, candidate) in candidates.iter().enumerate() {
+                let active = index == *selected;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if active { "› " } else { "  " },
+                        Style::default().fg(if active { ACCENT } else { SUBTLE }),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} · {} · {}",
+                            candidate.name(),
+                            candidate.method_label(),
+                            candidate.identifier(),
+                        ),
+                        Style::default()
+                            .fg(if active { SUCCESS } else { Color::White })
+                            .add_modifier(if active {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]));
+                lines.push(Line::styled(
+                    format!(
+                        "    {} {} · {} {}",
+                        candidate.method_label(),
+                        candidate.update_version(),
+                        candidate.latest_summary().0,
+                        candidate.latest_summary().1,
+                    ),
+                    Style::default().fg(SUBTLE),
+                ));
+            }
+            if !rejected.is_empty() {
+                lines.push(Line::styled(
+                    match app.language {
+                        Language::English => {
+                            format!("{} unverified candidate(s) hidden", rejected.len())
+                        }
+                        Language::Chinese => {
+                            format!("已隐藏 {} 个未验证候选", rejected.len())
+                        }
+                    },
+                    Style::default().fg(WARNING_COLOR),
+                ));
+            }
+            lines.extend([
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled("[Enter]", Style::default().fg(ACCENT)),
+                    Span::raw(app.language.text(" choose and generate", " 选择并生成")),
+                    Span::raw("    "),
+                    Span::styled("[Esc]", Style::default().fg(ACCENT)),
+                    Span::raw(app.language.text(" edit request", " 修改需求")),
+                ]),
+            ]);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .style(Style::default().bg(PANEL_BG))
+                    .wrap(Wrap { trim: false }),
+                inner,
+            );
+            for index in 0..candidates.len() {
+                let row =
+                    u16::try_from(index.saturating_mul(2).saturating_add(2)).unwrap_or(u16::MAX);
+                if inner.height <= row {
+                    continue;
+                }
+                app.modal_input_hitboxes.push(ModalInputHitbox {
+                    area: Rect::new(inner.x, inner.y.saturating_add(row), inner.width, 2),
+                    field: index,
+                    visible_start: 0,
+                    visible_end: 0,
+                });
+            }
+        }
         Modal::ConfirmGithubMonitorUpdate { monitors } => {
             let inner = modal_panel(
                 frame,
@@ -9992,15 +10715,22 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let lines = vec![
                 Line::styled(
-                    match form.mode {
-                        CommandFormMode::Add => app.language.text(
-                            "Create a complete user-level custom-tool definition.",
-                            "创建一份完整的用户级自定义工具配置。",
-                        ),
-                        CommandFormMode::Edit => app.language.text(
-                            "Edit every field of the selected custom tool.",
-                            "编辑所选自定义工具的全部字段。",
-                        ),
+                    if form.locked_request.is_some() {
+                        app.language.text(
+                            "Verified source fields are locked; review the remaining generated fields.",
+                            "已验证的来源字段保持锁定；请检查其余生成字段。",
+                        )
+                    } else {
+                        match form.mode {
+                            CommandFormMode::Add => app.language.text(
+                                "Create a complete user-level custom-tool definition.",
+                                "创建一份完整的用户级自定义工具配置。",
+                            ),
+                            CommandFormMode::Edit => app.language.text(
+                                "Edit every field of the selected custom tool.",
+                                "编辑所选自定义工具的全部字段。",
+                            ),
+                        }
                     },
                     Style::default().fg(DIM),
                 ),
@@ -10204,6 +10934,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Modal::GithubMonitorForm {
             mode,
+            locked_identity,
             field,
             name,
             repository,
@@ -10276,10 +11007,17 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let lines = vec![
                 Line::styled(
-                    app.language.text(
-                        "Fields are strict: owner/repo, a valid Rust regex, and an absolute target path.",
-                        "字段严格校验：owner/repo、有效的 Rust 正则表达式，且目标路径必须为绝对路径。",
-                    ),
+                    if locked_identity.is_some() {
+                        app.language.text(
+                            "The verified name and repository are locked; review the generated asset settings.",
+                            "已验证的名称和仓库保持锁定；请检查生成的资产设置。",
+                        )
+                    } else {
+                        app.language.text(
+                            "Fields are strict: owner/repo, a valid Rust regex, and an absolute target path.",
+                            "字段严格校验：owner/repo、有效的 Rust 正则表达式，且目标路径必须为绝对路径。",
+                        )
+                    },
                     Style::default().fg(DIM),
                 ),
                 Line::raw(""),
@@ -10315,8 +11053,16 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     *field == 6,
                     labels[6],
                     app.language.text(
-                        if *cleanup_installer { "enabled" } else { "keep" },
-                        if *cleanup_installer { "自动清理" } else { "保留" },
+                        if *cleanup_installer {
+                            "enabled"
+                        } else {
+                            "keep"
+                        },
+                        if *cleanup_installer {
+                            "自动清理"
+                        } else {
+                            "保留"
+                        },
                     ),
                 ),
                 modal_input_line(
@@ -10340,13 +11086,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     "10000 (file: 0)",
                     value_width,
                 ),
-                modal_input_line(
-                    *field == 10,
-                    labels[10],
-                    strip_components,
-                    "0",
-                    value_width,
-                ),
+                modal_input_line(*field == 10, labels[10], strip_components, "0", value_width),
                 selector(
                     *field == 11,
                     labels[11],
@@ -12344,6 +13084,28 @@ impl CommandForm {
             platforms,
             resource_group,
         };
+        if let Some(request) = &self.locked_request
+            && let Err(error) = generation::validate_generated_against_evidence(
+                request,
+                self.generation_evidence.as_ref().ok_or_else(|| {
+                    language
+                        .text(
+                            "Verified source evidence is missing",
+                            "缺少已验证的来源证据",
+                        )
+                        .to_owned()
+                })?,
+                &name,
+                &tool,
+            )
+        {
+            return Err(match language {
+                Language::English => {
+                    format!("The verified source fields are locked: {error}")
+                }
+                Language::Chinese => "已验证的来源字段已锁定，不能修改".to_owned(),
+            });
+        }
         tool.validate_for_name(&name)
             .map_err(|error| error.to_string())?;
         Ok(CommandSubmission { name, tool })
@@ -14075,14 +14837,16 @@ mod tests {
     }
 
     #[test]
-    fn editing_an_ai_generated_form_invalidates_verified_evidence() {
+    fn editing_an_unlocked_generated_field_preserves_verified_source_evidence() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         let request = test_generation_request("codegraph");
         let mut form = test_command_form("codegraph", "npm install codegraph");
         configure_form_for_generation(&mut form, &request);
-        form.generation_evidence = Some(test_generation_evidence(&request));
+        let evidence = test_generation_evidence(&request);
+        form.locked_request = Some(request);
+        form.generation_evidence = Some(evidence.clone());
         form.field = CommandFormField::Probe;
         app.modal = Modal::AddCommand { form };
 
@@ -14093,19 +14857,23 @@ mod tests {
 
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { form } if form.generation_evidence.is_none()
+            Modal::AddCommand { form }
+                if form.probe.value == "codegraph --versionx"
+                    && form.generation_evidence.as_ref() == Some(&evidence)
         ));
     }
 
     #[test]
-    fn pasting_into_an_ai_generated_form_invalidates_verified_evidence() {
+    fn pasting_into_an_unlocked_generated_field_preserves_verified_source_evidence() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         let request = test_generation_request("codegraph");
         let mut form = test_command_form("codegraph", "npm install codegraph");
         configure_form_for_generation(&mut form, &request);
-        form.generation_evidence = Some(test_generation_evidence(&request));
+        let evidence = test_generation_evidence(&request);
+        form.locked_request = Some(request);
+        form.generation_evidence = Some(evidence.clone());
         form.field = CommandFormField::Probe;
         app.modal = Modal::AddCommand { form };
 
@@ -14113,19 +14881,23 @@ mod tests {
 
         assert!(matches!(
             &app.modal,
-            Modal::AddCommand { form } if form.generation_evidence.is_none()
+            Modal::AddCommand { form }
+                if form.probe.value == "codegraph --version --json"
+                    && form.generation_evidence.as_ref() == Some(&evidence)
         ));
     }
 
     #[test]
-    fn changing_a_generated_form_selector_invalidates_verified_evidence() {
+    fn changing_a_locked_generated_selector_is_rejected() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state, None).expect("app");
         let request = test_generation_request("codegraph");
         let mut form = test_command_form("codegraph", "npm install codegraph");
         configure_form_for_generation(&mut form, &request);
-        form.generation_evidence = Some(test_generation_evidence(&request));
+        let evidence = test_generation_evidence(&request);
+        form.locked_request = Some(request);
+        form.generation_evidence = Some(evidence.clone());
         form.field = CommandFormField::LatestSource;
         app.modal = Modal::AddCommand { form };
 
@@ -14134,9 +14906,10 @@ mod tests {
         assert!(matches!(
             &app.modal,
             Modal::AddCommand { form }
-                if form.latest_provider == LatestProviderChoice::Pypi
-                    && form.generation_evidence.is_none()
+                if form.latest_provider == LatestProviderChoice::Npm
+                    && form.generation_evidence.as_ref() == Some(&evidence)
         ));
+        assert!(app.message.contains("locked"));
     }
 
     #[test]
@@ -14196,7 +14969,7 @@ mod tests {
             .update_provider
             .update_version_command(&request.update_package);
         generated.tool.platforms = request.platforms.clone();
-        let form = CommandForm::from_generated(&active, generated, evidence);
+        let form = CommandForm::from_generated(&active, &request, generated, evidence);
         let submission = form.submission(Language::English).expect("submission");
         app.modal = Modal::ConfirmAdd {
             form: Box::new(form),
@@ -14218,6 +14991,82 @@ mod tests {
             "screen: {screen}"
         );
         assert!(screen.contains("Fetched at"), "screen: {screen}");
+    }
+
+    #[test]
+    fn verified_command_source_fields_cannot_be_changed_before_saving() {
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        let mut active = *test_command_form("codegraph", "");
+        configure_form_for_generation(&mut active, &request);
+        let mut generated = generated_command(
+            "codegraph",
+            &[
+                "npm",
+                "install",
+                "--global",
+                "@colbymchenry/codegraph@latest",
+            ],
+        );
+        generated.tool.latest = Some(request.latest.clone());
+        generated.tool.update_version = request
+            .update_provider
+            .update_version_command(&request.update_package);
+        generated.tool.platforms = request.platforms.clone();
+        let mut form = CommandForm::from_generated(&active, &request, generated, evidence);
+        form.update = TextInput::new("cargo install codegraph".to_owned());
+
+        let error = form
+            .submission(Language::English)
+            .err()
+            .expect("locked update source must not be saveable");
+
+        assert!(error.contains("verified source fields are locked"));
+    }
+
+    #[test]
+    fn verified_command_source_fields_ignore_keyboard_and_paste_edits() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        let mut active = *test_command_form("codegraph", "");
+        configure_form_for_generation(&mut active, &request);
+        let mut generated = generated_command(
+            "codegraph",
+            &[
+                "npm",
+                "install",
+                "--global",
+                "@colbymchenry/codegraph@latest",
+            ],
+        );
+        generated.tool.latest = Some(request.latest.clone());
+        generated.tool.update_version = request
+            .update_provider
+            .update_version_command(&request.update_package);
+        generated.tool.platforms = request.platforms.clone();
+        let mut form = CommandForm::from_generated(&active, &request, generated, evidence.clone());
+        form.field = CommandFormField::Update;
+        app.modal = Modal::AddCommand {
+            form: Box::new(form),
+        };
+
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        handle_paste(&mut app, " cargo install codegraph");
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.update.value
+                    == "npm install --global @colbymchenry/codegraph@latest"
+                    && form.generation_evidence.as_ref() == Some(&evidence)
+        ));
+        assert!(app.message.contains("locked"));
     }
 
     #[test]
@@ -14244,7 +15093,7 @@ mod tests {
             .update_provider
             .update_version_command(&request.update_package);
         generated.tool.platforms = request.platforms.clone();
-        let form = CommandForm::from_generated(&active, generated, evidence);
+        let form = CommandForm::from_generated(&active, &request, generated, evidence);
         let submission = form.submission(Language::English).expect("submission");
 
         app.save_command_form(form, submission);
@@ -14860,6 +15709,509 @@ mod tests {
     }
 
     #[test]
+    fn verified_intent_candidates_are_presented_for_user_selection() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let intent = "更新 CodeGraph".to_owned();
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        app.modal = Modal::AiToolIntent {
+            intent: TextInput::new(intent.clone()),
+        };
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 12;
+        app.ai_generation_in_flight_request_id = Some(12);
+
+        app.tx
+            .send(AppEvent::AiCandidatesVerified {
+                request_id: 12,
+                result: Ok(Box::new(AiCandidateDiscoveryResult {
+                    intent: intent.clone(),
+                    verification: generation::CandidateVerification {
+                        verified: vec![generation::VerifiedCandidate::Command {
+                            request,
+                            evidence,
+                        }],
+                        rejected: Vec::new(),
+                    },
+                })),
+            })
+            .expect("candidate discovery result");
+        app.process_events();
+
+        assert!(!app.ai_generation_loading);
+        assert!(matches!(
+            &app.modal,
+            Modal::AiCandidateSelection {
+                intent: selected_intent,
+                candidates,
+                selected: 0,
+                rejected,
+            } if selected_intent == &intent && candidates.len() == 1 && rejected.is_empty()
+        ));
+        let screen = render_test_screen(&mut app, 120, 30);
+        assert!(
+            screen.contains("Choose a verified update method"),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("npm"), "screen: {screen}");
+        assert!(
+            screen.contains("@colbymchenry/codegraph"),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("1.2.3"), "screen: {screen}");
+    }
+
+    #[test]
+    fn failed_candidate_summary_is_fully_localized_in_chinese() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let intent = "更新 ripgrep".to_owned();
+        app.language = Language::Chinese;
+        app.modal = Modal::AiToolIntent {
+            intent: TextInput::new(intent.clone()),
+        };
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 13;
+        app.ai_generation_in_flight_request_id = Some(13);
+        app.tx
+            .send(AppEvent::AiCandidatesVerified {
+                request_id: 13,
+                result: Ok(Box::new(AiCandidateDiscoveryResult {
+                    intent,
+                    verification: generation::CandidateVerification {
+                        verified: Vec::new(),
+                        rejected: vec![generation::RejectedCandidate {
+                            name: "ripgrep".to_owned(),
+                            method: generation::CandidateMethod::Command(UpdateProvider::Cargo),
+                            identifier: "ripgrep".to_owned(),
+                            error: "crates.io authoritative lookup failed".to_owned(),
+                        }],
+                    },
+                })),
+            })
+            .expect("failed candidate discovery result");
+
+        app.process_events();
+
+        assert_eq!(
+            app.message,
+            "没有候选通过权威来源验证，请检查工具名称、网络或来源信息"
+        );
+        assert!(!app.message.contains("authoritative"));
+        assert!(!app.message.contains("failed"));
+    }
+
+    #[test]
+    fn candidate_analysis_error_is_fully_localized_in_chinese() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.language = Language::Chinese;
+        app.modal = Modal::AiToolIntent {
+            intent: TextInput::new("更新 ripgrep".to_owned()),
+        };
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 14;
+        app.ai_generation_in_flight_request_id = Some(14);
+        app.tx
+            .send(AppEvent::AiCandidatesVerified {
+                request_id: 14,
+                result: Err("AI must return 1 to 5 tool candidates".to_owned()),
+            })
+            .expect("candidate analysis error");
+
+        app.process_events();
+
+        assert_eq!(
+            app.message,
+            "AI 候选分析失败，请检查 AI 设置、响应格式或网络连接"
+        );
+        assert!(!app.message.contains("must return"));
+    }
+
+    #[test]
+    fn selected_verified_candidate_accepts_its_matching_generation_result() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        app.modal = Modal::AiCandidateSelection {
+            intent: request.instructions.clone(),
+            candidates: vec![generation::VerifiedCandidate::Command {
+                request: request.clone(),
+                evidence: evidence.clone(),
+            }],
+            selected: 0,
+            rejected: Vec::new(),
+        };
+
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 27;
+        app.ai_generation_in_flight_request_id = Some(27);
+        let mut generated = generated_command(
+            "codegraph",
+            &[
+                "npm",
+                "install",
+                "--global",
+                "@colbymchenry/codegraph@latest",
+            ],
+        );
+        generated.tool.latest = Some(request.latest.clone());
+        generated.tool.update_version = request
+            .update_provider
+            .update_version_command(&request.update_package);
+        generated.tool.platforms = request.platforms.clone();
+        app.tx
+            .send(AppEvent::AiCommandGenerated {
+                request_id: 27,
+                result: Ok(Box::new(AiCommandGenerationResult {
+                    request: request.clone(),
+                    evidence,
+                    generated,
+                })),
+            })
+            .expect("matching generated command");
+
+        app.process_events();
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.name.value == "codegraph"
+                    && form.ai_request.value == request.instructions
+                    && form.update_provider == Some(UpdateProvider::Npm)
+                    && form.update_package.value == "@colbymchenry/codegraph"
+                    && form.update.value
+                        == "npm install --global @colbymchenry/codegraph@latest"
+                    && form.latest_provider == LatestProviderChoice::Npm
+                    && form.latest_value.value == "@colbymchenry/codegraph"
+                    && form.update_version.value
+                        == "npm install --global @colbymchenry/codegraph@{version}"
+                    && form.platforms.value == "macos, linux"
+                    && form.probe.value == "codegraph --version"
+                    && form.generation_evidence.as_ref() == Some(&test_generation_evidence(&request))
+        ));
+        assert!(!app.ai_generation_loading);
+        assert_eq!(app.ai_generation_in_flight_request_id, None);
+        assert!(app.message.contains("verified authoritative sources"));
+    }
+
+    #[test]
+    fn selected_verified_candidate_rejects_ai_changes_to_locked_sources() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        app.modal = Modal::AiCandidateSelection {
+            intent: request.instructions.clone(),
+            candidates: vec![generation::VerifiedCandidate::Command {
+                request: request.clone(),
+                evidence: evidence.clone(),
+            }],
+            selected: 0,
+            rejected: Vec::new(),
+        };
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 28;
+        app.ai_generation_in_flight_request_id = Some(28);
+        let mut generated = generated_command(
+            "codegraph",
+            &["cargo", "install", "@colbymchenry/codegraph"],
+        );
+        generated.tool.latest = Some(request.latest.clone());
+        generated.tool.update_version = request
+            .update_provider
+            .update_version_command(&request.update_package);
+        generated.tool.platforms = request.platforms.clone();
+        app.tx
+            .send(AppEvent::AiCommandGenerated {
+                request_id: 28,
+                result: Ok(Box::new(AiCommandGenerationResult {
+                    request,
+                    evidence,
+                    generated,
+                })),
+            })
+            .expect("generated command with changed source");
+
+        app.process_events();
+
+        assert!(!app.ai_generation_loading);
+        assert_eq!(app.ai_generation_in_flight_request_id, None);
+        assert!(matches!(app.modal, Modal::AiCandidateSelection { .. }));
+        assert!(app.message.contains("changed locked fields"));
+        assert!(app.message.contains("locked update command"));
+    }
+
+    #[test]
+    fn changing_candidate_selection_discards_the_in_flight_generation_result() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let first_request = test_generation_request("codegraph-npm");
+        let first_evidence = test_generation_evidence(&first_request);
+        let second_request = test_generation_request("codegraph-pnpm");
+        let second_evidence = test_generation_evidence(&second_request);
+        app.modal = Modal::AiCandidateSelection {
+            intent: first_request.instructions.clone(),
+            candidates: vec![
+                generation::VerifiedCandidate::Command {
+                    request: first_request.clone(),
+                    evidence: first_evidence.clone(),
+                },
+                generation::VerifiedCandidate::Command {
+                    request: second_request,
+                    evidence: second_evidence,
+                },
+            ],
+            selected: 0,
+            rejected: Vec::new(),
+        };
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 31;
+        app.ai_generation_in_flight_request_id = Some(31);
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert!(!app.ai_generation_loading);
+        assert_ne!(app.ai_generation_request_id, 31);
+        assert!(matches!(
+            &app.modal,
+            Modal::AiCandidateSelection { selected: 1, .. }
+        ));
+
+        let mut generated = generated_command(
+            "codegraph-npm",
+            &[
+                "npm",
+                "install",
+                "--global",
+                "@colbymchenry/codegraph@latest",
+            ],
+        );
+        generated.tool.latest = Some(first_request.latest.clone());
+        generated.tool.update_version = first_request
+            .update_provider
+            .update_version_command(&first_request.update_package);
+        generated.tool.platforms = first_request.platforms.clone();
+        app.tx
+            .send(AppEvent::AiCommandGenerated {
+                request_id: 31,
+                result: Ok(Box::new(AiCommandGenerationResult {
+                    request: first_request,
+                    evidence: first_evidence,
+                    generated,
+                })),
+            })
+            .expect("stale candidate generation result");
+
+        app.process_events();
+
+        assert_eq!(app.ai_generation_in_flight_request_id, None);
+        assert!(matches!(
+            &app.modal,
+            Modal::AiCandidateSelection { selected: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn github_release_candidate_opens_the_monitor_flow_with_locked_identity() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::AiCandidateSelection {
+            intent: "更新 ripgrep 的 GitHub Release".to_owned(),
+            candidates: vec![generation::VerifiedCandidate::GithubRelease {
+                name: "ripgrep-release".to_owned(),
+                repository: "BurntSushi/ripgrep".to_owned(),
+                instructions: "更新 ripgrep 的 GitHub Release".to_owned(),
+                latest_version: "14.1.1".to_owned(),
+                collected_at_unix_secs: 1_700_000_000,
+            }],
+            selected: 0,
+            rejected: Vec::new(),
+        };
+
+        let screen = render_test_screen(&mut app, 120, 30);
+        assert!(screen.contains("GitHub Release"), "screen: {screen}");
+        assert!(screen.contains("BurntSushi/ripgrep"), "screen: {screen}");
+        assert!(screen.contains("14.1.1"), "screen: {screen}");
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            &app.modal,
+            Modal::GithubMonitorForm {
+                name,
+                repository,
+                ..
+            } if name.value == "ripgrep-release"
+                && repository.value == "BurntSushi/ripgrep"
+        ));
+        assert_eq!(
+            app.message,
+            "Enable AI and configure its Base URL and model in Settings first"
+        );
+        assert!(!app.message.contains("provider"));
+        assert!(!app.message.contains("package"));
+    }
+
+    #[test]
+    fn selected_github_candidate_identity_cannot_be_changed_before_saving() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state.clone(), None).expect("app");
+        app.modal = Modal::AiCandidateSelection {
+            intent: "更新 ripgrep 的 GitHub Release".to_owned(),
+            candidates: vec![generation::VerifiedCandidate::GithubRelease {
+                name: "ripgrep-release".to_owned(),
+                repository: "BurntSushi/ripgrep".to_owned(),
+                instructions: "更新 ripgrep 的 GitHub Release".to_owned(),
+                latest_version: "14.1.1".to_owned(),
+                collected_at_unix_secs: 1_700_000_000,
+            }],
+            selected: 0,
+            rejected: Vec::new(),
+        };
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Modal::GithubMonitorForm {
+            repository,
+            asset_regex,
+            target_directory,
+            format,
+            max_download_bytes,
+            max_extracted_bytes,
+            max_extracted_files,
+            ..
+        } = &mut app.modal
+        else {
+            panic!("GitHub monitor form");
+        };
+        *repository = TextInput::new("someone/else".to_owned());
+        *asset_regex = TextInput::new(r"^ripgrep\.zip$".to_owned());
+        *target_directory =
+            TextInput::new(temporary.path().join("installed").display().to_string());
+        *format = ReleaseAssetFormat::Zip;
+        *max_download_bytes = TextInput::new("1024".to_owned());
+        *max_extracted_bytes = TextInput::new("2048".to_owned());
+        *max_extracted_files = TextInput::new("10".to_owned());
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::GithubMonitorForm { .. }));
+        assert!(app.message.contains("locked"));
+        assert!(!state.custom_config_path().exists());
+    }
+
+    #[test]
+    fn clicking_a_verified_candidate_selects_it_without_starting_generation() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let command_request = test_generation_request("codegraph");
+        let command_evidence = test_generation_evidence(&command_request);
+        app.modal = Modal::AiCandidateSelection {
+            intent: "更新我的开发工具".to_owned(),
+            candidates: vec![
+                generation::VerifiedCandidate::Command {
+                    request: command_request,
+                    evidence: command_evidence,
+                },
+                generation::VerifiedCandidate::GithubRelease {
+                    name: "ripgrep-release".to_owned(),
+                    repository: "BurntSushi/ripgrep".to_owned(),
+                    instructions: "更新我的开发工具".to_owned(),
+                    latest_version: "14.1.1".to_owned(),
+                    collected_at_unix_secs: 1_700_000_000,
+                },
+            ],
+            selected: 0,
+            rejected: Vec::new(),
+        };
+        render_test_screen(&mut app, 120, 30);
+        let second_candidate = app
+            .modal_input_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.field == 1)
+            .expect("second candidate hitbox")
+            .area;
+
+        handle_modal_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: second_candidate.x,
+                row: second_candidate.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(!app.ai_generation_loading);
+        assert!(matches!(
+            &app.modal,
+            Modal::AiCandidateSelection { selected: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn editing_natural_language_discards_stale_candidate_results() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let original_intent = "更新 CodeGraph".to_owned();
+        let request = test_generation_request("codegraph");
+        let evidence = test_generation_evidence(&request);
+        app.modal = Modal::AiToolIntent {
+            intent: TextInput::new(original_intent.clone()),
+        };
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 44;
+        app.ai_generation_in_flight_request_id = Some(44);
+
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+
+        assert!(!app.ai_generation_loading);
+        assert_ne!(app.ai_generation_request_id, 44);
+        assert!(matches!(
+            &app.modal,
+            Modal::AiToolIntent { intent } if intent.value == "更新 CodeGraph!"
+        ));
+
+        app.tx
+            .send(AppEvent::AiCandidatesVerified {
+                request_id: 44,
+                result: Ok(Box::new(AiCandidateDiscoveryResult {
+                    intent: original_intent,
+                    verification: generation::CandidateVerification {
+                        verified: vec![generation::VerifiedCandidate::Command {
+                            request,
+                            evidence,
+                        }],
+                        rejected: Vec::new(),
+                    },
+                })),
+            })
+            .expect("stale candidate result");
+
+        app.process_events();
+
+        assert_eq!(app.ai_generation_in_flight_request_id, None);
+        assert!(matches!(
+            &app.modal,
+            Modal::AiToolIntent { intent } if intent.value == "更新 CodeGraph!"
+        ));
+    }
+
+    #[test]
     fn ai_github_result_fills_every_strict_monitor_field() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -14919,6 +16271,65 @@ mod tests {
                 && max_extracted_files.value == "30"
                 && strip_components.value == "1"
         ));
+    }
+
+    #[test]
+    fn ai_github_result_cannot_change_a_selected_candidate_name() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.open_github_monitor_form(MonitorFormMode::Add, None);
+        let Modal::GithubMonitorForm {
+            name, repository, ..
+        } = &mut app.modal
+        else {
+            panic!("GitHub monitor form");
+        };
+        *name = TextInput::new("deepseek-reasonix".to_owned());
+        *repository = TextInput::new("esengine/DeepSeek-Reasonix".to_owned());
+        app.ai_generation_loading = true;
+        app.ai_generation_request_id = 5;
+        app.ai_generation_in_flight_request_id = Some(5);
+        let target = if cfg!(windows) {
+            PathBuf::from(r"C:\Tools\deepseek-reasonix")
+        } else {
+            PathBuf::from("/tmp/deepseek-reasonix")
+        };
+        app.tx
+            .send(AppEvent::AiGithubMonitorGenerated {
+                request_id: 5,
+                result: Ok(GithubReleaseMonitor {
+                    name: "another-valid-name".to_owned(),
+                    repository: "esengine/DeepSeek-Reasonix".to_owned(),
+                    asset_regex: r"^deepseek-reasonix\.zip$".to_owned(),
+                    target_directory: target,
+                    format: ReleaseAssetFormat::Zip,
+                    update_policy: ReleaseUpdatePolicy::Manual,
+                    cleanup_installer: true,
+                    max_download_bytes: 1_000,
+                    max_extracted_bytes: 2_000,
+                    max_extracted_files: 30,
+                    strip_components: 0,
+                    enabled: true,
+                }),
+            })
+            .expect("AI monitor with changed name");
+
+        app.process_events();
+
+        assert!(!app.ai_generation_loading);
+        assert!(matches!(
+            &app.modal,
+            Modal::GithubMonitorForm {
+                name,
+                repository,
+                asset_regex,
+                ..
+            } if name.value == "deepseek-reasonix"
+                && repository.value == "esengine/DeepSeek-Reasonix"
+                && asset_regex.value.is_empty()
+        ));
+        assert!(app.message.contains("changed the locked monitor name"));
     }
 
     #[test]
@@ -14984,6 +16395,79 @@ mod tests {
         app.open_github_monitor_form(MonitorFormMode::Add, None);
         let github = render_test_screen(&mut app, 140, 30);
         assert!(github.contains("Ctrl+G"), "screen: {github}");
+    }
+
+    #[test]
+    fn add_shortcut_opens_the_natural_language_tool_flow() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+
+        handle_command_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AiToolIntent { intent } if intent.value.is_empty()
+        ));
+        let screen = render_test_screen(&mut app, 120, 30);
+        assert!(
+            screen.contains("Describe the tool you want to update"),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("Ctrl+G"), "screen: {screen}");
+        assert!(screen.contains("F3"), "screen: {screen}");
+        assert!(!screen.contains("Update provider"), "screen: {screen}");
+    }
+
+    #[test]
+    fn f3_opens_the_advanced_manual_form_from_natural_language_flow() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::AiToolIntent {
+            intent: TextInput::new("更新 CodeGraph".to_owned()),
+        };
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+
+        assert!(matches!(
+            &app.modal,
+            Modal::AddCommand { form }
+                if form.mode == CommandFormMode::Add
+                    && form.field == CommandFormField::Name
+                    && form.name.value.is_empty()
+                    && form.update.value.is_empty()
+        ));
+        let screen = render_test_screen(&mut app, 140, 30);
+        assert!(screen.contains("Update provider"), "screen: {screen}");
+        assert!(screen.contains("Update package"), "screen: {screen}");
+        assert!(screen.contains("Process rules"), "screen: {screen}");
+        assert!(app.message.contains("Advanced manual tool form opened"));
+    }
+
+    #[test]
+    fn natural_language_generation_does_not_require_source_form_fields() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::AiToolIntent {
+            intent: TextInput::new("更新 CodeGraph".to_owned()),
+        };
+
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(
+            app.message,
+            "Enable AI and configure its Base URL and model in Settings first"
+        );
+        assert!(!app.message.contains("provider"));
+        assert!(!app.message.contains("package"));
     }
 
     #[test]
@@ -17593,6 +19077,7 @@ mod tests {
         app.modal = Modal::GithubMonitorForm {
             mode: MonitorFormMode::Add,
             original_index: None,
+            locked_identity: None,
             field: 2,
             name: TextInput::new("example".to_owned()),
             repository: TextInput::new("owner/repository".to_owned()),
@@ -17634,6 +19119,7 @@ mod tests {
         app.modal = Modal::GithubMonitorForm {
             mode: MonitorFormMode::Add,
             original_index: None,
+            locked_identity: None,
             field: GITHUB_MONITOR_FORM_FIELD_COUNT - 1,
             name: TextInput::new("example".to_owned()),
             repository: TextInput::new("owner/repository".to_owned()),

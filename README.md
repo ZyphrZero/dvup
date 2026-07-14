@@ -30,7 +30,7 @@ dvup
 | `PgUp` / `PgDn` | 在 Jobs 页滚动已展开的任务结果 |
 | `t` | 在 Tools 页打开当前生效配置的 TOML 编辑视图 |
 | `o` | 在 Tools 页使用系统文本编辑器直接打开同一个 TOML 配置文件 |
-| `c` | 添加自定义更新命令 |
+| `c` | 用自然语言添加自定义更新命令或 GitHub Release 监控；在输入窗口按 `F3` 可打开高级手工表单 |
 | `e` | 编辑或重命名选中的自定义命令 |
 | `d` | 删除选中的自定义命令（内置工具不能删除） |
 | `→` | 切换到下一个页面 |
@@ -151,17 +151,19 @@ dvup path/to/dvup_custom.toml
 
 TUI 默认使用英文，随时按 `L` 可切换为中文，再按一次切回英文。标签页、表头、工具与任务状态、帮助栏、表单、确认框、进程策略以及 dvup 在界面内生成的运行摘要都会即时使用当前语言；已经写入 Activity 的历史记录保留产生时的语言，外部工具 stdout/stderr 和持久化 Job 日志始终保持原文，确保诊断内容不被翻译改写。在添加命令、目标版本文本输入框和 TOML 编辑视图中，`l`/`L` 仍作为普通字符输入；退出输入界面后即可继续用 `L` 切换语言。
 
-在 TUI 中按 `c`，只需填写名称和命令。例如名称填写 `claude`，命令填写 `claude update`；也可以填写 `npm install -g package@latest`、`pnpm add -g package@latest` 或 `brew upgrade ripgrep`。填写后会先出现预览确认框，并明确提示“只保存，不执行”。保存完成后界面返回 Tools 页面并聚焦新工具；只有之后再次按 `Enter` 并确认更新，命令才会真正执行。
+在 TUI 的命令工具视图按 `c`，默认只显示一个自然语言输入框。用户不需要知道 provider、package、latest source 或 TOML 字段，可以直接输入“更新 CodeGraph”“用 npm 全局更新 `@colbymchenry/codegraph`”“更新我的 Python 工具 ruff”或“从 GitHub Release 更新 ripgrep”。按 `Enter` 或 `Ctrl+G` 后，dvup 才开始分析；输入窗口按 `F3` 可以打开包含全部字段的高级手工表单。高级表单不会替代默认流程，主要用于已经明确知道完整配置的用户。
 
 添加/编辑表单也支持通过 OpenAI 兼容接口辅助生成配置，不要求本机安装 Codex、Claude Code 或其他 Agent CLI。先在 Settings 页打开合并后的 `AI 生成` 设置，按“启用、Base URL、API Key、模型”的顺序配置：填写 Base URL 和可选 API Key 后按 `Ctrl+R` 获取 `/models` 列表，模型字段会自动带入首个结果，也可以聚焦模型字段后用左右键选择其他结果或直接输入模型名；按 `Ctrl+T` 可以在保存前用当前输入测试接口、鉴权和模型。AI 开关只控制是否允许生成，关闭后仍保留连接信息和已选模型。Base URL 可以填写到 `/v1`，dvup 会自动追加 `/chat/completions`；如果服务地址已经包含 `/chat/completions`，则不会重复追加。远程服务必须使用 HTTPS，HTTP 仅允许 `localhost`、回环 IP 或 `.localhost` 域名，避免明文传输凭据。API Key 使用与 GitHub 凭据相同的操作系统安全存储机制加密，明文不会写入 `settings.toml`；不需要鉴权的本地兼容服务可以留空。留空 API Key 会保留原值，聚焦该字段时按 `Ctrl+D` 可标记删除。
 
-在添加或编辑更新命令时，AI 生成使用一组明确且严格的输入：工具名称、专用的“AI 生成需求”、Update provider、Update package、最新版本来源及其 package/repository，以及目标平台。Update provider 只支持 `Homebrew`、`npm`、`pnpm`、`Cargo`、`pipx` 和 `uv`；最新版本来源只支持 `GitHub Release`、`GitHub Tag`、`npm`、`PyPI` 和 `crates.io`，没有 `Auto` 或 Scoop 选项。填写完这些字段后按 `Ctrl+G`，dvup 会先通过所选来源的官方结构化 API 实时查询版本证据，再把锁定请求、确定性的更新命令和权威证据交给模型。来源不存在、网络失败、标识错误或响应缺少必需数据时会立即失败；不会切换来源、抓取网页/README、回退到其他方案或让 AI 猜测。
+自然语言生成分成两个严格阶段。第一次 AI 调用只把用户需求分析成最多 5 个结构化候选，不生成命令或 TOML。候选命令的更新方式只允许 `Homebrew`、`npm`、`pnpm`、`Cargo`、`pipx` 和 `uv`，最新版本来源只允许 `GitHub Release`、`GitHub Tag`、`npm`、`PyPI` 和 `crates.io`；也可以提出一个 GitHub Release 监控候选。AI 响应必须是完整的纯 JSON，Markdown 代码块、说明文字、未知字段、重复候选、`Auto`、Scoop、网页地址和安装脚本都会被直接拒绝。
 
-AI 只能补全 probe、后台模式、进程规则、超时和重试等配置。工具名称、Update provider/package、最新版本 provider/package/repository、平台、`update` 和 `update_version` 都是锁定字段；模型返回值只要修改其中任意一项，整个结果就会被拒绝。通过校验后，表单会显示生成结果；确认页同时显示两个已验证来源、版本、获取时间和验证状态。用户修改任意生成字段后，已附着的证据状态会立即失效，需要重新按 `Ctrl+G` 取证。专用 AI 需求和证据只用于本次生成与确认，不会写入 `dvup_custom.toml`；最终保存仍只写完整 `UserTool`，也绝不会立即执行更新命令。
+候选只是待验证的假设，不会直接成为配置事实。dvup 会使用 npm、PyPI、crates.io、Homebrew Formula 和 GitHub 的官方结构化 API 逐个验证候选；命令候选的更新来源与最新版本来源必须同时成功，GitHub Release 候选必须存在真实 Release。界面只显示验证成功的候选，并隐藏失败候选；用户用方向键、`j`/`k` 或鼠标选择，再按 `Enter` 明确确认一个来源。选择后，候选名称和 package/repository 会被锁定；命令候选还会锁定 provider、平台、确定性的 `update` 与 `update_version`。之后任何来源失败或模型改动锁定字段都会让本次生成直接失败，不会自动换成另一个候选、切换来源、抓取网页/README 或回退到其他方案。
 
-在添加或编辑 GitHub 仓库监控时，先填写 `owner/repo` 或完整 GitHub URL，再按 `Ctrl+G`。dvup 会先从 GitHub 获取该仓库最新 Release 的真实资产名称，再让模型按当前系统和架构选择资产、生成 Rust 正则、格式、目标目录和安全解压上限；普通文件与压缩包默认安装到 dvup 的用户级安装目录，macOS DMG 默认安装到 `/Applications/<应用名>.app`。只有正则在最新 Release 中恰好匹配一个资产且全部严格配置校验通过时才会回填。用户仍可修改所有字段并决定是否保存。
+第二次 AI 调用只在用户选择之后发生。对于命令候选，它只能补全 probe、后台模式、进程规则、超时、重试和资源组等完整 `UserTool` 字段；dvup 会把第一次验证得到的实时版本证据一并发送，并在本地再次比对全部锁定字段和完整配置。通过校验后才打开完整结果表单供用户检查，确认页同时显示两个已验证来源、版本、获取时间和验证状态。结果表单中的名称、来源、更新命令和平台保持只读，用户仍可调整 probe、进程策略、超时、重试和资源组；保存前会再次比对锁定字段，因此不能通过键盘、鼠标、粘贴或其他路径绕过已选来源。
 
-AI 请求沿用 Settings 中选择的网络/代理策略。自定义工具生成只发送操作系统、架构、可用包管理器、dvup 的用户级安装目录、用户明确填写的生成需求、锁定字段、当前可编辑配置提示和实时权威证据；GitHub 监控生成还会发送最新 Release 的资产名称。不会发送现有配置文件、Activity 日志、任务日志或其他环境变量。模型输出始终被视为不可信候选值，必须经过 dvup 本地解析、锁定字段比对和完整配置校验。
+对于 GitHub Release 候选，选择后会进入专用监控流程。dvup 从 GitHub 获取最新 Release 的真实资产名称，再把用户原始自然语言需求和锁定的监控名称、仓库一起交给模型，按当前系统和架构生成严格 asset regex、格式、目标目录和安全解压上限；正则必须在该 Release 中恰好匹配一个兼容资产。结果表单中的名称和仓库保持锁定，其余字段仍由用户检查并决定是否保存。普通文件与压缩包安装到 dvup 的用户级安装目录，macOS DMG 安装到 `/Applications/<应用名>.app`；保存配置不会立即下载或安装。
+
+AI 请求沿用 Settings 中选择的网络/代理策略。请求只发送操作系统、架构、可用包管理器、dvup 的用户级安装目录、用户输入的自然语言需求、所选候选的锁定字段、当前可编辑配置提示和实时权威证据；GitHub 监控生成还会发送最新 Release 的资产名称。不会发送现有配置文件、Activity 日志、任务日志或其他环境变量。自然语言需求、候选和证据只存在于本次生成与确认流程，不会写入 `dvup_custom.toml`；最终保存只写经过校验的完整工具或监控配置，也绝不会立即执行更新。
 
 ## 命令行用法
 

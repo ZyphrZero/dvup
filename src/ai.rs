@@ -15,7 +15,9 @@ use crate::{
     },
     credential,
     error::{Error, Result},
-    generation::{self, GenerationEvidence, GenerationRequest},
+    generation::{
+        self, AnalyzedCandidate, GenerationCandidate, GenerationEvidence, GenerationRequest,
+    },
     settings::{AiSettings, NetworkSettings, ProxyMode},
 };
 
@@ -26,6 +28,7 @@ const MAX_GITHUB_RELEASE_BYTES: u64 = 1024 * 1024;
 const MAX_GENERATED_NAME_BYTES: usize = 128;
 const MAX_GENERATED_COMMAND_BYTES: usize = 4 * 1024;
 const MAX_GENERATED_FIELD_BYTES: usize = 4 * 1024;
+const MAX_GENERATION_CANDIDATES: usize = 5;
 const USER_AGENT: &str = concat!("dvup/", env!("CARGO_PKG_VERSION"));
 const PACKAGE_MANAGERS: &[&str] = &[
     "brew", "scoop", "winget", "apt", "dnf", "pacman", "npm", "pnpm", "bun", "cargo", "pipx", "uv",
@@ -247,11 +250,75 @@ pub(crate) fn generate_command(
     Ok(generated)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationCandidatesResponse {
+    candidates: Vec<GenerationCandidate>,
+}
+
+pub(crate) fn analyze_tool_intent(
+    settings: &AiSettings,
+    network: &NetworkSettings,
+    context: &SystemContext,
+    intent: &str,
+) -> Result<Vec<AnalyzedCandidate>> {
+    if !settings.configured() {
+        return Err(Error::Message(
+            "AI generation is disabled or incomplete".to_owned(),
+        ));
+    }
+    let intent = intent.trim();
+    if intent.is_empty() {
+        return Err(Error::Message(
+            "tool update description must be non-empty".to_owned(),
+        ));
+    }
+    let system = concat!(
+        "You analyze a user's tool-update intent and propose 1 to 5 distinct candidates. Return ",
+        "one JSON object only with exactly one property, candidates. candidates must be a non-empty ",
+        "array of tagged objects. A command candidate has exactly kind=command, name, ",
+        "update_provider, update_package, and latest. update_provider must be homebrew, npm, pnpm, ",
+        "cargo, pipx, or uv. latest must be an object ",
+        "with provider npm, pypi, crates_io, github_release, or github_tag plus its exact package or ",
+        "owner/repository. A GitHub Release candidate has exactly kind=github_release, name, and ",
+        "repository in owner/name form. Its name is a monitor identifier containing only ASCII letters, ",
+        "digits, dash, underscore, or dot; never copy owner/name into name. Respect an explicitly ",
+        "requested package manager. When the intent is ",
+        "ambiguous, propose distinct plausible installation methods for the user to choose from. ",
+        "Candidates are hypotheses that dvup will verify against authoritative APIs. Do not return ",
+        "commands, TOML, markdown, explanations, Auto, Scoop, webpages, or installer scripts."
+    );
+    let user = format!(
+        "Analyze this tool update request.\n{}\nintent={}",
+        context.prompt(),
+        serde_json::to_string(intent)?,
+    );
+    let response = chat_json::<GenerationCandidatesResponse>(settings, network, system, &user)?;
+    if response.candidates.is_empty() || response.candidates.len() > MAX_GENERATION_CANDIDATES {
+        return Err(Error::Message(format!(
+            "AI must return 1 to {MAX_GENERATION_CANDIDATES} tool candidates"
+        )));
+    }
+    let mut candidates = Vec::with_capacity(response.candidates.len());
+    for candidate in response.candidates {
+        let candidate = candidate.into_analyzed(intent)?;
+        if candidates.contains(&candidate) {
+            return Err(Error::Message(
+                "AI returned duplicate tool candidates".to_owned(),
+            ));
+        }
+        candidates.push(candidate);
+    }
+    Ok(candidates)
+}
+
 pub(crate) fn generate_github_monitor(
     settings: &AiSettings,
     network: &NetworkSettings,
     github_api_key: Option<&str>,
     context: &SystemContext,
+    locked_name: Option<&str>,
+    user_intent: Option<&str>,
     repository_hint: &str,
 ) -> Result<GithubReleaseMonitor> {
     if !settings.configured() {
@@ -260,6 +327,20 @@ pub(crate) fn generate_github_monitor(
         ));
     }
     let repository = normalize_github_repository(repository_hint)?;
+    let locked_name = locked_name.filter(|name| !name.is_empty());
+    if let Some(name) = locked_name
+        && !valid_github_release_monitor_name(name)
+    {
+        return Err(Error::Message(
+            "locked GitHub Release monitor name is invalid".to_owned(),
+        ));
+    }
+    let user_intent = user_intent.filter(|intent| !intent.is_empty());
+    if user_intent.is_some_and(|intent| intent.trim() != intent) {
+        return Err(Error::Message(
+            "GitHub monitor generation intent has surrounding whitespace".to_owned(),
+        ));
+    }
     let assets = latest_release_assets(network, github_api_key, &repository)?;
     if assets.is_empty() {
         return Err(Error::Message(format!(
@@ -275,18 +356,22 @@ pub(crate) fn generate_github_monitor(
         "update_policy (manual), cleanup_installer (boolean), max_download_bytes (integer), ",
         "max_extracted_bytes (integer; 0 for file), max_extracted_files (integer; 0 for file), ",
         "strip_components (integer), and enabled (true). Select only an asset compatible with the ",
-        "supplied operating system and architecture. Escape the exact stable filename shape into ",
+        "supplied operating system and architecture. If locked_monitor_name is not null, copy it ",
+        "exactly into name. Use user_intent only to choose unlocked monitor behavior; never let it ",
+        "override the repository, name, system compatibility, or safety limits. Escape the exact stable filename shape into ",
         "an anchored regex while allowing release version changes. Do not include markdown or ",
         "extra properties."
     );
     let user = format!(
-        "Generate a monitor for this repository.\n{}\nrepository={}\nlatest_release_assets={}",
+        "Generate a monitor for this repository.\n{}\nuser_intent={}\nlocked_monitor_name={}\nrepository={}\nlatest_release_assets={}",
         context.prompt(),
+        serde_json::to_string(&user_intent)?,
+        serde_json::to_string(&locked_name)?,
         repository,
         serde_json::to_string(&assets)?,
     );
     let monitor = chat_json::<GithubReleaseMonitor>(settings, network, system, &user)?;
-    validate_generated_monitor(monitor, &repository, context, &assets)
+    validate_generated_monitor(monitor, &repository, locked_name, context, &assets)
 }
 
 pub(crate) fn test_connection(settings: &AiSettings, network: &NetworkSettings) -> Result<()> {
@@ -351,22 +436,24 @@ pub(crate) fn list_models(settings: &AiSettings, network: &NetworkSettings) -> R
 fn validate_generated_monitor(
     mut monitor: GithubReleaseMonitor,
     repository: &str,
+    locked_name: Option<&str>,
     context: &SystemContext,
     assets: &[String],
 ) -> Result<GithubReleaseMonitor> {
-    if !valid_github_release_monitor_name(&monitor.name) {
-        monitor.name = repository
-            .rsplit_once('/')
-            .map(|(_, name)| name)
-            .unwrap_or(repository)
-            .to_owned();
-    }
     normalize_generated_target_directory(&mut monitor);
     monitor.validate()?;
     if monitor.repository != *repository {
         return Err(Error::Message(format!(
             "AI changed repository {repository} to {}",
             monitor.repository
+        )));
+    }
+    if let Some(locked_name) = locked_name
+        && monitor.name != locked_name
+    {
+        return Err(Error::Message(format!(
+            "AI changed locked monitor name {locked_name} to {}",
+            monitor.name
         )));
     }
     if monitor.update_policy != ReleaseUpdatePolicy::Manual || !monitor.enabled {
@@ -994,16 +1081,30 @@ mod tests {
         ];
 
         assert!(
-            validate_generated_monitor(monitor.clone(), "owner/example", &context, &assets).is_ok()
+            validate_generated_monitor(monitor.clone(), "owner/example", None, &context, &assets)
+                .is_ok()
         );
+
+        let mut changed_locked_name = monitor.clone();
+        changed_locked_name.name = "another-example".to_owned();
+        let error = validate_generated_monitor(
+            changed_locked_name,
+            "owner/example",
+            Some("example"),
+            &context,
+            &assets,
+        )
+        .expect_err("AI must not change a locked monitor name");
+        assert!(error.to_string().contains("changed locked monitor name"));
 
         for generated_name in ["owner/example", "Example CLI", "示例工具"] {
             let mut invalid_name = monitor.clone();
             invalid_name.name = generated_name.to_owned();
-            let normalized =
-                validate_generated_monitor(invalid_name, "owner/example", &context, &assets)
-                    .expect("invalid generated names are normalized");
-            assert_eq!(normalized.name, "example");
+            assert!(
+                validate_generated_monitor(invalid_name, "owner/example", None, &context, &assets,)
+                    .is_err(),
+                "invalid generated name `{generated_name}` must be rejected"
+            );
         }
 
         let mut outside = monitor.clone();
@@ -1012,50 +1113,75 @@ mod tests {
         } else {
             std::path::PathBuf::from("/opt/example")
         };
-        assert!(validate_generated_monitor(outside, "owner/example", &context, &assets).is_err());
+        assert!(
+            validate_generated_monitor(outside, "owner/example", None, &context, &assets).is_err()
+        );
 
         let mut root_target = monitor.clone();
         root_target.target_directory = root.clone();
         assert!(
-            validate_generated_monitor(root_target, "owner/example", &context, &assets).is_err()
+            validate_generated_monitor(root_target, "owner/example", None, &context, &assets)
+                .is_err()
         );
 
         let mut traversal = monitor.clone();
         traversal.target_directory = root.join("nested").join("..").join("..").join("outside");
-        assert!(validate_generated_monitor(traversal, "owner/example", &context, &assets).is_err());
+        assert!(
+            validate_generated_monitor(traversal, "owner/example", None, &context, &assets)
+                .is_err()
+        );
 
         let mut automatic = monitor.clone();
         automatic.update_policy = ReleaseUpdatePolicy::Automatic;
-        assert!(validate_generated_monitor(automatic, "owner/example", &context, &assets).is_err());
+        assert!(
+            validate_generated_monitor(automatic, "owner/example", None, &context, &assets)
+                .is_err()
+        );
 
         let mut disabled = monitor.clone();
         disabled.enabled = false;
-        assert!(validate_generated_monitor(disabled, "owner/example", &context, &assets).is_err());
+        assert!(
+            validate_generated_monitor(disabled, "owner/example", None, &context, &assets).is_err()
+        );
 
         let mut oversized = monitor.clone();
         oversized.name = "x".repeat(MAX_GENERATED_NAME_BYTES + 1);
-        assert!(validate_generated_monitor(oversized, "owner/example", &context, &assets).is_err());
+        assert!(
+            validate_generated_monitor(oversized, "owner/example", None, &context, &assets)
+                .is_err()
+        );
 
         let mut broad = monitor.clone();
         broad.asset_regex = r"^example-v[0-9.]+-.*$".to_owned();
-        assert!(validate_generated_monitor(broad, "owner/example", &context, &assets).is_err());
+        assert!(
+            validate_generated_monitor(broad, "owner/example", None, &context, &assets).is_err()
+        );
 
         let mut wrong_format = monitor;
         wrong_format.format = ReleaseAssetFormat::TarGz;
         assert!(
-            validate_generated_monitor(wrong_format.clone(), "owner/example", &context, &assets)
-                .is_err()
+            validate_generated_monitor(
+                wrong_format.clone(),
+                "owner/example",
+                None,
+                &context,
+                &assets,
+            )
+            .is_err()
         );
 
         let mut wrong_os = wrong_format.clone();
         wrong_os.asset_regex = r"^example-v[0-9.]+-darwin-arm64\.tar\.gz$".to_owned();
-        assert!(validate_generated_monitor(wrong_os, "owner/example", &context, &assets).is_err());
+        assert!(
+            validate_generated_monitor(wrong_os, "owner/example", None, &context, &assets).is_err()
+        );
 
         let mut wrong_arch = wrong_format;
         wrong_arch.asset_regex = r"^example-v[0-9.]+-linux-aarch64\.zip$".to_owned();
         wrong_arch.format = ReleaseAssetFormat::Zip;
         assert!(
-            validate_generated_monitor(wrong_arch, "owner/example", &context, &assets).is_err()
+            validate_generated_monitor(wrong_arch, "owner/example", None, &context, &assets)
+                .is_err()
         );
     }
 
@@ -1085,8 +1211,9 @@ mod tests {
         };
         let assets = vec!["Example-1.2.3-arm64.dmg".to_owned()];
 
-        let generated = validate_generated_monitor(monitor, "owner/example", &context, &assets)
-            .expect("generated DMG monitor");
+        let generated =
+            validate_generated_monitor(monitor, "owner/example", None, &context, &assets)
+                .expect("generated DMG monitor");
 
         assert_eq!(
             generated.target_directory,
@@ -1187,6 +1314,94 @@ mod tests {
         assert_eq!(generated.tool.retry_delay_secs, 2);
         assert_eq!(generated.tool.platforms, ["macos"]);
         assert_eq!(generated.tool.resource_group, None);
+        server.join().expect("test server");
+    }
+
+    #[test]
+    fn natural_language_analysis_returns_strict_tool_candidates() {
+        let (address, server) = spawn_chat_server(
+            r#"{
+                "candidates": [
+                    {
+                        "kind": "command",
+                        "name": "ripgrep",
+                        "update_provider": "homebrew",
+                        "update_package": "ripgrep",
+                        "latest": {
+                            "provider": "github_release",
+                            "repository": "BurntSushi/ripgrep"
+                        }
+                    },
+                    {
+                        "kind": "command",
+                        "name": "ripgrep",
+                        "update_provider": "cargo",
+                        "update_package": "ripgrep",
+                        "latest": {
+                            "provider": "crates_io",
+                            "package": "ripgrep"
+                        }
+                    },
+                    {
+                        "kind": "github_release",
+                        "name": "ripgrep-release",
+                        "repository": "BurntSushi/ripgrep"
+                    }
+                ]
+            }"#,
+            None,
+            &["更新 ripgrep", "available_package_managers=brew,cargo"],
+        );
+        let settings = AiSettings {
+            enabled: true,
+            base_url: Some(format!("http://{address}/v1")),
+            model: Some("test-model".to_owned()),
+            encrypted_api_key: None,
+        };
+        let network = NetworkSettings {
+            proxy_mode: ProxyMode::Direct,
+            proxy_url: None,
+            no_proxy: Vec::new(),
+        };
+        let context = SystemContext {
+            os: "macos",
+            arch: "aarch64",
+            available_package_managers: vec!["brew", "cargo"],
+            install_root: "/tmp/dvup/installs".to_owned(),
+        };
+
+        let candidates = analyze_tool_intent(&settings, &network, &context, "更新 ripgrep")
+            .expect("verified candidate protocol");
+
+        assert_eq!(candidates.len(), 3);
+        let generation::AnalyzedCandidate::Command(first) = &candidates[0] else {
+            panic!("first candidate must be a command tool");
+        };
+        assert_eq!(first.name, "ripgrep");
+        assert_eq!(first.instructions, "更新 ripgrep");
+        assert_eq!(first.update_provider, UpdateProvider::Homebrew);
+        assert_eq!(first.update_package, "ripgrep");
+        assert_eq!(first.platforms, ["macos".to_owned(), "linux".to_owned()]);
+        assert!(matches!(
+            first.latest,
+            LatestVersionSource::GithubRelease { ref repository }
+                if repository == "BurntSushi/ripgrep"
+        ));
+        let generation::AnalyzedCandidate::Command(second) = &candidates[1] else {
+            panic!("second candidate must be a command tool");
+        };
+        assert_eq!(second.update_provider, UpdateProvider::Cargo);
+        assert!(second.platforms.is_empty());
+        assert!(matches!(
+            &candidates[2],
+            generation::AnalyzedCandidate::GithubRelease {
+                name,
+                repository,
+                instructions,
+            } if name == "ripgrep-release"
+                && repository == "BurntSushi/ripgrep"
+                && instructions == "更新 ripgrep"
+        ));
         server.join().expect("test server");
     }
 

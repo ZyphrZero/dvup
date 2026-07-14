@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::LatestVersionSource,
+    config::{LatestVersionSource, valid_github_release_monitor_name},
     error::{Error, Result},
     settings::NetworkSettings,
     version,
@@ -12,7 +12,7 @@ use crate::{
 const HOMEBREW_FORMULA_API: &str = "https://formulae.brew.sh/api/formula";
 const MAX_SOURCE_RESPONSE_BYTES: u64 = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UpdateProvider {
     Homebrew,
@@ -102,12 +102,96 @@ impl UpdateProvider {
         }
     }
 
+    pub(crate) fn default_platforms(self) -> Vec<String> {
+        match self {
+            Self::Homebrew => vec!["macos".to_owned(), "linux".to_owned()],
+            Self::Npm | Self::Pnpm | Self::Cargo | Self::Pipx | Self::Uv => Vec::new(),
+        }
+    }
+
     fn evidence_provider(self) -> EvidenceProvider {
         match self {
             Self::Homebrew => EvidenceProvider::Homebrew,
             Self::Npm | Self::Pnpm => EvidenceProvider::Npm,
             Self::Cargo => EvidenceProvider::CratesIo,
             Self::Pipx | Self::Uv => EvidenceProvider::Pypi,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum GenerationCandidate {
+    Command {
+        name: String,
+        update_provider: UpdateProvider,
+        update_package: String,
+        latest: LatestVersionSource,
+    },
+    GithubRelease {
+        name: String,
+        repository: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AnalyzedCandidate {
+    Command(GenerationRequest),
+    GithubRelease {
+        name: String,
+        repository: String,
+        instructions: String,
+    },
+}
+
+impl GenerationCandidate {
+    pub(crate) fn into_analyzed(self, instructions: &str) -> Result<AnalyzedCandidate> {
+        match self {
+            Self::Command {
+                name,
+                update_provider,
+                update_package,
+                latest,
+            } => {
+                let request = GenerationRequest {
+                    name,
+                    instructions: instructions.to_owned(),
+                    update_provider,
+                    update_package,
+                    latest,
+                    platforms: update_provider.default_platforms(),
+                };
+                request.validate()?;
+                Ok(AnalyzedCandidate::Command(request))
+            }
+            Self::GithubRelease { name, repository } => {
+                for (label, value) in [
+                    ("tool name", name.as_str()),
+                    ("AI generation request", instructions),
+                    ("GitHub repository", repository.as_str()),
+                ] {
+                    if value.is_empty() || value.trim() != value {
+                        return Err(Error::Message(format!(
+                            "{label} must be non-empty without surrounding whitespace"
+                        )));
+                    }
+                }
+                if !valid_github_release_monitor_name(&name) {
+                    return Err(Error::Message(
+                        "GitHub Release monitor name must use only letters, digits, dash, underscore, or dot"
+                            .to_owned(),
+                    ));
+                }
+                LatestVersionSource::GithubRelease {
+                    repository: repository.clone(),
+                }
+                .validate("AI candidate")?;
+                Ok(AnalyzedCandidate::GithubRelease {
+                    name,
+                    repository,
+                    instructions: instructions.to_owned(),
+                })
+            }
         }
     }
 }
@@ -288,6 +372,81 @@ pub(crate) struct GenerationEvidence {
     pub(crate) latest: SourceEvidence,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VerifiedCandidate {
+    Command {
+        request: GenerationRequest,
+        evidence: GenerationEvidence,
+    },
+    GithubRelease {
+        name: String,
+        repository: String,
+        instructions: String,
+        latest_version: String,
+        collected_at_unix_secs: u64,
+    },
+}
+
+impl VerifiedCandidate {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Command { request, .. } => &request.name,
+            Self::GithubRelease { name, .. } => name,
+        }
+    }
+
+    pub(crate) fn method_label(&self) -> &'static str {
+        match self {
+            Self::Command { request, .. } => request.update_provider.label(),
+            Self::GithubRelease { .. } => "GitHub Release",
+        }
+    }
+
+    pub(crate) fn identifier(&self) -> &str {
+        match self {
+            Self::Command { request, .. } => &request.update_package,
+            Self::GithubRelease { repository, .. } => repository,
+        }
+    }
+
+    pub(crate) fn update_version(&self) -> &str {
+        match self {
+            Self::Command { evidence, .. } => &evidence.update.latest_version,
+            Self::GithubRelease { latest_version, .. } => latest_version,
+        }
+    }
+
+    pub(crate) fn latest_summary(&self) -> (&str, &str) {
+        match self {
+            Self::Command { evidence, .. } => (
+                evidence.latest.provider.label(),
+                &evidence.latest.latest_version,
+            ),
+            Self::GithubRelease { latest_version, .. } => ("GitHub Release", latest_version),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateMethod {
+    Command(UpdateProvider),
+    GithubRelease,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RejectedCandidate {
+    pub(crate) name: String,
+    pub(crate) method: CandidateMethod,
+    pub(crate) identifier: String,
+    pub(crate) error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateVerification {
+    pub(crate) verified: Vec<VerifiedCandidate>,
+    pub(crate) rejected: Vec<RejectedCandidate>,
+}
+
 pub(crate) trait AuthoritativeSources {
     fn homebrew_formula(&self, formula: &str) -> Result<SourceFacts>;
     fn npm_package(&self, package: &str) -> Result<SourceFacts>;
@@ -446,6 +605,66 @@ pub(crate) fn collect_live_evidence(
 ) -> Result<GenerationEvidence> {
     let sources = LiveAuthoritativeSources::new(version::network_agent(network)?, github_api_key);
     collect_evidence(request, &sources, collected_at_unix_secs)
+}
+
+pub(crate) fn verify_live_candidates(
+    candidates: Vec<AnalyzedCandidate>,
+    network: &NetworkSettings,
+    github_api_key: Option<&str>,
+    collected_at_unix_secs: u64,
+) -> Result<CandidateVerification> {
+    let sources = LiveAuthoritativeSources::new(version::network_agent(network)?, github_api_key);
+    Ok(verify_candidates(
+        candidates,
+        &sources,
+        collected_at_unix_secs,
+    ))
+}
+
+pub(crate) fn verify_candidates(
+    candidates: Vec<AnalyzedCandidate>,
+    sources: &impl AuthoritativeSources,
+    collected_at_unix_secs: u64,
+) -> CandidateVerification {
+    let mut verified = Vec::new();
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        match candidate {
+            AnalyzedCandidate::Command(request) => {
+                match collect_evidence(&request, sources, collected_at_unix_secs) {
+                    Ok(evidence) => verified.push(VerifiedCandidate::Command { request, evidence }),
+                    Err(error) => rejected.push(RejectedCandidate {
+                        name: request.name,
+                        method: CandidateMethod::Command(request.update_provider),
+                        identifier: request.update_package,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            AnalyzedCandidate::GithubRelease {
+                name,
+                repository,
+                instructions,
+            } => match sources.github_release(&repository).and_then(|facts| {
+                facts.validate(EvidenceProvider::GithubRelease, repository.clone())
+            }) {
+                Ok(evidence) => verified.push(VerifiedCandidate::GithubRelease {
+                    name,
+                    repository,
+                    instructions,
+                    latest_version: evidence.latest_version,
+                    collected_at_unix_secs,
+                }),
+                Err(error) => rejected.push(RejectedCandidate {
+                    name,
+                    method: CandidateMethod::GithubRelease,
+                    identifier: repository,
+                    error: error.to_string(),
+                }),
+            },
+        }
+    }
+    CandidateVerification { verified, rejected }
 }
 
 pub(crate) fn collect_evidence(
@@ -637,6 +856,102 @@ mod tests {
     }
 
     #[test]
+    fn candidate_verification_keeps_only_authoritatively_verified_choices() {
+        struct SelectiveSources;
+
+        impl AuthoritativeSources for SelectiveSources {
+            fn homebrew_formula(&self, formula: &str) -> crate::error::Result<SourceFacts> {
+                assert_eq!(formula, "ripgrep");
+                Ok(SourceFacts {
+                    latest_version: "14.1.1".to_owned(),
+                })
+            }
+
+            fn npm_package(&self, _: &str) -> crate::error::Result<SourceFacts> {
+                unreachable!("npm was not proposed")
+            }
+
+            fn pypi_project(&self, _: &str) -> crate::error::Result<SourceFacts> {
+                unreachable!("PyPI was not proposed")
+            }
+
+            fn crate_package(&self, package: &str) -> crate::error::Result<SourceFacts> {
+                assert_eq!(package, "ripgrep");
+                Err(Error::Message("crates.io lookup failed".to_owned()))
+            }
+
+            fn github_release(&self, repository: &str) -> crate::error::Result<SourceFacts> {
+                assert_eq!(repository, "BurntSushi/ripgrep");
+                Ok(SourceFacts {
+                    latest_version: "14.1.1".to_owned(),
+                })
+            }
+
+            fn github_tag(&self, _: &str) -> crate::error::Result<SourceFacts> {
+                unreachable!("GitHub tags were not proposed")
+            }
+        }
+
+        let candidates = vec![
+            AnalyzedCandidate::Command(GenerationRequest {
+                name: "ripgrep".to_owned(),
+                instructions: "更新 ripgrep".to_owned(),
+                update_provider: UpdateProvider::Homebrew,
+                update_package: "ripgrep".to_owned(),
+                latest: LatestVersionSource::GithubRelease {
+                    repository: "BurntSushi/ripgrep".to_owned(),
+                },
+                platforms: vec!["macos".to_owned(), "linux".to_owned()],
+            }),
+            AnalyzedCandidate::Command(GenerationRequest {
+                name: "ripgrep".to_owned(),
+                instructions: "更新 ripgrep".to_owned(),
+                update_provider: UpdateProvider::Cargo,
+                update_package: "ripgrep".to_owned(),
+                latest: LatestVersionSource::CratesIo {
+                    package: "ripgrep".to_owned(),
+                },
+                platforms: Vec::new(),
+            }),
+            AnalyzedCandidate::GithubRelease {
+                name: "ripgrep-release".to_owned(),
+                repository: "BurntSushi/ripgrep".to_owned(),
+                instructions: "更新 ripgrep".to_owned(),
+            },
+        ];
+
+        let verification = verify_candidates(candidates, &SelectiveSources, 1_700_000_000);
+
+        assert_eq!(verification.verified.len(), 2);
+        assert!(matches!(
+            &verification.verified[0],
+            VerifiedCandidate::Command { request, evidence }
+                if request.update_provider == UpdateProvider::Homebrew
+                    && evidence.update.latest_version == "14.1.1"
+        ));
+        assert!(matches!(
+            &verification.verified[1],
+            VerifiedCandidate::GithubRelease {
+                repository,
+                latest_version,
+                ..
+            } if repository == "BurntSushi/ripgrep" && latest_version == "14.1.1"
+        ));
+        assert_eq!(verification.rejected.len(), 1);
+        assert_eq!(verification.rejected[0].name, "ripgrep");
+        assert_eq!(
+            verification.rejected[0].method,
+            CandidateMethod::Command(UpdateProvider::Cargo)
+        );
+        assert_eq!(verification.rejected[0].identifier, "ripgrep");
+        assert!(
+            verification.rejected[0]
+                .error
+                .contains("crates.io lookup failed")
+        );
+    }
+
+    #[test]
     fn generation_request_rejects_whitespace_padded_source_identifiers() {
         let request = GenerationRequest {
             name: "ripgrep".to_owned(),
@@ -654,6 +969,18 @@ mod tests {
             .expect_err("source identifiers must be exact");
 
         assert!(error.to_string().contains("without surrounding whitespace"));
+    }
+
+    #[test]
+    fn github_candidate_rejects_a_repository_path_as_its_monitor_name() {
+        let error = GenerationCandidate::GithubRelease {
+            name: "esengine/DeepSeek-Reasonix".to_owned(),
+            repository: "esengine/DeepSeek-Reasonix".to_owned(),
+        }
+        .into_analyzed("更新 DeepSeek Reasonix")
+        .expect_err("monitor name must not contain a repository separator");
+
+        assert!(error.to_string().contains("GitHub Release monitor name"));
     }
 
     #[test]
