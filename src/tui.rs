@@ -49,8 +49,12 @@ use crate::{
         self, CommandCandidateVerification, GithubCandidateVerification, RejectedCommandCandidate,
         RejectedGithubCandidate, VerifiedCommandCandidate, VerifiedGithubCandidate,
     },
+    i18n::{MessageKey, message_key},
     job::{CommandSpec, JobStatus, JobStore},
-    release::{self, GithubAsset, GithubReleaseInfo, MonitorOutcome, MonitorStatus},
+    release::{
+        self, GithubAsset, GithubReleaseInfo, MonitorFailure, MonitorFailureStage, MonitorOutcome,
+        MonitorStatus,
+    },
     settings::{AiSettings, AppSettings, Language, NetworkSettings, ProxyMode},
     state::StateDirs,
     version, worker,
@@ -169,16 +173,12 @@ impl Availability {
     }
 
     fn label(self, language: Language) -> &'static str {
-        match (self, language) {
-            (Self::Installed, Language::English) => "installed",
-            (Self::Installed, Language::Chinese) => "已安装",
-            (Self::Missing, Language::English) => "missing",
-            (Self::Missing, Language::Chinese) => "未安装",
-            (Self::UpdaterMissing, Language::English) => "no updater",
-            (Self::UpdaterMissing, Language::Chinese) => "缺少更新器",
-            (Self::Unsupported, Language::English) => "unsupported",
-            (Self::Unsupported, Language::Chinese) => "不支持",
-        }
+        language.text(match self {
+            Self::Installed => message_key!("availability.installed"),
+            Self::Missing => message_key!("availability.missing"),
+            Self::UpdaterMissing => message_key!("availability.updater_missing"),
+            Self::Unsupported => message_key!("availability.unsupported"),
+        })
     }
 
     fn style(self) -> Style {
@@ -203,20 +203,16 @@ enum RunState {
 
 impl RunState {
     fn label(self, frame: u64, language: Language) -> &'static str {
-        match (self, language) {
-            (Self::Idle, _) => "",
-            (Self::Running, Language::English) if frame % 2 == 0 => "running ·",
-            (Self::Running, Language::English) => "running •",
-            (Self::Running, Language::Chinese) if frame % 2 == 0 => "运行中 ·",
-            (Self::Running, Language::Chinese) => "运行中 •",
-            (Self::UpToDate, Language::English) => "up to date",
-            (Self::UpToDate, Language::Chinese) => "已是最新",
-            (Self::Updated, Language::English) => "updated",
-            (Self::Updated, Language::Chinese) => "已更新",
-            (Self::Queued, Language::English) => "queued",
-            (Self::Queued, Language::Chinese) => "已排队",
-            (Self::Failed, Language::English) => "failed",
-            (Self::Failed, Language::Chinese) => "失败",
+        match self {
+            Self::Idle => "",
+            Self::Running if frame % 2 == 0 => {
+                language.text(message_key!("run_state.running_even"))
+            }
+            Self::Running => language.text(message_key!("run_state.running_odd")),
+            Self::UpToDate => language.text(message_key!("run_state.up_to_date")),
+            Self::Updated => language.text(message_key!("run_state.updated")),
+            Self::Queued => language.text(message_key!("run_state.queued")),
+            Self::Failed => language.text(message_key!("run_state.failed")),
         }
     }
 
@@ -330,14 +326,11 @@ fn activity_style(text: &str) -> Style {
 }
 
 fn activity_outcome_label(success: bool, queued: bool, language: Language) -> &'static str {
-    match (success, queued, language) {
-        (false, _, Language::English) => "FAILED",
-        (false, _, Language::Chinese) => "失败",
-        (true, true, Language::English) => "QUEUED",
-        (true, true, Language::Chinese) => "已排队",
-        (true, false, Language::English) => "OK",
-        (true, false, Language::Chinese) => "成功",
-    }
+    language.text(match (success, queued) {
+        (false, _) => message_key!("activity.failed"),
+        (true, true) => message_key!("activity.queued"),
+        (true, false) => message_key!("activity.ok"),
+    })
 }
 
 impl Language {
@@ -348,28 +341,19 @@ impl Language {
         }
     }
 
-    fn text(self, english: &'static str, chinese: &'static str) -> &'static str {
-        match self {
-            Self::English => english,
-            Self::Chinese => chinese,
-        }
-    }
-
     fn job_status(self, status: &JobStatus) -> &'static str {
-        match (self, status) {
-            (Self::English, JobStatus::Pending) => "pending",
-            (Self::Chinese, JobStatus::Pending) => "等待执行",
-            (Self::English, JobStatus::WaitingForLocks { .. }) => "waiting_for_locks",
-            (Self::Chinese, JobStatus::WaitingForLocks { .. }) => "等待进程退出",
-            (Self::English, JobStatus::TerminatingProcesses { .. }) => "terminating_processes",
-            (Self::Chinese, JobStatus::TerminatingProcesses { .. }) => "正在终止进程",
-            (Self::English, JobStatus::Running { .. }) => "running",
-            (Self::Chinese, JobStatus::Running { .. }) => "运行中",
-            (Self::English, JobStatus::Succeeded { .. }) => "succeeded",
-            (Self::Chinese, JobStatus::Succeeded { .. }) => "成功",
-            (Self::English, JobStatus::Failed { .. }) => "failed",
-            (Self::Chinese, JobStatus::Failed { .. }) => "失败",
-        }
+        self.text(match status {
+            JobStatus::Pending => message_key!("job_status.pending"),
+            JobStatus::WaitingForLocks { .. } => {
+                message_key!("job_status.waiting_for_locks")
+            }
+            JobStatus::TerminatingProcesses { .. } => {
+                message_key!("job_status.terminating_processes")
+            }
+            JobStatus::Running { .. } => message_key!("job_status.running"),
+            JobStatus::Succeeded { .. } => message_key!("job_status.succeeded"),
+            JobStatus::Failed { .. } => message_key!("job_status.failed"),
+        })
     }
 }
 
@@ -411,12 +395,10 @@ enum ToolKind {
 
 impl ToolKind {
     fn label(self, language: Language) -> &'static str {
-        match (self, language) {
-            (Self::BuiltIn, Language::English) => "built-in",
-            (Self::BuiltIn, Language::Chinese) => "内置",
-            (Self::Custom, Language::English) => "custom",
-            (Self::Custom, Language::Chinese) => "自定义",
-        }
+        language.text(match self {
+            Self::BuiltIn => message_key!("tool_kind.built_in"),
+            Self::Custom => message_key!("tool_kind.custom"),
+        })
     }
 }
 
@@ -543,12 +525,10 @@ impl ProcessStrategy {
     }
 
     fn label(self, language: Language) -> &'static str {
-        match (self, language) {
-            (Self::Wait, Language::English) => "WAIT",
-            (Self::Wait, Language::Chinese) => "等待",
-            (Self::Terminate, Language::English) => "TERMINATE",
-            (Self::Terminate, Language::Chinese) => "终止",
-        }
+        language.text(match self {
+            Self::Wait => message_key!("process_strategy.wait"),
+            Self::Terminate => message_key!("process_strategy.terminate"),
+        })
     }
 
     fn style(self) -> Style {
@@ -1784,11 +1764,14 @@ enum Modal {
     TomlEditor {
         editor: TomlEditor,
     },
-    NetworkProxy {
+    NetworkSettings {
         proxy_mode: ProxyMode,
         field: usize,
         proxy_url: TextInput,
         no_proxy: TextInput,
+        metadata_timeout: TextInput,
+        release_asset_setup_timeout: TextInput,
+        release_asset_body_timeout: TextInput,
     },
     GithubSettings {
         field: usize,
@@ -1818,12 +1801,10 @@ enum Operation {
 
 impl Operation {
     fn label(self, language: Language) -> &'static str {
-        match (self, language) {
-            (Self::Update, Language::English) => "update",
-            (Self::Update, Language::Chinese) => "更新",
-            (Self::Delete, Language::English) => "remove",
-            (Self::Delete, Language::Chinese) => "删除",
-        }
+        language.text(match self {
+            Self::Update => message_key!("operation.update"),
+            Self::Delete => message_key!("operation.delete"),
+        })
     }
 
     fn completion_message(
@@ -1834,24 +1815,23 @@ impl Operation {
         running: usize,
         language: Language,
     ) -> String {
-        match (self, success, language) {
-            (Self::Delete, true, Language::English) => format!("Removed {name}"),
-            (Self::Delete, true, Language::Chinese) => format!("已删除 {name}"),
-            (Self::Delete, false, Language::English) => {
-                format!("Could not remove {name}; open Activity to view the error")
+        match (self, success) {
+            (Self::Delete, true) => language.format(message_key!("operation.removed"), &[&name]),
+            (Self::Delete, false) => {
+                language.format(message_key!("operation.remove_failed"), &[&name])
             }
-            (Self::Delete, false, Language::Chinese) => {
-                format!("无法删除 {name}；请在活动页查看错误")
-            }
-            (Self::Update, _, Language::English) => format!(
-                "{name} {} in {:.1}s. {running} operation(s) still running.",
-                if success { "finished" } else { "failed" },
-                elapsed.as_secs_f64(),
-            ),
-            (Self::Update, _, Language::Chinese) => format!(
-                "{name} {}，耗时 {:.1} 秒；仍有 {running} 项操作在运行。",
-                if success { "已完成" } else { "失败" },
-                elapsed.as_secs_f64(),
+            (Self::Update, success) => language.format(
+                message_key!("operation.completed"),
+                &[
+                    &name,
+                    &language.text(if success {
+                        message_key!("operation.finished")
+                    } else {
+                        message_key!("operation.failed")
+                    }),
+                    &format!("{:.1}", elapsed.as_secs_f64()),
+                    &running,
+                ],
             ),
         }
     }
@@ -2102,14 +2082,13 @@ impl InitialLoadProgress {
     }
 
     fn label(self, language: Language) -> &'static str {
-        match (self.phase, language) {
-            (InitialLoadPhase::Configuration, Language::English) => "Loading configuration",
-            (InitialLoadPhase::Configuration, Language::Chinese) => "正在加载配置",
-            (InitialLoadPhase::Tools, Language::English) => "Checking installed tools",
-            (InitialLoadPhase::Tools, Language::Chinese) => "正在检查已安装工具",
-            (InitialLoadPhase::Jobs, Language::English) => "Loading job history",
-            (InitialLoadPhase::Jobs, Language::Chinese) => "正在加载任务历史",
-        }
+        language.text(match self.phase {
+            InitialLoadPhase::Configuration => {
+                message_key!("initial_load.configuration")
+            }
+            InitialLoadPhase::Tools => message_key!("initial_load.tools"),
+            InitialLoadPhase::Jobs => message_key!("initial_load.jobs"),
+        })
     }
 }
 
@@ -2273,13 +2252,12 @@ impl App {
             job_viewport: ListViewport::default(),
             activity: vec![
                 language
-                    .text("Welcome to dvup.", "欢迎使用 dvup。")
+                    .text(message_key!("tui.welcome_to_dvup"))
                     .to_owned(),
                 language
-                    .text(
-                        "Select tools with Space and press Enter to update.",
-                        "按 Space 选择工具，然后按 Enter 更新。",
-                    )
+                    .text(message_key!(
+                        "tui.select_tools_with_space_and_press_enter_to_update"
+                    ))
                     .to_owned(),
             ],
             activity_timestamps: vec![started_at.clone(), started_at],
@@ -2294,7 +2272,7 @@ impl App {
             language,
             process_strategy: ProcessStrategy::Wait,
             modal: Modal::None,
-            message: language.text("Ready", "就绪").to_owned(),
+            message: language.text(message_key!("common.ready")).to_owned(),
             running: 0,
             next_version_probe_id: 0,
             next_latest_probe_id: 0,
@@ -2410,7 +2388,8 @@ impl App {
                     .ok_or_else(|| {
                         Error::Message("GitHub API key is no longer configured".to_owned())
                     })?;
-                let agent = version::network_agent(&network)?;
+                let agent =
+                    version::network_agent(&network, version::NetworkRequestPolicy::Metadata)?;
                 version::fetch_github_rate_limit(&agent, api_key.as_str())
             })()
             .map_err(|error| error.to_string());
@@ -2434,7 +2413,7 @@ impl App {
         self.job_index = self.job_index.min(self.jobs.len().saturating_sub(1));
         self.last_job_refresh = Instant::now();
         self.initial_load = None;
-        self.message = self.language.text("Ready", "就绪").to_owned();
+        self.message = self.language.text(message_key!("common.ready")).to_owned();
         self.start_all_tool_version_probes();
         if self.settings.auto_diagnose_on_startup {
             let _ = self.refresh_doctor();
@@ -2609,7 +2588,10 @@ impl App {
             .as_ref()
             .is_none_or(|(cached, _)| cached != network)
         {
-            self.latest_agent = Some((network.clone(), version::network_agent(network)?));
+            self.latest_agent = Some((
+                network.clone(),
+                version::network_agent(network, version::NetworkRequestPolicy::Metadata)?,
+            ));
         }
         Ok(self
             .latest_agent
@@ -2630,22 +2612,22 @@ impl App {
         if tab == Tab::Doctor && self.doctor_never_scanned() {
             self.message = self
                 .language
-                .text(
-                    "Diagnostics have not been run. Press Enter to scan",
-                    "尚未运行诊断，按 Enter 开始扫描",
-                )
+                .text(message_key!(
+                    "tui.diagnostics_have_not_been_run_press_enter_to_scan"
+                ))
                 .to_owned();
         }
     }
 
     fn select_tool_view(&mut self, view: ToolView) {
         self.tool_view = view;
-        self.message = match (view, self.language) {
-            (ToolView::Commands, Language::English) => "Command tools".to_owned(),
-            (ToolView::Commands, Language::Chinese) => "命令工具".to_owned(),
-            (ToolView::Github, Language::English) => "GitHub repositories".to_owned(),
-            (ToolView::Github, Language::Chinese) => "GitHub 仓库".to_owned(),
-        };
+        self.message = self
+            .language
+            .text(match view {
+                ToolView::Commands => message_key!("tool_view.commands"),
+                ToolView::Github => message_key!("tool_view.github"),
+            })
+            .to_owned();
         if view == ToolView::Github
             && self.release_monitor_statuses.is_empty()
             && !self.github_monitors.is_empty()
@@ -2710,19 +2692,14 @@ impl App {
                     self.report_settings_save_error(error);
                     return;
                 }
-                self.message = match (self.settings.auto_diagnose_on_startup, self.language) {
-                    (true, Language::English) => {
-                        "Automatic startup diagnostics enabled; applies next time TUI starts"
-                            .to_owned()
-                    }
-                    (true, Language::Chinese) => {
-                        "已启用启动自动诊断；下次进入 TUI 时生效".to_owned()
-                    }
-                    (false, Language::English) => {
-                        "Automatic startup diagnostics disabled".to_owned()
-                    }
-                    (false, Language::Chinese) => "已关闭启动自动诊断".to_owned(),
-                };
+                self.message = self
+                    .language
+                    .text(if self.settings.auto_diagnose_on_startup {
+                        message_key!("settings_message.startup_diagnostics_enabled")
+                    } else {
+                        message_key!("settings_message.startup_diagnostics_disabled")
+                    })
+                    .to_owned();
             }
             1 => {
                 let focused_name = self.focused_tool().map(|tool| tool.name.clone());
@@ -2738,17 +2715,14 @@ impl App {
                 }
                 self.rebuild_visible_tool_indices(focused_name.as_deref());
                 self.reconcile_doctor_selection(focused_doctor_name.as_deref());
-                self.message = match (
-                    self.settings.hide_unsupported_and_missing_tools,
-                    self.language,
-                ) {
-                    (true, Language::English) => {
-                        "Unsupported and uninstalled tools are now hidden".to_owned()
-                    }
-                    (true, Language::Chinese) => "已隐藏不支持或未安装的工具".to_owned(),
-                    (false, Language::English) => "All configured tools are now shown".to_owned(),
-                    (false, Language::Chinese) => "已显示全部配置工具".to_owned(),
-                };
+                self.message = self
+                    .language
+                    .text(if self.settings.hide_unsupported_and_missing_tools {
+                        message_key!("settings_message.tools_hidden")
+                    } else {
+                        message_key!("settings_message.tools_shown")
+                    })
+                    .to_owned();
             }
             2 => self.open_network_editor(0),
             3 | 4 => {
@@ -2757,10 +2731,9 @@ impl App {
                 } else {
                     self.message = self
                         .language
-                        .text(
-                            "Proxy URL and bypass rules are only used in explicit mode",
-                            "代理地址和绕过规则仅用于显式代理模式",
-                        )
+                        .text(message_key!(
+                            "tui.proxy_url_and_bypass_rules_are_only_used_in_explicit_mode"
+                        ))
                         .to_owned();
                 }
             }
@@ -2780,10 +2753,9 @@ impl App {
         };
         self.message = self
             .language
-            .text(
-                "Configure GitHub access and repository monitoring together",
-                "统一配置 GitHub 访问凭据与仓库监控",
-            )
+            .text(message_key!(
+                "tui.configure_github_access_and_repository_monitoring_together"
+            ))
             .to_owned();
     }
 
@@ -2801,10 +2773,9 @@ impl App {
         };
         self.message = self
             .language
-            .text(
-                "Configure an OpenAI-compatible endpoint for assisted form generation",
-                "配置 OpenAI 兼容接口，用于辅助生成表单",
-            )
+            .text(message_key!(
+                "tui.configure_an_openai_compatible_endpoint_for_assisted_form_generation"
+            ))
             .to_owned();
     }
 
@@ -2821,10 +2792,9 @@ impl App {
         if self.ai_connection_test_in_flight_request_id.is_some() {
             self.message = self
                 .language
-                .text(
-                    "The previous AI connection test is still finishing",
-                    "上一次 AI 连接测试仍在结束中",
-                )
+                .text(message_key!(
+                    "tui.the_previous_ai_connection_test_is_still_finishing"
+                ))
                 .to_owned();
             return;
         }
@@ -2836,7 +2806,7 @@ impl App {
         self.ai_connection_test_succeeded = None;
         self.message = self
             .language
-            .text("Testing the AI connection…", "正在测试 AI 连接…")
+            .text(message_key!("tui.testing_the_ai_connection"))
             .to_owned();
         let network = self.settings.network.clone();
         let tx = self.tx.clone();
@@ -2858,10 +2828,9 @@ impl App {
         if self.ai_model_list_in_flight_request_id.is_some() {
             self.message = self
                 .language
-                .text(
-                    "The previous AI model request is still finishing",
-                    "上一次 AI 模型请求仍在结束中",
-                )
+                .text(message_key!(
+                    "tui.the_previous_ai_model_request_is_still_finishing"
+                ))
                 .to_owned();
             return;
         }
@@ -2871,7 +2840,7 @@ impl App {
         self.ai_model_list_in_flight_request_id = Some(request_id);
         self.message = self
             .language
-            .text("Fetching available AI models…", "正在获取可用 AI 模型…")
+            .text(message_key!("tui.fetching_available_ai_models"))
             .to_owned();
         let network = self.settings.network.clone();
         let tx = self.tx.clone();
@@ -2892,20 +2861,18 @@ impl App {
         if self.ai_generation_in_flight_request_id.is_some() {
             self.message = self
                 .language
-                .text(
-                    "The previous AI generation request is still finishing",
-                    "上一次 AI 生成请求仍在结束中",
-                )
+                .text(message_key!(
+                    "tui.the_previous_ai_generation_request_is_still_finishing"
+                ))
                 .to_owned();
             return None;
         }
         if !self.settings.ai.configured() {
             self.message = self
                 .language
-                .text(
-                    "Enable AI and configure its Base URL and model in Settings first",
-                    "请先在设置中启用 AI，并配置 Base URL 和模型",
-                )
+                .text(message_key!(
+                    "tui.enable_ai_and_configure_its_base_url_and_model_in_settings_first"
+                ))
                 .to_owned();
             return None;
         }
@@ -2913,10 +2880,9 @@ impl App {
         if intent.is_empty() {
             self.message = self
                 .language
-                .text(
-                    "Describe the tool you want to update first",
-                    "请先描述你想更新的工具",
-                )
+                .text(message_key!(
+                    "tui.describe_the_tool_you_want_to_update_first"
+                ))
                 .to_owned();
             return None;
         }
@@ -2926,10 +2892,9 @@ impl App {
         self.ai_generation_in_flight_request_id = Some(request_id);
         self.message = self
             .language
-            .text(
-                "Analyzing the request and verifying authoritative candidates…",
-                "正在分析需求并验证权威候选…",
-            )
+            .text(message_key!(
+                "tui.analyzing_the_request_and_verifying_authoritative_candidates"
+            ))
             .to_owned();
         Some((request_id, intent))
     }
@@ -3023,10 +2988,9 @@ impl App {
         flow.executable_candidates.clear();
         self.message = self
             .language
-            .text(
-                "Validating the package with its official registry…",
-                "正在通过对应官方 Registry 验证软件包…",
-            )
+            .text(message_key!(
+                "tui.validating_the_package_with_its_official_registry"
+            ))
             .to_owned();
         let network = self.settings.network.clone();
         let tx = self.tx.clone();
@@ -3051,7 +3015,7 @@ impl App {
         flow.current_version = None;
         self.message = self
             .language
-            .text("Testing the version probe…", "正在测试版本探测命令…")
+            .text(message_key!("tui.testing_the_version_probe"))
             .to_owned();
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -3071,7 +3035,7 @@ impl App {
         flow.current_version = None;
         self.message = self
             .language
-            .text("Testing the version probe…", "正在测试版本探测命令…")
+            .text(message_key!("tui.testing_the_version_probe"))
             .to_owned();
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -3093,10 +3057,9 @@ impl App {
         flow.latest_version = None;
         self.message = self
             .language
-            .text(
-                "Validating the selected official latest-version source…",
-                "正在验证所选官方最新版本来源…",
-            )
+            .text(message_key!(
+                "tui.validating_the_selected_official_latest_version_source"
+            ))
             .to_owned();
         let network = self.settings.network.clone();
         let encrypted_github_api_key = self.settings.github.encrypted_api_key.clone();
@@ -3125,10 +3088,9 @@ impl App {
         flow.variant = TextInput::new(String::new());
         self.message = self
             .language
-            .text(
-                "Fetching the latest Release and its real assets from GitHub…",
-                "正在从 GitHub 获取最新 Release 及真实资产…",
-            )
+            .text(message_key!(
+                "tui.fetching_the_latest_release_and_its_real_assets_from_github"
+            ))
             .to_owned();
         let github = self.settings.github.clone();
         let network = self.settings.network.clone();
@@ -3188,10 +3150,9 @@ impl App {
                 self.release_monitor_statuses
                     .retain(|status| status.name != name);
                 self.selected_github_monitors.remove(&name);
-                self.message = match self.language {
-                    Language::English => format!("Removed GitHub monitor {name}"),
-                    Language::Chinese => format!("已删除 GitHub 监控 {name}"),
-                };
+                self.message = self
+                    .language
+                    .format(message_key!("message.github_monitor_removed"), &[&name]);
             }
             Err(error) => self.report_custom_config_save_error(error),
         }
@@ -3203,10 +3164,9 @@ impl App {
             if manual {
                 self.message = self
                     .language
-                    .text(
-                        "A GitHub repository operation is already running",
-                        "GitHub 仓库操作正在进行中",
-                    )
+                    .text(message_key!(
+                        "tui.a_github_repository_operation_is_already_running"
+                    ))
                     .to_owned();
             }
             return;
@@ -3215,7 +3175,7 @@ impl App {
             if manual {
                 self.message = self
                     .language
-                    .text("No GitHub repositories configured", "尚未配置 GitHub 仓库")
+                    .text(message_key!("tui.no_github_repositories_configured"))
                     .to_owned();
             }
             self.last_release_refresh = Instant::now();
@@ -3226,10 +3186,7 @@ impl App {
         if manual {
             self.message = self
                 .language
-                .text(
-                    "Refreshing GitHub repository status…",
-                    "正在刷新 GitHub 仓库状态…",
-                )
+                .text(message_key!("tui.refreshing_github_repository_status"))
                 .to_owned();
         }
         let monitors = self.github_monitors.clone();
@@ -3248,10 +3205,9 @@ impl App {
         if self.release_probe_running || self.release_monitor_running {
             self.message = self
                 .language
-                .text(
-                    "A GitHub repository operation is already running",
-                    "GitHub 仓库操作正在进行中",
-                )
+                .text(message_key!(
+                    "tui.a_github_repository_operation_is_already_running"
+                ))
                 .to_owned();
             return;
         }
@@ -3259,10 +3215,10 @@ impl App {
             return;
         }
         self.release_monitor_running = true;
-        self.message = match self.language {
-            Language::English => format!("Installing {} GitHub repository update(s)…", names.len()),
-            Language::Chinese => format!("正在安装 {} 项 GitHub 仓库更新…", names.len()),
-        };
+        self.message = self.language.format(
+            message_key!("message.installing_github_updates"),
+            &[&names.len()],
+        );
         let monitors = self.github_monitors.clone();
         let github = self.settings.github.clone();
         let network = self.settings.network.clone();
@@ -3278,22 +3234,36 @@ impl App {
 
     fn open_network_editor(&mut self, requested_field: usize) {
         let proxy_mode = self.settings.network.proxy_mode;
-        self.modal = Modal::NetworkProxy {
+        self.modal = Modal::NetworkSettings {
             proxy_mode,
             field: if proxy_mode == ProxyMode::Explicit {
-                requested_field.min(2)
+                requested_field.min(5)
             } else {
                 0
             },
             proxy_url: TextInput::new(self.settings.network.proxy_url.clone().unwrap_or_default()),
             no_proxy: TextInput::new(self.settings.network.no_proxy.join(", ")),
+            metadata_timeout: TextInput::new(
+                self.settings.network.metadata_timeout_secs.to_string(),
+            ),
+            release_asset_setup_timeout: TextInput::new(
+                self.settings
+                    .network
+                    .release_asset_setup_timeout_secs
+                    .to_string(),
+            ),
+            release_asset_body_timeout: TextInput::new(
+                self.settings
+                    .network
+                    .release_asset_body_timeout_secs
+                    .to_string(),
+            ),
         };
         self.message = self
             .language
-            .text(
-                "Choose a network mode; explicit mode accepts an HTTP/HTTPS proxy",
-                "请选择网络模式；显式模式可填写 HTTP/HTTPS 代理",
-            )
+            .text(message_key!(
+                "tui.configure_proxy_behavior_and_request_timeouts"
+            ))
             .to_owned();
     }
 
@@ -3302,7 +3272,41 @@ impl App {
         proxy_mode: ProxyMode,
         proxy_url: String,
         no_proxy: String,
+        metadata_timeout: String,
+        release_asset_setup_timeout: String,
+        release_asset_body_timeout: String,
     ) -> bool {
+        let parse_timeout = |name: &str, value: &str| -> Result<u64> {
+            value.trim().parse::<u64>().map_err(|_| {
+                Error::InvalidConfig(format!("network {name} must be a whole number of seconds"))
+            })
+        };
+        let timeouts: Result<(u64, u64, u64)> = (|| {
+            Ok((
+                parse_timeout("metadata_timeout_secs", &metadata_timeout)?,
+                parse_timeout(
+                    "release_asset_setup_timeout_secs",
+                    &release_asset_setup_timeout,
+                )?,
+                parse_timeout(
+                    "release_asset_body_timeout_secs",
+                    &release_asset_body_timeout,
+                )?,
+            ))
+        })();
+        let (
+            metadata_timeout_secs,
+            release_asset_setup_timeout_secs,
+            release_asset_body_timeout_secs,
+        ) = match timeouts {
+            Ok(timeouts) => timeouts,
+            Err(error) => {
+                self.message = self
+                    .language
+                    .format(message_key!("message.invalid_network_settings"), &[&error]);
+                return false;
+            }
+        };
         let network = if proxy_mode == ProxyMode::Explicit {
             NetworkSettings {
                 proxy_mode,
@@ -3313,19 +3317,24 @@ impl App {
                     .filter(|entry| !entry.is_empty())
                     .map(str::to_owned)
                     .collect(),
+                metadata_timeout_secs,
+                release_asset_setup_timeout_secs,
+                release_asset_body_timeout_secs,
             }
         } else {
             NetworkSettings {
                 proxy_mode,
                 proxy_url: None,
                 no_proxy: Vec::new(),
+                metadata_timeout_secs,
+                release_asset_setup_timeout_secs,
+                release_asset_body_timeout_secs,
             }
         };
         if let Err(error) = network.validate() {
-            self.message = match self.language {
-                Language::English => format!("Invalid proxy settings: {error}"),
-                Language::Chinese => format!("代理设置无效：{error}"),
-            };
+            self.message = self
+                .language
+                .format(message_key!("message.invalid_network_settings"), &[&error]);
             return false;
         }
         let previous = std::mem::replace(&mut self.settings.network, network);
@@ -3345,21 +3354,15 @@ impl App {
         self.clear_github_rate_limit();
         self.start_github_rate_limit_refresh();
         if let Err(error) = self.refresh_tools() {
-            self.message = match self.language {
-                Language::English => format!("Network settings saved, but refresh failed: {error}"),
-                Language::Chinese => format!("网络设置已保存，但刷新失败：{error}"),
-            };
+            self.message = self.language.format(
+                message_key!("message.network_saved_refresh_failed"),
+                &[&error],
+            );
         } else {
-            self.message = match self.language {
-                Language::English => format!(
-                    "Network mode changed to {}",
-                    self.settings.network.proxy_mode.label()
-                ),
-                Language::Chinese => format!(
-                    "网络模式已切换为 {}",
-                    self.settings.network.proxy_mode.label()
-                ),
-            };
+            self.message = self
+                .language
+                .text(message_key!("message.network_saved"))
+                .to_owned();
         }
     }
 
@@ -3367,7 +3370,7 @@ impl App {
         if self.network_test_loading {
             self.message = self
                 .language
-                .text("Network test is already running", "网络测试正在进行中")
+                .text(message_key!("tui.network_test_is_already_running"))
                 .to_owned();
             return;
         }
@@ -3378,7 +3381,7 @@ impl App {
         self.network_test_results.clear();
         self.message = self
             .language
-            .text("Testing four registry endpoints…", "正在测试四个仓库端点…")
+            .text(message_key!("tui.testing_four_registry_endpoints"))
             .to_owned();
         if cfg!(test) {
             return;
@@ -3392,31 +3395,28 @@ impl App {
     }
 
     fn report_settings_save_error(&mut self, error: Error) {
-        self.message = match self.language {
-            Language::English => format!("Could not save settings: {error}"),
-            Language::Chinese => format!("无法保存设置：{error}"),
-        };
+        self.message = self
+            .language
+            .format(message_key!("message.settings_save_failed"), &[&error]);
     }
 
     fn report_custom_config_save_error(&mut self, error: Error) {
-        self.message = match self.language {
-            Language::English => format!("Could not save custom configuration: {error}"),
-            Language::Chinese => format!("无法保存自定义配置：{error}"),
-        };
+        self.message = self
+            .language
+            .format(message_key!("message.custom_config_save_failed"), &[&error]);
     }
 
     fn report_refresh_error(&mut self, error: Error) {
-        self.message = match self.language {
-            Language::English => format!("Refresh failed: {error}"),
-            Language::Chinese => format!("刷新失败：{error}"),
-        };
+        self.message = self
+            .language
+            .format(message_key!("message.refresh_failed"), &[&error]);
     }
 
     fn refresh_doctor(&mut self) -> Result<()> {
         if self.doctor_loading {
             self.message = self
                 .language
-                .text("Diagnostics are already running", "诊断正在进行中，请稍候")
+                .text(message_key!("tui.diagnostics_are_already_running"))
                 .to_owned();
             return Ok(());
         }
@@ -3428,7 +3428,7 @@ impl App {
         self.doctor_loading = true;
         self.message = self
             .language
-            .text("Scanning installation conflicts…", "正在扫描安装冲突…")
+            .text(message_key!("tui.scanning_installation_conflicts"))
             .to_owned();
         let tx = self.tx.clone();
         let network = self.settings.network.clone();
@@ -3641,10 +3641,10 @@ impl App {
                     self.push_activity_output(&output);
                     if operation != Operation::Update {
                         if let Err(error) = self.refresh_tools() {
-                            let line = match self.language {
-                                Language::English => format!("refresh failed: {error}"),
-                                Language::Chinese => format!("刷新失败：{error}"),
-                            };
+                            let line = self.language.format(
+                                message_key!("message.refresh_failed_lowercase"),
+                                &[&error],
+                            );
                             self.push_activity(line);
                         }
                     }
@@ -3709,10 +3709,9 @@ impl App {
                     self.doctor_loading = false;
                     self.doctor_checked_at = Some(datetime::now());
                     if let Some(error) = error {
-                        self.message = match self.language {
-                            Language::English => format!("Diagnostics failed: {error}"),
-                            Language::Chinese => format!("诊断失败：{error}"),
-                        };
+                        self.message = self
+                            .language
+                            .format(message_key!("message.diagnostics_failed"), &[&error]);
                         continue;
                     }
                     let focused_name = self
@@ -3725,15 +3724,10 @@ impl App {
                         .filter(|diagnosis| diagnosis.has_conflict())
                         .count();
                     let visible_count = self.visible_doctor_count();
-                    self.message = match self.language {
-                        Language::English => format!(
-                            "Diagnostics complete: {} tool(s), {conflicts} conflict(s)",
-                            visible_count
-                        ),
-                        Language::Chinese => {
-                            format!("诊断完成：{} 个工具，{conflicts} 项冲突", visible_count)
-                        }
-                    };
+                    self.message = self.language.format(
+                        message_key!("message.diagnostics_complete"),
+                        &[&visible_count, &conflicts],
+                    );
                 }
                 AppEvent::NetworkTestResolved { probe_id, results } => {
                     if self.network_test_probe_id != probe_id {
@@ -3747,23 +3741,19 @@ impl App {
                                 .filter(|result| result.error.is_some())
                                 .count();
                             self.network_test_results = results;
-                            self.message = match self.language {
-                                Language::English => format!(
-                                    "Network test complete: {} succeeded, {failed} failed",
-                                    self.network_test_results.len().saturating_sub(failed)
-                                ),
-                                Language::Chinese => format!(
-                                    "网络测试完成：{} 项成功，{failed} 项失败",
-                                    self.network_test_results.len().saturating_sub(failed)
-                                ),
-                            };
+                            self.message = self.language.format(
+                                message_key!("message.network_test_complete"),
+                                &[
+                                    &self.network_test_results.len().saturating_sub(failed),
+                                    &failed,
+                                ],
+                            );
                         }
                         Err(error) => {
                             self.network_test_results.clear();
-                            self.message = match self.language {
-                                Language::English => format!("Network test failed: {error}"),
-                                Language::Chinese => format!("网络测试失败：{error}"),
-                            };
+                            self.message = self
+                                .language
+                                .format(message_key!("message.network_test_failed"), &[&error]);
                         }
                     }
                 }
@@ -3774,37 +3764,16 @@ impl App {
                         Ok(statuses) => {
                             let automatic =
                                 automatic_release_update_names(&self.github_monitors, &statuses);
-                            let failed = statuses
-                                .iter()
-                                .filter(|status| status.error.is_some())
-                                .count();
-                            let available = statuses
-                                .iter()
-                                .filter(|status| {
-                                    status.latest_tag.is_some()
-                                        && !monitor_status_is_current(status)
-                                })
-                                .count();
+                            self.message = release_probe_message(&statuses, self.language);
                             self.release_monitor_statuses = statuses;
-                            self.message = match self.language {
-                                Language::English => format!(
-                                    "GitHub repositories refreshed: {available} update(s), {failed} failed"
-                                ),
-                                Language::Chinese => format!(
-                                    "GitHub 仓库刷新完成：{available} 项可更新，{failed} 项失败"
-                                ),
-                            };
                             if !automatic.is_empty() {
                                 self.start_release_updates(automatic);
                             }
                         }
                         Err(error) => {
-                            self.message = match self.language {
-                                Language::English => {
-                                    format!("GitHub repository refresh failed: {error}")
-                                }
-                                Language::Chinese => format!("GitHub 仓库刷新失败：{error}"),
-                            };
+                            self.message = self
+                                .language
+                                .format(message_key!("message.github_refresh_failed"), &[&error]);
                         }
                     }
                 }
@@ -3813,14 +3782,6 @@ impl App {
                     self.last_release_refresh = Instant::now();
                     match results {
                         Ok(results) => {
-                            let updated = results
-                                .iter()
-                                .filter(|outcome| matches!(outcome, MonitorOutcome::Updated { .. }))
-                                .count();
-                            let failed = results
-                                .iter()
-                                .filter(|outcome| matches!(outcome, MonitorOutcome::Failed { .. }))
-                                .count();
                             for outcome in &results {
                                 match outcome {
                                     MonitorOutcome::Updated { name, tag, asset } => {
@@ -3831,39 +3792,33 @@ impl App {
                                             Some(asset),
                                             None,
                                         );
-                                        self.push_activity(match self.language {
-                                            Language::English => format!(
-                                                "GitHub Release updated {name} to {tag} from {asset}"
-                                            ),
-                                            Language::Chinese => format!(
-                                                "GitHub Release 已将 {name} 更新到 {tag}（{asset}）"
-                                            ),
-                                        });
+                                        self.push_activity(self.language.format(
+                                            message_key!("message.github_release_updated"),
+                                            &[&name, &tag, &asset],
+                                        ));
                                     }
-                                    MonitorOutcome::Failed { name, error } => {
+                                    MonitorOutcome::Failed { name, failure } => {
                                         if let Some(status) = self
                                             .release_monitor_statuses
                                             .iter_mut()
                                             .find(|status| status.name == *name)
                                         {
-                                            status.error = Some(error.clone());
+                                            status.failure = Some(failure.clone());
                                         } else {
                                             self.release_monitor_statuses.push(MonitorStatus {
                                                 name: name.clone(),
                                                 installed_tag: None,
                                                 latest_tag: None,
                                                 asset: None,
-                                                error: Some(error.clone()),
+                                                failure: Some(failure.clone()),
                                             });
                                         }
-                                        self.push_activity(match self.language {
-                                            Language::English => format!(
-                                                "GitHub Release monitor {name} failed: {error}"
-                                            ),
-                                            Language::Chinese => {
-                                                format!("GitHub Release 监控 {name} 失败：{error}")
-                                            }
-                                        });
+                                        let failure_message =
+                                            release_failure_message(name, failure, self.language);
+                                        self.push_activity(self.language.format(
+                                            message_key!("message.github_release_monitor_failed"),
+                                            &[&failure_message],
+                                        ));
                                     }
                                     MonitorOutcome::Current { name, tag } => {
                                         update_monitor_status(
@@ -3877,20 +3832,12 @@ impl App {
                                 }
                             }
                             self.selected_github_monitors.clear();
-                            self.message = match self.language {
-                                Language::English => format!(
-                                    "Release check complete: {updated} updated, {failed} failed"
-                                ),
-                                Language::Chinese => {
-                                    format!("Release 检查完成：{updated} 项更新，{failed} 项失败")
-                                }
-                            };
+                            self.message = release_update_message(&results, self.language);
                         }
                         Err(error) => {
-                            self.message = match self.language {
-                                Language::English => format!("Release check failed: {error}"),
-                                Language::Chinese => format!("Release 检查失败：{error}"),
-                            };
+                            self.message = self
+                                .language
+                                .format(message_key!("message.release_update_failed"), &[&error]);
                         }
                     }
                 }
@@ -3953,10 +3900,7 @@ impl App {
                                     flow.step = CommandPackageStep::Executable;
                                     self.message = self
                                         .language
-                                        .text(
-                                            "Package verified; enter its installed executable command",
-                                            "软件包已验证；请输入本机已安装的可执行命令",
-                                        )
+                                        .text(message_key!("tui.package_verified_enter_its_installed_executable_command"))
                                         .to_owned();
                                 }
                                 [executable] => {
@@ -3964,20 +3908,18 @@ impl App {
                                     flow.step = CommandPackageStep::Executable;
                                     self.message = self
                                         .language
-                                        .text(
-                                            "Package verified and one executable was discovered",
-                                            "软件包已验证，并发现一个可执行命令",
-                                        )
+                                        .text(message_key!(
+                                            "tui.package_verified_and_one_executable_was_discovered"
+                                        ))
                                         .to_owned();
                                 }
                                 _ => {
                                     flow.step = CommandPackageStep::ExecutableChoice;
                                     self.message = self
                                         .language
-                                        .text(
-                                            "Package verified; choose one discovered executable",
-                                            "软件包已验证；请选择一个发现的可执行命令",
-                                        )
+                                        .text(message_key!(
+                                            "tui.package_verified_choose_one_discovered_executable"
+                                        ))
                                         .to_owned();
                                 }
                             }
@@ -3985,10 +3927,9 @@ impl App {
                         Ok(_) => {
                             self.message = self
                                 .language
-                                .text(
-                                    "Package result discarded because the identity changed",
-                                    "软件包身份已变化，已丢弃验证结果",
-                                )
+                                .text(message_key!(
+                                    "tui.package_result_discarded_because_the_identity_changed"
+                                ))
                                 .to_owned();
                         }
                         Err(error) => self.message = error,
@@ -4012,20 +3953,18 @@ impl App {
                                 flow.step = CommandPackageStep::VersionChoice;
                                 self.message = self
                                     .language
-                                    .text(
-                                        "Multiple versions were found; choose the tool version",
-                                        "探测到多个版本号；请选择工具版本",
-                                    )
+                                    .text(message_key!(
+                                        "tui.multiple_versions_were_found_choose_the_tool_version"
+                                    ))
                                     .to_owned();
                             } else {
                                 flow.current_version = flow.current_versions.first().cloned();
                                 flow.step = CommandPackageStep::Confirm;
                                 self.message = self
                                     .language
-                                    .text(
-                                        "Version probe succeeded; review before saving",
-                                        "版本探测成功；请确认后保存",
-                                    )
+                                    .text(message_key!(
+                                        "tui.version_probe_succeeded_review_before_saving"
+                                    ))
                                     .to_owned();
                             }
                         }
@@ -4050,20 +3989,16 @@ impl App {
                                 flow.step = CustomCommandStep::VersionChoice;
                                 self.message = self
                                     .language
-                                    .text(
-                                        "Multiple versions were found; choose the tool version",
-                                        "探测到多个版本号；请选择工具版本",
-                                    )
+                                    .text(message_key!(
+                                        "tui.multiple_versions_were_found_choose_the_tool_version"
+                                    ))
                                     .to_owned();
                             } else {
                                 flow.current_version = flow.current_versions.first().cloned();
                                 flow.step = CustomCommandStep::LatestSource;
                                 self.message = self
                                     .language
-                                    .text(
-                                        "Version probe succeeded; choose whether to compare an official latest version",
-                                        "版本探测成功；请选择是否比较官方最新版本",
-                                    )
+                                    .text(message_key!("tui.version_probe_succeeded_choose_whether_to_compare_an_official_latest_version"))
                                     .to_owned();
                             }
                         }
@@ -4090,10 +4025,9 @@ impl App {
                     if active_source.as_ref() != Some(&source) {
                         self.message = self
                             .language
-                            .text(
-                                "Latest-version result discarded because the source changed",
-                                "最新版本来源已变化，已丢弃验证结果",
-                            )
+                            .text(message_key!(
+                                "tui.latest_version_result_discarded_because_the_source_changed"
+                            ))
                             .to_owned();
                         continue;
                     }
@@ -4103,10 +4037,9 @@ impl App {
                             flow.step = CustomCommandStep::Confirm;
                             self.message = self
                                 .language
-                                .text(
-                                    "Official latest version verified; review before saving",
-                                    "官方最新版本已验证；请确认后保存",
-                                )
+                                .text(message_key!(
+                                    "tui.official_latest_version_verified_review_before_saving"
+                                ))
                                 .to_owned();
                         }
                         Err(error) => self.message = error,
@@ -4139,10 +4072,7 @@ impl App {
                             flow.step = GithubReleaseStep::Name;
                             self.message = self
                                 .language
-                                .text(
-                                    "GitHub Release verified; name the monitor and choose a real asset",
-                                    "GitHub Release 已验证；请命名监控并选择真实资产",
-                                )
+                                .text(message_key!("tui.github_release_verified_name_the_monitor_and_choose_a_real_asset"))
                                 .to_owned();
                         }
                         Err(error) => self.message = error,
@@ -4161,20 +4091,15 @@ impl App {
                             self.ai_connection_test_succeeded = Some(true);
                             self.message = self
                                 .language
-                                .text(
-                                    "AI connection succeeded; the endpoint, credentials, and model are valid",
-                                    "AI 连接成功；接口、凭据和模型均可用",
-                                )
+                                .text(message_key!("tui.ai_connection_succeeded_the_endpoint_credentials_and_model_are_valid"))
                                 .to_owned();
                         }
                         Err(error) => {
                             self.ai_connection_test_succeeded = Some(false);
-                            self.message = match self.language {
-                                Language::English => {
-                                    format!("AI connection test failed: {error}")
-                                }
-                                Language::Chinese => format!("AI 连接测试失败：{error}"),
-                            };
+                            self.message = self.language.format(
+                                message_key!("message.ai_connection_test_failed"),
+                                &[&error],
+                            );
                         }
                     }
                 }
@@ -4204,22 +4129,14 @@ impl App {
                                 *available_models = models;
                                 *field = 3;
                             }
-                            self.message = match self.language {
-                                Language::English => format!(
-                                    "Fetched {count} AI model(s); use Left/Right on Model to select one"
-                                ),
-                                Language::Chinese => {
-                                    format!("已获取 {count} 个 AI 模型；在模型字段按左右键选择")
-                                }
-                            };
+                            self.message = self
+                                .language
+                                .format(message_key!("message.ai_models_fetched"), &[&count]);
                         }
                         Err(error) => {
-                            self.message = match self.language {
-                                Language::English => {
-                                    format!("AI model list request failed: {error}")
-                                }
-                                Language::Chinese => format!("获取 AI 模型列表失败：{error}"),
-                            };
+                            self.message = self
+                                .language
+                                .format(message_key!("message.ai_model_list_failed"), &[&error]);
                         }
                     }
                 }
@@ -4244,32 +4161,27 @@ impl App {
                             if active_intent.value.trim() != intent {
                                 self.message = self
                                     .language
-                                    .text(
-                                        "Candidate result discarded because the request changed",
-                                        "需求已变化，已丢弃候选结果",
-                                    )
+                                    .text(message_key!(
+                                        "tui.candidate_result_discarded_because_the_request_changed"
+                                    ))
                                     .to_owned();
                                 continue;
                             }
                             if verification.verified.is_empty() {
-                                self.message = match self.language {
-                                    Language::English => verification
-                                        .rejected
-                                        .first()
-                                        .map(|candidate| {
-                                            format!(
-                                                "No candidate could be verified: {}",
-                                                candidate.error
-                                            )
-                                        })
-                                        .unwrap_or_else(|| {
-                                            "No candidate could be verified".to_owned()
-                                        }),
-                                    Language::Chinese => {
-                                        "没有候选通过权威来源验证，请检查工具名称、网络或来源信息"
+                                self.message = verification
+                                    .rejected
+                                    .first()
+                                    .map(|candidate| {
+                                        self.language.format(
+                                            message_key!("message.no_candidate_verified_detail"),
+                                            &[&candidate.error],
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        self.language
+                                            .text(message_key!("message.no_candidate_verified"))
                                             .to_owned()
-                                    }
-                                };
+                                    });
                                 continue;
                             }
                             let count = verification.verified.len();
@@ -4280,24 +4192,16 @@ impl App {
                                 selected: 0,
                                 rejected,
                             };
-                            self.message = match self.language {
-                                Language::English => {
-                                    format!("Choose from {count} verified update candidate(s)")
-                                }
-                                Language::Chinese => {
-                                    format!("请从 {count} 个已验证更新候选中选择")
-                                }
-                            };
+                            self.message = self.language.format(
+                                message_key!("message.choose_verified_candidates"),
+                                &[&count],
+                            );
                         }
                         Err(error) => {
-                            self.message = match self.language {
-                                Language::English => {
-                                    format!("AI candidate analysis failed: {error}")
-                                }
-                                Language::Chinese => {
-                                    "AI 候选分析失败，请检查 AI 设置、响应格式或网络连接".to_owned()
-                                }
-                            };
+                            self.message = self.language.format(
+                                message_key!("message.ai_candidate_analysis_failed"),
+                                &[&error],
+                            );
                         }
                     }
                 }
@@ -4322,32 +4226,27 @@ impl App {
                             if active_intent.value.trim() != intent {
                                 self.message = self
                                     .language
-                                    .text(
-                                        "Candidate result discarded because the request changed",
-                                        "需求已变化，已丢弃候选结果",
-                                    )
+                                    .text(message_key!(
+                                        "tui.candidate_result_discarded_because_the_request_changed"
+                                    ))
                                     .to_owned();
                                 continue;
                             }
                             if verification.verified.is_empty() {
-                                self.message = match self.language {
-                                    Language::English => verification
-                                        .rejected
-                                        .first()
-                                        .map(|candidate| {
-                                            format!(
-                                                "No repository could be verified: {}",
-                                                candidate.error
-                                            )
-                                        })
-                                        .unwrap_or_else(|| {
-                                            "No repository could be verified".to_owned()
-                                        }),
-                                    Language::Chinese => {
-                                        "没有仓库通过 GitHub Release 验证，请检查仓库、网络或访问凭据"
+                                self.message = verification
+                                    .rejected
+                                    .first()
+                                    .map(|candidate| {
+                                        self.language.format(
+                                            message_key!("message.no_repository_verified_detail"),
+                                            &[&candidate.error],
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        self.language
+                                            .text(message_key!("message.no_repository_verified"))
                                             .to_owned()
-                                    }
-                                };
+                                    });
                                 continue;
                             }
                             let count = verification.verified.len();
@@ -4357,24 +4256,16 @@ impl App {
                                 selected: 0,
                                 rejected: verification.rejected,
                             };
-                            self.message = match self.language {
-                                Language::English => {
-                                    format!("Choose from {count} verified repository candidate(s)")
-                                }
-                                Language::Chinese => {
-                                    format!("请从 {count} 个已验证仓库候选中选择")
-                                }
-                            };
+                            self.message = self.language.format(
+                                message_key!("message.choose_verified_repositories"),
+                                &[&count],
+                            );
                         }
                         Err(error) => {
-                            self.message = match self.language {
-                                Language::English => {
-                                    format!("AI repository analysis failed: {error}")
-                                }
-                                Language::Chinese => {
-                                    "AI 仓库分析失败，请检查 AI 设置、响应格式或网络连接".to_owned()
-                                }
-                            };
+                            self.message = self.language.format(
+                                message_key!("message.ai_repository_analysis_failed"),
+                                &[&error],
+                            );
                         }
                     }
                 }
@@ -4410,35 +4301,31 @@ impl App {
             .tools
             .iter()
             .any(|tool| tool.name == "dvup" && tool.run_state == RunState::Queued);
-        let summary = match self.language {
-            Language::English => format!(
-                "Complete: {up_to_date} current, {updated} updated, {queued} queued, {failed} failed ({} total) in {:.1}s",
-                batch.total,
-                batch.started.elapsed().as_secs_f64()
-            ),
-            Language::Chinese => format!(
-                "完成：{up_to_date} 项已是最新，{updated} 项已更新，{queued} 项已排队，{failed} 项失败（共 {} 项），耗时 {:.1} 秒",
-                batch.total,
-                batch.started.elapsed().as_secs_f64()
-            ),
-        };
+        let summary = self.language.format(
+            message_key!("summary.update_batch"),
+            &[
+                &up_to_date,
+                &updated,
+                &queued,
+                &failed,
+                &batch.total,
+                &format!("{:.1}", batch.started.elapsed().as_secs_f64()),
+            ],
+        );
         self.push_activity(format!("\n=== {summary} ==="));
         self.message = if self_update_queued {
             self.language
-                .text(
-                    "dvup self-update is queued; exit dvup to let the worker replace it",
-                    "dvup 自更新已排队；请退出 dvup，让后台任务完成替换",
-                )
+                .text(message_key!(
+                    "tui.dvup_self_update_is_queued_exit_dvup_to_let_the_worker_replace_it"
+                ))
                 .to_owned()
         } else if failed == 0 {
             summary
         } else {
-            match self.language {
-                Language::English => {
-                    format!("{summary}. See Activity for command output and errors")
-                }
-                Language::Chinese => format!("{summary}。请在活动页查看命令输出和错误"),
-            }
+            self.language.format(
+                message_key!("summary.update_batch_with_failures"),
+                &[&summary],
+            )
         };
     }
 
@@ -4505,24 +4392,18 @@ impl App {
             total: tools.len() + current_tools.len(),
         });
         if !current_tools.is_empty() {
-            self.push_activity(match self.language {
-                Language::English => {
-                    format!("\n=== already up to date: {} ===", current_tools.join(", "))
-                }
-                Language::Chinese => {
-                    format!("\n=== 已是最新版本：{} ===", current_tools.join("，"))
-                }
-            });
+            self.push_activity(self.language.format(
+                message_key!("activity.already_up_to_date"),
+                &[&current_tools.join(self.language.text(message_key!("format.list_separator")))],
+            ));
         }
-        self.push_activity(format!(
-            "\nprocess policy: {}{}",
-            process_strategy.label(self.language),
-            match (process_strategy.terminates(), self.language) {
-                (true, Language::English) => " matching processes will be stopped",
-                (false, Language::English) => " matching processes will be waited on",
-                (true, Language::Chinese) => "；将终止匹配的进程",
-                (false, Language::Chinese) => "；将等待匹配的进程退出",
-            }
+        self.push_activity(self.language.format(
+            if process_strategy.terminates() {
+                message_key!("activity.process_policy_terminate")
+            } else {
+                message_key!("activity.process_policy_wait")
+            },
+            &[&process_strategy.label(self.language)],
         ));
         for name in tools {
             if let Some(tool) = self.tools.iter_mut().find(|tool| tool.name == name) {
@@ -4530,15 +4411,14 @@ impl App {
                 tool.selected = false;
             }
             self.running += 1;
-            self.push_activity(match (&target_version, self.language) {
-                (Some(version), Language::English) => {
-                    format!("\n>>> starting {name} at version {version}")
-                }
-                (Some(version), Language::Chinese) => {
-                    format!("\n>>> 正在将 {name} 更新到版本 {version}")
-                }
-                (None, Language::English) => format!("\n>>> starting {name}"),
-                (None, Language::Chinese) => format!("\n>>> 正在启动 {name}"),
+            self.push_activity(match &target_version {
+                Some(version) => self.language.format(
+                    message_key!("activity.starting_version"),
+                    &[&name, &version],
+                ),
+                None => self
+                    .language
+                    .format(message_key!("activity.starting"), &[&name]),
             });
             spawn_dvup(
                 self.tx.clone(),
@@ -4555,10 +4435,10 @@ impl App {
                 self.language,
             );
         }
-        self.message = match self.language {
-            Language::English => format!("Started {} update(s) in parallel", self.running),
-            Language::Chinese => format!("已并行启动 {} 项更新", self.running),
-        };
+        self.message = self.language.format(
+            message_key!("message.parallel_updates_started"),
+            &[&self.running],
+        );
         self.tab = Tab::Activity;
     }
 
@@ -4585,20 +4465,16 @@ impl App {
         if self.running > 0 {
             self.message = self
                 .language
-                .text(
-                    "Wait for the current operation to finish",
-                    "请等待当前操作完成",
-                )
+                .text(message_key!("tui.wait_for_the_current_operation_to_finish"))
                 .to_owned();
             return;
         }
         if self.config_path.is_some() {
             self.message = self
                 .language
-                .text(
-                    "Custom commands are disabled with --config",
-                    "使用 --config 时不能编辑自定义命令",
-                )
+                .text(message_key!(
+                    "tui.custom_commands_disabled_with_config_edit"
+                ))
                 .to_owned();
             return;
         }
@@ -4609,7 +4485,7 @@ impl App {
             ToolKind::BuiltIn => {
                 self.message = self
                     .language
-                    .text("Built-in tools cannot be edited", "不能编辑内置工具")
+                    .text(message_key!("tui.built_in_tools_cannot_be_edited"))
                     .to_owned();
                 return;
             }
@@ -4618,17 +4494,17 @@ impl App {
         let custom = match UserConfig::load(&self.state.custom_config_path()) {
             Ok(custom) => custom,
             Err(error) => {
-                self.message = match self.language {
-                    Language::English => format!("Could not load custom command: {error}"),
-                    Language::Chinese => format!("无法加载自定义命令：{error}"),
-                };
+                self.message = self.language.format(
+                    message_key!("message.custom_command_load_failed"),
+                    &[&error],
+                );
                 return;
             }
         };
         let Some(command_spec) = custom.commands.get(&selected.name) else {
             self.message = self
                 .language
-                .text("Custom command no longer exists", "自定义命令已不存在")
+                .text(message_key!("tui.custom_command_no_longer_exists"))
                 .to_owned();
             return;
         };
@@ -4674,7 +4550,7 @@ impl App {
         let Some(spec) = custom.github.monitors.get(&runtime_name) else {
             self.message = self
                 .language
-                .text("GitHub monitor no longer exists", "GitHub 监控已不存在")
+                .text(message_key!("tui.github_monitor_no_longer_exists"))
                 .to_owned();
             return;
         };
@@ -4727,10 +4603,9 @@ impl App {
         if self.running > 0 {
             self.message = self
                 .language
-                .text(
-                    "Wait for the current operation before editing TOML",
-                    "请等待当前操作完成后再编辑 TOML",
-                )
+                .text(message_key!(
+                    "tui.wait_for_the_current_operation_before_editing_toml"
+                ))
                 .to_owned();
             return;
         }
@@ -4740,10 +4615,9 @@ impl App {
         match result {
             Ok((path, text)) => self.show_toml_editor(path, text),
             Err(error) => {
-                self.message = match self.language {
-                    Language::English => format!("Could not open TOML editor: {error}"),
-                    Language::Chinese => format!("无法打开 TOML 编辑器：{error}"),
-                };
+                self.message = self
+                    .language
+                    .format(message_key!("message.toml_editor_open_failed"), &[&error]);
             }
         }
     }
@@ -4761,10 +4635,9 @@ impl App {
         if self.running > 0 {
             self.message = self
                 .language
-                .text(
-                    "Wait for the current operation before editing TOML",
-                    "请等待当前操作完成后再编辑 TOML",
-                )
+                .text(message_key!(
+                    "tui.wait_for_the_current_operation_before_editing_toml"
+                ))
                 .to_owned();
             return;
         }
@@ -4773,22 +4646,15 @@ impl App {
             .and_then(|path| launch_system_text_editor(&path).map(|()| path))
         {
             Ok(path) => {
-                self.message = match self.language {
-                    Language::English => {
-                        format!("Opened {} in the system text editor", path.display())
-                    }
-                    Language::Chinese => {
-                        format!("已使用系统文本编辑器打开 {}", path.display())
-                    }
-                };
+                self.message = self.language.format(
+                    message_key!("message.system_editor_opened"),
+                    &[&path.display()],
+                );
             }
             Err(error) => {
-                self.message = match self.language {
-                    Language::English => {
-                        format!("Could not open the system text editor: {error}")
-                    }
-                    Language::Chinese => format!("无法打开系统文本编辑器：{error}"),
-                };
+                self.message = self
+                    .language
+                    .format(message_key!("message.system_editor_open_failed"), &[&error]);
             }
         }
     }
@@ -4801,10 +4667,9 @@ impl App {
     }
 
     fn show_toml_editor(&mut self, path: PathBuf, text: String) {
-        self.message = match self.language {
-            Language::English => format!("Editing {}", path.display()),
-            Language::Chinese => format!("正在编辑 {}", path.display()),
-        };
+        self.message = self
+            .language
+            .format(message_key!("message.editing_path"), &[&path.display()]);
         self.modal = Modal::TomlEditor {
             editor: TomlEditor::new(path, text),
         };
@@ -4910,10 +4775,10 @@ impl App {
 
     fn start_delete(&mut self, name: String) {
         self.running += 1;
-        self.push_activity(match self.language {
-            Language::English => format!("\n>>> removing {name}"),
-            Language::Chinese => format!("\n>>> 正在删除 {name}"),
-        });
+        self.push_activity(
+            self.language
+                .format(message_key!("activity.removing"), &[&name]),
+        );
         spawn_dvup(
             self.tx.clone(),
             self.executable.clone(),
@@ -4930,7 +4795,7 @@ impl App {
         let Some(job) = self.jobs.get(self.job_index).cloned() else {
             self.message = self
                 .language
-                .text("No job selected", "未选择任务")
+                .text(message_key!("tui.no_job_selected"))
                 .to_owned();
             return;
         };
@@ -4947,10 +4812,9 @@ impl App {
                 self.job_log_scroll = 0;
             }
             Err(error) => {
-                self.message = match self.language {
-                    Language::English => format!("Failed to load job log: {error}"),
-                    Language::Chinese => format!("无法加载任务日志：{error}"),
-                }
+                self.message = self
+                    .language
+                    .format(message_key!("message.job_log_load_failed"), &[&error]);
             }
         }
     }
@@ -5133,7 +4997,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             if matches!(line.as_str(), "Welcome to dvup." | "欢迎使用 dvup。") {
                 *line = app
                     .language
-                    .text("Welcome to dvup.", "欢迎使用 dvup。")
+                    .text(message_key!("tui.welcome_to_dvup"))
                     .to_owned();
             } else if matches!(
                 line.as_str(),
@@ -5142,16 +5006,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             ) {
                 *line = app
                     .language
-                    .text(
-                        "Select tools with Space and press Enter to update.",
-                        "按 Space 选择工具，然后按 Enter 更新。",
-                    )
+                    .text(message_key!(
+                        "tui.select_tools_with_space_and_press_enter_to_update"
+                    ))
                     .to_owned();
             }
         }
         app.message = app
             .language
-            .text("Language switched to English", "语言已切换为中文")
+            .text(message_key!("tui.language_switched_to_english"))
             .to_owned();
         return;
     }
@@ -5257,11 +5120,95 @@ fn github_poll_interval_submission(input: &TextInput) -> Result<u64> {
 }
 
 fn release_update_policy_label(policy: ReleaseUpdatePolicy, language: Language) -> &'static str {
-    match (policy, language) {
-        (ReleaseUpdatePolicy::Manual, Language::English) => "manual",
-        (ReleaseUpdatePolicy::Manual, Language::Chinese) => "手动确认",
-        (ReleaseUpdatePolicy::Automatic, Language::English) => "automatic",
-        (ReleaseUpdatePolicy::Automatic, Language::Chinese) => "自动安装",
+    language.text(match policy {
+        ReleaseUpdatePolicy::Manual => message_key!("release.policy.manual"),
+        ReleaseUpdatePolicy::Automatic => message_key!("release.policy.automatic"),
+    })
+}
+
+fn release_failure_label(stage: MonitorFailureStage, language: Language) -> &'static str {
+    language.text(match stage {
+        MonitorFailureStage::Metadata => message_key!("release.failure.metadata"),
+        MonitorFailureStage::LocalInspection => {
+            message_key!("release.failure.local_inspection")
+        }
+        MonitorFailureStage::Download => message_key!("release.failure.download"),
+        MonitorFailureStage::Installation => {
+            message_key!("release.failure.installation")
+        }
+    })
+}
+
+fn release_failure_message(name: &str, failure: &MonitorFailure, language: Language) -> String {
+    language.format(
+        message_key!("release.failure_message"),
+        &[
+            &name,
+            &release_failure_label(failure.stage(), language),
+            &failure.detail(),
+        ],
+    )
+}
+
+fn release_probe_message(statuses: &[MonitorStatus], language: Language) -> String {
+    let available = statuses
+        .iter()
+        .filter(|status| status.latest_tag.is_some() && !monitor_status_is_current(status))
+        .count();
+    let failures = statuses
+        .iter()
+        .filter_map(|status| {
+            status
+                .failure
+                .as_ref()
+                .map(|failure| release_failure_message(&status.name, failure, language))
+        })
+        .collect::<Vec<_>>();
+    let summary = language.format(
+        message_key!("release.probe_summary"),
+        &[&available, &failures.len()],
+    );
+    if failures.is_empty() {
+        summary
+    } else {
+        language.format(
+            message_key!("release.summary_with_failures"),
+            &[
+                &summary,
+                &failures.join(language.text(message_key!("format.failure_separator"))),
+            ],
+        )
+    }
+}
+
+fn release_update_message(outcomes: &[MonitorOutcome], language: Language) -> String {
+    let updated = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, MonitorOutcome::Updated { .. }))
+        .count();
+    let failures = outcomes
+        .iter()
+        .filter_map(|outcome| {
+            let MonitorOutcome::Failed { name, failure } = outcome else {
+                return None;
+            };
+            Some(release_failure_message(name, failure, language))
+        })
+        .collect::<Vec<_>>();
+    let summary = language.format(
+        message_key!("release.update_summary"),
+        &[&updated, &failures.len()],
+    );
+    if failures.is_empty() {
+        summary
+    } else {
+        language.format(
+            message_key!("release.summary_with_failures"),
+            &[
+                &summary,
+                &failures.join(language.text(message_key!("format.failure_separator"))),
+            ],
+        )
     }
 }
 
@@ -5279,7 +5226,7 @@ fn automatic_release_update_names(
                 .iter()
                 .find(|status| status.name == monitor.name)
                 .is_some_and(|status| {
-                    status.error.is_none()
+                    status.failure.is_none()
                         && status.latest_tag.is_some()
                         && !monitor_status_is_current(status)
                 })
@@ -5300,7 +5247,7 @@ fn update_monitor_status(
     name: &str,
     tag: &str,
     asset: Option<&str>,
-    error: Option<String>,
+    failure: Option<MonitorFailure>,
 ) {
     if let Some(status) = statuses.iter_mut().find(|status| status.name == name) {
         status.installed_tag = Some(tag.to_owned());
@@ -5308,7 +5255,7 @@ fn update_monitor_status(
         if let Some(asset) = asset {
             status.asset = Some(asset.to_owned());
         }
-        status.error = error;
+        status.failure = failure;
         return;
     }
     statuses.push(MonitorStatus {
@@ -5316,7 +5263,7 @@ fn update_monitor_status(
         installed_tag: Some(tag.to_owned()),
         latest_tag: Some(tag.to_owned()),
         asset: asset.map(str::to_owned),
-        error,
+        failure,
     });
 }
 
@@ -5355,7 +5302,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 app.cancel_ai_model_list();
                 app.message = app
                     .language
-                    .text("AI settings unchanged", "AI 设置未更改")
+                    .text(message_key!("tui.ai_settings_unchanged"))
                     .to_owned();
                 return;
             }
@@ -5368,10 +5315,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 app.cancel_ai_model_list();
                 app.message = app
                     .language
-                    .text(
-                        "AI API key will be removed when settings are saved",
-                        "保存设置时将删除 AI API Key",
-                    )
+                    .text(message_key!(
+                        "tui.ai_api_key_will_be_removed_when_settings_are_saved"
+                    ))
                     .to_owned();
             }
             KeyCode::Tab | KeyCode::Down if !save => {
@@ -5410,12 +5356,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 }) {
                     Ok(settings) => app.start_ai_model_list(settings),
                     Err(error) => {
-                        app.message = match app.language {
-                            Language::English => {
-                                format!("AI model list request could not start: {error}")
-                            }
-                            Language::Chinese => format!("无法获取 AI 模型列表：{error}"),
-                        };
+                        app.message = app.language.format(
+                            message_key!("message.ai_model_list_start_failed"),
+                            &[&error],
+                        );
                     }
                 }
             }
@@ -5434,19 +5378,16 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     Ok(_) => {
                         app.message = app
                             .language
-                            .text(
-                                "Enter an AI Base URL and model before testing",
-                                "请先填写 AI Base URL 和模型再测试",
-                            )
+                            .text(message_key!(
+                                "tui.enter_an_ai_base_url_and_model_before_testing"
+                            ))
                             .to_owned();
                     }
                     Err(error) => {
-                        app.message = match app.language {
-                            Language::English => {
-                                format!("AI connection test could not start: {error}")
-                            }
-                            Language::Chinese => format!("无法开始 AI 连接测试：{error}"),
-                        };
+                        app.message = app.language.format(
+                            message_key!("message.ai_connection_test_start_failed"),
+                            &[&error],
+                        );
                     }
                 }
             }
@@ -5472,24 +5413,19 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         app.settings = settings;
                         app.message = if app.settings.ai.configured() {
                             app.language
-                                .text("AI generation settings saved", "AI 生成设置已保存")
+                                .text(message_key!("tui.ai_generation_settings_saved"))
                                 .to_owned()
                         } else {
                             app.language
-                                .text("AI generation disabled", "AI 生成功能已关闭")
+                                .text(message_key!("tui.ai_generation_disabled"))
                                 .to_owned()
                         };
                         return;
                     }
                     Err(error) => {
-                        app.message = match app.language {
-                            Language::English => format!(
-                                "AI settings were not saved: {error}. Correct them and press Ctrl+S to retry"
-                            ),
-                            Language::Chinese => {
-                                format!("AI 设置未保存：{error}。请修正后按 Ctrl+S 重试")
-                            }
-                        };
+                        app.message = app
+                            .language
+                            .format(message_key!("message.ai_settings_save_failed"), &[&error]);
                     }
                 }
             }
@@ -5566,7 +5502,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 api_key.value.zeroize();
                 app.message = app
                     .language
-                    .text("GitHub settings unchanged", "GitHub 设置未更改")
+                    .text(message_key!("tui.github_settings_unchanged"))
                     .to_owned();
                 return;
             }
@@ -5576,10 +5512,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 remove_api_key = true;
                 app.message = app
                     .language
-                    .text(
-                        "GitHub API key will be removed when settings are saved",
-                        "保存设置时将删除 GitHub API Key",
-                    )
+                    .text(message_key!(
+                        "tui.github_api_key_will_be_removed_when_settings_are_saved"
+                    ))
                     .to_owned();
             }
             KeyCode::Tab | KeyCode::Down if !save => field = (field + 1) % 2,
@@ -5616,16 +5551,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                             app.github_credential_error = None;
                             app.clear_github_rate_limit();
                         }
-                        app.message = match app.language {
-                            Language::English => format!(
-                                "GitHub access and monitor interval saved ({} seconds)",
-                                app.settings.github.poll_interval_secs
-                            ),
-                            Language::Chinese => format!(
-                                "GitHub 访问与监控间隔已保存（{} 秒）",
-                                app.settings.github.poll_interval_secs
-                            ),
-                        };
+                        app.message = app.language.format(
+                            message_key!("message.github_settings_saved"),
+                            &[&app.settings.github.poll_interval_secs],
+                        );
                         if credential_changed && app.github_api_key_configured {
                             app.start_all_tool_version_probes();
                             app.start_github_rate_limit_refresh();
@@ -5633,21 +5562,15 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         return;
                     }
                     Err(error) => {
-                        app.message = match (&error, app.language) {
-                            (Error::SettingsWrite { path, .. }, Language::English) => format!(
-                                "settings.toml is busy or not writable: {}. Close the editor or process using it, then press Ctrl+S to retry",
-                                path.display()
+                        app.message = match &error {
+                            Error::SettingsWrite { path, .. } => app.language.format(
+                                message_key!("message.settings_file_busy"),
+                                &[&path.display()],
                             ),
-                            (Error::SettingsWrite { path, .. }, Language::Chinese) => format!(
-                                "settings.toml 被占用或拒绝写入：{}。请关闭配置编辑器或其他占用进程后按 Ctrl+S 重试",
-                                path.display()
+                            _ => app.language.format(
+                                message_key!("message.github_settings_save_failed"),
+                                &[&error],
                             ),
-                            (_, Language::English) => format!(
-                                "GitHub settings were not saved: {error}. Correct them and press Ctrl+S to retry"
-                            ),
-                            (_, Language::Chinese) => {
-                                format!("GitHub 设置未保存：{error}。请修正后按 Ctrl+S 重试")
-                            }
                         };
                     }
                 }
@@ -5733,7 +5656,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     if value.is_empty() {
                         app.message = app
                             .language
-                            .text("Version cannot be empty", "版本不能为空")
+                            .text(message_key!("tui.version_cannot_be_empty"))
                             .to_owned();
                     } else {
                         app.modal = Modal::ConfirmUpdate {
@@ -5774,10 +5697,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                             if !app.settings.ai.configured() {
                                 app.message = app
                                     .language
-                                    .text(
-                                        "AI is disabled; package and custom command flows remain available",
-                                        "AI 未启用；仍可使用包管理器和自定义命令流程",
-                                    )
+                                    .text(message_key!("tui.ai_is_disabled_package_and_custom_command_flows_remain_available"))
                                     .to_owned();
                                 Modal::CommandAddFlow(flow)
                             } else {
@@ -5857,7 +5777,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     if flow.loading {
                         app.message = app
                             .language
-                            .text("Validation is still running…", "验证仍在进行中…")
+                            .text(message_key!("tui.validation_is_still_running"))
                             .to_owned();
                         app.modal = Modal::CommandPackageFlow(flow);
                         return;
@@ -5941,10 +5861,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                             app.modal = Modal::None;
                             app.message = app
                                 .language
-                                .text(
-                                    "Command declaration saved; no update was executed",
-                                    "命令声明已保存；未执行任何更新",
-                                )
+                                .text(message_key!(
+                                    "tui.command_declaration_saved_no_update_was_executed"
+                                ))
                                 .to_owned();
                             return;
                         }
@@ -6035,7 +5954,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     if flow.loading {
                         app.message = app
                             .language
-                            .text("Validation is still running…", "验证仍在进行中…")
+                            .text(message_key!("tui.validation_is_still_running"))
                             .to_owned();
                         app.modal = Modal::CustomCommandFlow(flow);
                         return;
@@ -6130,10 +6049,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                             app.modal = Modal::None;
                             app.message = app
                                 .language
-                                .text(
-                                    "Custom command saved; its update command was not executed",
-                                    "自定义命令已保存；未执行更新命令",
-                                )
+                                .text(message_key!(
+                                    "tui.custom_command_saved_its_update_command_was_not_executed"
+                                ))
                                 .to_owned();
                             return;
                         }
@@ -6194,10 +6112,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                             } else {
                                 app.message = app
                                     .language
-                                    .text(
-                                        "AI is disabled; manual GitHub Release setup remains available",
-                                        "AI 未启用；仍可手动配置 GitHub Release",
-                                    )
+                                    .text(message_key!("tui.ai_is_disabled_manual_github_release_setup_remains_available"))
                                     .to_owned();
                                 Modal::GithubAddFlow(flow)
                             }
@@ -6222,7 +6137,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     if value.is_empty() {
                         app.message = app
                             .language
-                            .text("Describe a GitHub repository", "请输入 GitHub 仓库描述")
+                            .text(message_key!("tui.describe_a_github_repository"))
                             .to_owned();
                     } else {
                         app.modal = Modal::GithubAiIntent { intent };
@@ -6282,7 +6197,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     if flow.loading {
                         app.message = app
                             .language
-                            .text("Validation is still running…", "验证仍在进行中…")
+                            .text(message_key!("tui.validation_is_still_running"))
                             .to_owned();
                         app.modal = Modal::GithubReleaseFlow(flow);
                         return;
@@ -6341,10 +6256,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                                         flow.step = GithubReleaseStep::Variant;
                                         app.message = app
                                             .language
-                                            .text(
-                                                "The selector matches multiple assets; enter a distinguishing variant such as musl, gnu, or portable",
-                                                "选择器命中多个资产；请输入 musl、gnu、portable 等区分变体",
-                                            )
+                                            .text(message_key!("tui.the_selector_matches_multiple_assets_enter_a_distinguishing_variant_such_as_musl_gnu_or_portable"))
                                             .to_owned();
                                         return Ok(false);
                                     }
@@ -6459,10 +6371,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                             app.modal = Modal::None;
                             app.message = app
                                 .language
-                                .text(
-                                    "GitHub monitor saved; no asset was downloaded or installed",
-                                    "GitHub 监控已保存；未下载或安装任何资产",
-                                )
+                                .text(message_key!(
+                                    "tui.github_monitor_saved_no_asset_was_downloaded_or_installed"
+                                ))
                                 .to_owned();
                             return;
                         }
@@ -6537,7 +6448,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     let Some(candidate) = candidates.get(selected).cloned() else {
                         app.message = app
                             .language
-                            .text("No verified candidate is selected", "未选择已验证候选")
+                            .text(message_key!("tui.no_verified_candidate_is_selected"))
                             .to_owned();
                         app.modal = Modal::CommandAiCandidateSelection {
                             intent,
@@ -6590,7 +6501,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     let Some(candidate) = candidates.get(selected).cloned() else {
                         app.message = app
                             .language
-                            .text("No verified repository is selected", "未选择已验证仓库")
+                            .text(message_key!("tui.no_verified_repository_is_selected"))
                             .to_owned();
                         app.modal = Modal::GithubAiCandidateSelection {
                             intent,
@@ -6626,13 +6537,33 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
             _ => {}
         },
-        Modal::NetworkProxy {
+        Modal::NetworkSettings {
             mut proxy_mode,
             mut field,
             mut proxy_url,
             mut no_proxy,
+            mut metadata_timeout,
+            mut release_asset_setup_timeout,
+            mut release_asset_body_timeout,
         } => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let selectable_fields: &[usize] = if proxy_mode == ProxyMode::Explicit {
+                &[0, 1, 2, 3, 4, 5]
+            } else {
+                &[0, 3, 4, 5]
+            };
+            let adjacent_field = |field: usize, reverse: bool| {
+                let position = selectable_fields
+                    .iter()
+                    .position(|candidate| *candidate == field)
+                    .unwrap_or(0);
+                if reverse {
+                    selectable_fields
+                        [(position + selectable_fields.len() - 1) % selectable_fields.len()]
+                } else {
+                    selectable_fields[(position + 1) % selectable_fields.len()]
+                }
+            };
             match key.code {
                 KeyCode::Esc => {
                     app.modal = Modal::None;
@@ -6643,6 +6574,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         proxy_mode,
                         proxy_url.value.clone(),
                         no_proxy.value.clone(),
+                        metadata_timeout.value.clone(),
+                        release_asset_setup_timeout.value.clone(),
+                        release_asset_body_timeout.value.clone(),
                     ) {
                         app.modal = Modal::None;
                         return;
@@ -6653,38 +6587,30 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     proxy_mode = proxy_mode.next();
                 }
                 KeyCode::Tab | KeyCode::BackTab => {
-                    field = if proxy_mode == ProxyMode::Explicit {
-                        if key.code == KeyCode::BackTab {
-                            (field + 2) % 3
-                        } else {
-                            (field + 1) % 3
-                        }
-                    } else {
-                        0
-                    };
+                    field = adjacent_field(field, key.code == KeyCode::BackTab);
                     proxy_url.clear_selection();
                     no_proxy.clear_selection();
+                    metadata_timeout.clear_selection();
+                    release_asset_setup_timeout.clear_selection();
+                    release_asset_body_timeout.clear_selection();
                 }
                 KeyCode::Up | KeyCode::Down => {
-                    field = if proxy_mode == ProxyMode::Explicit {
-                        if key.code == KeyCode::Up {
-                            (field + 2) % 3
-                        } else {
-                            (field + 1) % 3
-                        }
-                    } else {
-                        0
-                    };
+                    field = adjacent_field(field, key.code == KeyCode::Up);
                     proxy_url.clear_selection();
                     no_proxy.clear_selection();
+                    metadata_timeout.clear_selection();
+                    release_asset_setup_timeout.clear_selection();
+                    release_asset_body_timeout.clear_selection();
                 }
-                KeyCode::Enter if field == 0 && proxy_mode == ProxyMode::Explicit => field = 1,
-                KeyCode::Enter if field == 1 => field = 2,
+                KeyCode::Enter if field != 5 => field = adjacent_field(field, false),
                 KeyCode::Enter => {
                     if app.save_network_settings(
                         proxy_mode,
                         proxy_url.value.clone(),
                         no_proxy.value.clone(),
+                        metadata_timeout.value.clone(),
+                        release_asset_setup_timeout.value.clone(),
+                        release_asset_body_timeout.value.clone(),
                     ) {
                         app.modal = Modal::None;
                         return;
@@ -6696,13 +6622,25 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 _ if proxy_mode == ProxyMode::Explicit && field == 2 => {
                     handle_text_input_key(&mut no_proxy, key);
                 }
+                _ if field == 3 => {
+                    handle_text_input_key(&mut metadata_timeout, key);
+                }
+                _ if field == 4 => {
+                    handle_text_input_key(&mut release_asset_setup_timeout, key);
+                }
+                _ if field == 5 => {
+                    handle_text_input_key(&mut release_asset_body_timeout, key);
+                }
                 _ => {}
             }
-            app.modal = Modal::NetworkProxy {
+            app.modal = Modal::NetworkSettings {
                 proxy_mode,
                 field,
                 proxy_url,
                 no_proxy,
+                metadata_timeout,
+                release_asset_setup_timeout,
+                release_asset_body_timeout,
             };
         }
         Modal::ConfirmDeleteGithubMonitor { index } => match key.code {
@@ -6734,19 +6672,21 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
 
     if key.code == KeyCode::F(2) && !ctrl && !alt {
         editor.toggle_vim_mode();
-        app.message = match (editor.mode.is_vim(), app.language) {
-            (true, Language::English) => "Vim mode enabled — NORMAL".to_owned(),
-            (true, Language::Chinese) => "已启用 Vim 模式 — NORMAL".to_owned(),
-            (false, Language::English) => "Standard editor mode enabled".to_owned(),
-            (false, Language::Chinese) => "已切换到标准编辑模式".to_owned(),
-        };
+        app.message = app
+            .language
+            .text(if editor.mode.is_vim() {
+                message_key!("vim.mode_enabled")
+            } else {
+                message_key!("vim.standard_mode_enabled")
+            })
+            .to_owned();
         app.modal = Modal::TomlEditor { editor };
         return;
     }
 
     if editor.mode == TomlEditorMode::VimInsert && key.code == KeyCode::Esc {
         editor.enter_vim_mode(TomlEditorMode::VimNormal);
-        app.message = app.language.text("Vim NORMAL", "Vim NORMAL").to_owned();
+        app.message = app.language.text(message_key!("vim.normal")).to_owned();
         app.modal = Modal::TomlEditor { editor };
         return;
     }
@@ -6757,8 +6697,8 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
     ) && !ctrl
         && !alt
     {
-        if let Some((english, chinese)) = handle_vim_toml_key(&mut editor, &key) {
-            app.message = app.language.text(english, chinese).to_owned();
+        if let Some(message_key) = handle_vim_toml_key(&mut editor, &key) {
+            app.message = app.language.text(message_key).to_owned();
         }
         app.modal = Modal::TomlEditor { editor };
         return;
@@ -6771,7 +6711,7 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
             app.toml_editor_drag = None;
             app.message = app
                 .language
-                .text("TOML editor closed", "已关闭 TOML 编辑器")
+                .text(message_key!("tui.toml_editor_closed"))
                 .to_owned();
             return;
         }
@@ -6781,51 +6721,51 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
             app.toml_editor_drag = None;
             app.message = app
                 .language
-                .text("TOML editor closed", "已关闭 TOML 编辑器")
+                .text(message_key!("tui.toml_editor_closed"))
                 .to_owned();
             return;
         }
         KeyCode::Char('z' | 'Z') if ctrl && extend_selection => {
             app.message = if editor.redo() {
                 app.language
-                    .text("Redid TOML edit", "已重做 TOML 编辑")
+                    .text(message_key!("tui.redid_toml_edit"))
                     .to_owned()
             } else {
                 app.language
-                    .text("Nothing to redo", "没有可重做的编辑")
+                    .text(message_key!("tui.nothing_to_redo"))
                     .to_owned()
             };
         }
         KeyCode::Char('z' | 'Z') if ctrl => {
             app.message = if editor.undo() {
                 app.language
-                    .text("Undid TOML edit", "已撤销 TOML 编辑")
+                    .text(message_key!("vim.undid_toml_edit"))
                     .to_owned()
             } else {
                 app.language
-                    .text("Nothing to undo", "没有可撤销的编辑")
+                    .text(message_key!("vim.nothing_to_undo"))
                     .to_owned()
             };
         }
         KeyCode::Char('y' | 'Y') if ctrl => {
             app.message = if editor.redo() {
                 app.language
-                    .text("Redid TOML edit", "已重做 TOML 编辑")
+                    .text(message_key!("tui.redid_toml_edit"))
                     .to_owned()
             } else {
                 app.language
-                    .text("Nothing to redo", "没有可重做的编辑")
+                    .text(message_key!("tui.nothing_to_redo"))
                     .to_owned()
             };
         }
         KeyCode::Char('r' | 'R') if ctrl && editor.mode.is_vim() => {
             app.message = if editor.redo() {
                 app.language
-                    .text("Redid TOML edit", "已重做 TOML 编辑")
+                    .text(message_key!("tui.redid_toml_edit"))
                     .to_owned()
             } else {
                 app.language
-                    .text("Nothing to redo", "没有可重做的编辑")
+                    .text(message_key!("tui.nothing_to_redo"))
                     .to_owned()
             };
         }
@@ -6833,15 +6773,15 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
             app.message = match editor.toggle_line_comments() {
                 Some(TomlCommentAction::Commented) => app
                     .language
-                    .text("Commented TOML line(s)", "已注释 TOML 行")
+                    .text(message_key!("tui.commented_toml_line_s"))
                     .to_owned(),
                 Some(TomlCommentAction::Uncommented) => app
                     .language
-                    .text("Uncommented TOML line(s)", "已取消 TOML 行注释")
+                    .text(message_key!("tui.uncommented_toml_line_s"))
                     .to_owned(),
                 None => app
                     .language
-                    .text("No TOML line to comment", "没有可注释的 TOML 行")
+                    .text(message_key!("tui.no_toml_line_to_comment"))
                     .to_owned(),
             };
         }
@@ -6850,31 +6790,26 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
             Ok(()) => {
                 editor.mark_saved();
                 app.message = match app.refresh_tools() {
-                    Ok(()) => match app.language {
-                        Language::English => format!("Saved {}", editor.path.display()),
-                        Language::Chinese => format!("已保存 {}", editor.path.display()),
-                    },
-                    Err(error) => match app.language {
-                        Language::English => format!("TOML saved but refresh failed: {error}"),
-                        Language::Chinese => format!("TOML 已保存，但刷新失败：{error}"),
-                    },
+                    Ok(()) => app.language.format(
+                        message_key!("message.toml_saved"),
+                        &[&editor.path.display()],
+                    ),
+                    Err(error) => app
+                        .language
+                        .format(message_key!("message.toml_saved_refresh_failed"), &[&error]),
                 };
             }
             Err(error) => {
-                app.message = match app.language {
-                    Language::English => format!("TOML was not saved: {error}"),
-                    Language::Chinese => format!("TOML 未保存：{error}"),
-                };
+                app.message = app
+                    .language
+                    .format(message_key!("message.toml_save_failed"), &[&error]);
             }
         },
         KeyCode::Char('c' | 'C') if ctrl => {
             let Some(selected) = editor.selected_text() else {
                 app.message = app
                     .language
-                    .text(
-                        "Select TOML text before copying",
-                        "请先选择要复制的 TOML 文本",
-                    )
+                    .text(message_key!("tui.select_toml_text_before_copying"))
                     .to_owned();
                 app.modal = Modal::TomlEditor { editor };
                 return;
@@ -6885,14 +6820,13 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
                 Ok(()) => {
                     app.message = app
                         .language
-                        .text("Copied selection", "已复制选区")
+                        .text(message_key!("tui.copied_selection"))
                         .to_owned()
                 }
                 Err(error) => {
-                    app.message = match app.language {
-                        Language::English => format!("Could not copy selection: {error}"),
-                        Language::Chinese => format!("无法复制选区：{error}"),
-                    }
+                    app.message = app
+                        .language
+                        .format(message_key!("message.clipboard_copy_failed"), &[&error])
                 }
             }
         }
@@ -6902,14 +6836,13 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
                     editor.insert_text(&text);
                     app.message = app
                         .language
-                        .text("Pasted clipboard text", "已粘贴剪贴板文本")
+                        .text(message_key!("tui.pasted_clipboard_text"))
                         .to_owned();
                 }
                 Err(error) => {
-                    app.message = match app.language {
-                        Language::English => format!("Could not paste clipboard text: {error}"),
-                        Language::Chinese => format!("无法粘贴剪贴板文本：{error}"),
-                    }
+                    app.message = app
+                        .language
+                        .format(message_key!("message.clipboard_paste_failed"), &[&error])
                 }
             }
         }
@@ -6943,25 +6876,22 @@ fn handle_toml_editor_key(app: &mut App, key: KeyEvent) {
     app.modal = Modal::TomlEditor { editor };
 }
 
-fn handle_vim_toml_key(
-    editor: &mut TomlEditor,
-    key: &KeyEvent,
-) -> Option<(&'static str, &'static str)> {
+fn handle_vim_toml_key(editor: &mut TomlEditor, key: &KeyEvent) -> Option<MessageKey> {
     if editor.mode == TomlEditorMode::VimNormal
         && let Some(pending) = editor.vim_pending.take()
     {
         match (pending, key.code) {
             ('g', KeyCode::Char('g')) => {
                 editor.move_home(true, false);
-                return Some(("Moved to start of file", "已移动到文件开头"));
+                return Some(message_key!("vim.moved_to_start_of_file"));
             }
             ('d', KeyCode::Char('d')) => {
                 editor.vim_delete_current_line();
-                return Some(("Deleted TOML line", "已删除 TOML 行"));
+                return Some(message_key!("vim.deleted_toml_line"));
             }
             ('y', KeyCode::Char('y')) => {
                 editor.vim_yank_current_line();
-                return Some(("Yanked TOML line", "已复制 TOML 行"));
+                return Some(message_key!("vim.yanked_toml_line"));
             }
             _ => {}
         }
@@ -6972,25 +6902,25 @@ fn handle_vim_toml_key(
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') => {
                 editor.enter_vim_mode(TomlEditorMode::VimNormal);
-                return Some(("Vim NORMAL", "Vim NORMAL"));
+                return Some(message_key!("vim.normal"));
             }
             KeyCode::Char('V') => {
                 editor.select_current_line();
-                return Some(("Vim VISUAL LINE", "Vim VISUAL LINE"));
+                return Some(message_key!("vim.visual_line"));
             }
             KeyCode::Char('y') => {
                 if editor.vim_yank_selection() {
-                    return Some(("Yanked selection", "已复制选区"));
+                    return Some(message_key!("vim.yanked_selection"));
                 }
             }
             KeyCode::Char('d' | 'x') => {
                 if editor.vim_delete_selection(false) {
-                    return Some(("Deleted selection", "已删除选区"));
+                    return Some(message_key!("vim.deleted_selection"));
                 }
             }
             KeyCode::Char('c') => {
                 if editor.vim_delete_selection(true) {
-                    return Some(("Vim INSERT", "Vim INSERT"));
+                    return Some(message_key!("vim.insert"));
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => editor.move_left(true),
@@ -7012,7 +6942,7 @@ fn handle_vim_toml_key(
     match key.code {
         KeyCode::Esc => {
             editor.vim_pending = None;
-            Some(("Vim NORMAL", "Vim NORMAL"))
+            Some(message_key!("vim.normal"))
         }
         KeyCode::Left | KeyCode::Char('h') => {
             editor.move_left(false);
@@ -7048,7 +6978,7 @@ fn handle_vim_toml_key(
         }
         KeyCode::Char('G') => {
             editor.move_end(true, false);
-            Some(("Moved to end of file", "已移动到文件末尾"))
+            Some(message_key!("vim.moved_to_end_of_file"))
         }
         KeyCode::Char('g' | 'd' | 'y') => {
             if let KeyCode::Char(command) = key.code {
@@ -7058,45 +6988,45 @@ fn handle_vim_toml_key(
         }
         KeyCode::Char('i') => {
             editor.enter_vim_mode(TomlEditorMode::VimInsert);
-            Some(("Vim INSERT", "Vim INSERT"))
+            Some(message_key!("vim.insert"))
         }
         KeyCode::Char('a') => {
             editor.move_right(false);
             editor.enter_vim_mode(TomlEditorMode::VimInsert);
-            Some(("Vim INSERT", "Vim INSERT"))
+            Some(message_key!("vim.insert"))
         }
         KeyCode::Char('I') => {
             editor.move_home(false, false);
             editor.enter_vim_mode(TomlEditorMode::VimInsert);
-            Some(("Vim INSERT", "Vim INSERT"))
+            Some(message_key!("vim.insert"))
         }
         KeyCode::Char('A') => {
             editor.move_end(false, false);
             editor.enter_vim_mode(TomlEditorMode::VimInsert);
-            Some(("Vim INSERT", "Vim INSERT"))
+            Some(message_key!("vim.insert"))
         }
         KeyCode::Char('v') => {
             editor.selection_anchor = Some(editor.cursor);
             editor.enter_vim_mode(TomlEditorMode::VimVisual);
-            Some(("Vim VISUAL", "Vim VISUAL"))
+            Some(message_key!("vim.visual"))
         }
         KeyCode::Char('V') => {
             editor.enter_vim_mode(TomlEditorMode::VimVisual);
             editor.select_current_line();
-            Some(("Vim VISUAL LINE", "Vim VISUAL LINE"))
+            Some(message_key!("vim.visual_line"))
         }
         KeyCode::Char('x') | KeyCode::Delete => {
             editor.delete();
-            Some(("Deleted character", "已删除字符"))
+            Some(message_key!("vim.deleted_character"))
         }
         KeyCode::Char('p') => {
             editor.vim_paste();
-            Some(("Pasted Vim register", "已粘贴 Vim 寄存器"))
+            Some(message_key!("vim.pasted_register"))
         }
         KeyCode::Char('u') => Some(if editor.undo() {
-            ("Undid TOML edit", "已撤销 TOML 编辑")
+            message_key!("vim.undid_toml_edit")
         } else {
-            ("Nothing to undo", "没有可撤销的编辑")
+            message_key!("vim.nothing_to_undo")
         }),
         KeyCode::PageUp => {
             editor.move_vertical(-10, false);
@@ -7229,28 +7159,27 @@ fn handle_paste(app: &mut App, text: &str) {
             app.ai_connection_test_loading = false;
             app.ai_connection_test_succeeded = None;
         }
-        Modal::NetworkProxy {
+        Modal::NetworkSettings {
             proxy_mode,
             field,
             proxy_url,
             no_proxy,
-        } => {
-            if *proxy_mode != ProxyMode::Explicit {
-                return;
-            }
-            if *field == 1 {
-                proxy_url.insert_text(text);
-            } else if *field == 2 {
-                no_proxy.insert_text(text);
-            } else {
-                return;
-            }
-        }
+            metadata_timeout,
+            release_asset_setup_timeout,
+            release_asset_body_timeout,
+        } => match *field {
+            1 if *proxy_mode == ProxyMode::Explicit => proxy_url.insert_text(text),
+            2 if *proxy_mode == ProxyMode::Explicit => no_proxy.insert_text(text),
+            3 => metadata_timeout.insert_text(text),
+            4 => release_asset_setup_timeout.insert_text(text),
+            5 => release_asset_body_timeout.insert_text(text),
+            _ => return,
+        },
         _ => return,
     }
     app.message = app
         .language
-        .text("Pasted terminal text", "已粘贴终端文本")
+        .text(message_key!("tui.pasted_terminal_text"))
         .to_owned();
 }
 
@@ -7277,7 +7206,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
             if let Err(error) = app.refresh_jobs() {
                 app.report_refresh_error(error);
             } else {
-                app.message = app.language.text("Refreshed", "已刷新").to_owned();
+                app.message = app.language.text(message_key!("tui.refreshed")).to_owned();
             }
         }
         _ => match app.tab {
@@ -7292,10 +7221,9 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
 
 fn request_doctor_refresh(app: &mut App) {
     if let Err(error) = app.refresh_doctor() {
-        app.message = match app.language {
-            Language::English => format!("Diagnostics failed: {error}"),
-            Language::Chinese => format!("诊断失败：{error}"),
-        };
+        app.message = app
+            .language
+            .format(message_key!("message.diagnostics_failed"), &[&error]);
     }
 }
 
@@ -7323,7 +7251,7 @@ fn is_language_toggle(modal: &Modal, key: &KeyEvent) -> bool {
             | Modal::CommandPackageFlow(_)
             | Modal::CustomCommandFlow(_)
             | Modal::GithubReleaseFlow(_)
-            | Modal::NetworkProxy { .. }
+            | Modal::NetworkSettings { .. }
             | Modal::AiSettings { .. }
     ) && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
         && !key
@@ -7335,10 +7263,9 @@ fn toggle_process_strategy(app: &mut App) {
     if app.running > 0 {
         app.message = app
             .language
-            .text(
-                "Wait for running operations before changing process policy",
-                "请等待运行中的操作结束后再切换进程策略",
-            )
+            .text(message_key!(
+                "tui.wait_for_running_operations_before_changing_process_policy"
+            ))
             .to_owned();
         return;
     }
@@ -7346,47 +7273,32 @@ fn toggle_process_strategy(app: &mut App) {
     app.message = match app.process_strategy {
         ProcessStrategy::Wait => app
             .language
-            .text(
-                "Process policy: WAIT for matching processes (Shift+Tab to change)",
-                "进程策略：等待匹配进程退出（按 Shift+Tab 切换）",
-            )
+            .text(message_key!(
+                "tui.process_policy_wait_for_matching_processes_shift_plus_tab_to_change"
+            ))
             .to_owned(),
         ProcessStrategy::Terminate => match app.terminate_active_job_waits() {
             Ok((jobs, rules, stopped, restarted, skipped)) => {
-                app.push_activity(match app.language {
-                    Language::English => format!(
-                        "process policy: TERMINATE; checked {jobs} active job(s), changed {rules} wait rule(s), stopped {stopped} matching process(es), restarted {restarted} orphaned job(s)"
-                    ),
-                    Language::Chinese => format!(
-                        "进程策略：终止；已检查 {jobs} 个活动任务，修改 {rules} 条等待规则，停止 {stopped} 个匹配进程，并重启 {restarted} 个孤儿任务"
-                    ),
-                });
+                app.push_activity(app.language.format(
+                    message_key!("activity.process_policy_changed"),
+                    &[&jobs, &rules, &stopped, &restarted],
+                ));
                 if skipped == 0 {
-                    match app.language {
-                        Language::English => format!(
-                            "Process policy: TERMINATE; checked {jobs} active job(s), stopped {stopped} process(es), restarted {restarted} orphaned job(s)"
-                        ),
-                        Language::Chinese => {
-                            format!(
-                                "进程策略：终止；已检查 {jobs} 个活动任务，停止 {stopped} 个进程，重启 {restarted} 个孤儿任务"
-                            )
-                        }
-                    }
+                    app.language.format(
+                        message_key!("message.process_policy_updated"),
+                        &[&jobs, &stopped, &restarted],
+                    )
                 } else {
-                    match app.language {
-                        Language::English => format!(
-                            "Process policy: TERMINATE; checked {jobs} job(s), restarted {restarted}, skipped {skipped} unsafe or failed job(s)"
-                        ),
-                        Language::Chinese => format!(
-                            "进程策略：终止；已检查 {jobs} 个任务，重启 {restarted} 个，跳过 {skipped} 个不安全或处理失败的任务"
-                        ),
-                    }
+                    app.language.format(
+                        message_key!("message.process_policy_updated_with_skips"),
+                        &[&jobs, &restarted, &skipped],
+                    )
                 }
             }
-            Err(error) => match app.language {
-                Language::English => format!("Could not update active job policies: {error}"),
-                Language::Chinese => format!("无法更新活动任务的进程策略：{error}"),
-            },
+            Err(error) => app.language.format(
+                message_key!("message.process_policy_update_failed"),
+                &[&error],
+            ),
         },
     };
 }
@@ -7400,7 +7312,7 @@ fn request_ctrl_c_quit(app: &mut App) {
     app.ctrl_c_armed = true;
     app.message = app
         .language
-        .text("Press Ctrl+C again to quit", "再次按 Ctrl+C 退出")
+        .text(message_key!("tui.press_ctrl_plus_c_again_to_quit"))
         .to_owned();
 }
 
@@ -7449,10 +7361,7 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
             if app.running > 0 {
                 app.message = app
                     .language
-                    .text(
-                        "Wait for the current operation to finish",
-                        "请等待当前操作完成",
-                    )
+                    .text(message_key!("tui.wait_for_the_current_operation_to_finish"))
                     .to_owned();
                 return;
             }
@@ -7460,21 +7369,17 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
             if requested.is_empty() {
                 app.message = app
                     .language
-                    .text("Select an installed tool first", "请先选择一个已安装的工具")
+                    .text(message_key!("tui.select_an_installed_tool_first"))
                     .to_owned();
             } else {
                 let (tools, current_tools) = app.partition_latest_updates(requested);
                 if tools.is_empty() {
                     app.mark_tools_up_to_date(&current_tools);
-                    app.message = match app.language {
-                        Language::English => format!(
-                            "Already at the latest version: {}",
-                            current_tools.join(", ")
-                        ),
-                        Language::Chinese => {
-                            format!("已是最新版本：{}", current_tools.join("，"))
-                        }
-                    };
+                    app.message = app.language.format(
+                        message_key!("message.already_latest"),
+                        &[&current_tools
+                            .join(app.language.text(message_key!("format.list_separator")))],
+                    );
                 } else {
                     app.modal = Modal::ConfirmUpdate {
                         tools,
@@ -7488,37 +7393,29 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
             if app.running > 0 {
                 app.message = app
                     .language
-                    .text(
-                        "Wait for the current operation to finish",
-                        "请等待当前操作完成",
-                    )
+                    .text(message_key!("tui.wait_for_the_current_operation_to_finish"))
                     .to_owned();
                 return;
             }
             let Some(tool) = app.focused_tool() else {
                 app.message = app
                     .language
-                    .text("Select an installed tool first", "请先选择一个已安装的工具")
+                    .text(message_key!("tui.select_an_installed_tool_first"))
                     .to_owned();
                 return;
             };
             if tool.availability != Availability::Installed {
                 app.message = app
                     .language
-                    .text("Select an installed tool first", "请先选择一个已安装的工具")
+                    .text(message_key!("tui.select_an_installed_tool_first"))
                     .to_owned();
                 return;
             }
             if !tool.supports_target_version {
-                app.message = match app.language {
-                    Language::English => format!(
-                        "{} does not define an arbitrary-version update command",
-                        tool.name
-                    ),
-                    Language::Chinese => {
-                        format!("{} 未配置指定版本更新命令", tool.name)
-                    }
-                };
+                app.message = app.language.format(
+                    message_key!("message.arbitrary_version_unsupported"),
+                    &[&tool.name],
+                );
                 return;
             }
             app.modal = Modal::TargetVersion {
@@ -7530,18 +7427,12 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
             if app.running > 0 {
                 app.message = app
                     .language
-                    .text(
-                        "Wait for the current operation to finish",
-                        "请等待当前操作完成",
-                    )
+                    .text(message_key!("tui.wait_for_the_current_operation_to_finish"))
                     .to_owned();
             } else if app.config_path.is_some() {
                 app.message = app
                     .language
-                    .text(
-                        "Custom commands are disabled with --config",
-                        "使用 --config 时不能添加自定义命令",
-                    )
+                    .text(message_key!("tui.custom_commands_disabled_with_config_add"))
                     .to_owned();
             } else {
                 app.modal = Modal::CommandAddFlow(CommandAddFlow {
@@ -7556,20 +7447,16 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
             if app.running > 0 {
                 app.message = app
                     .language
-                    .text(
-                        "Wait for the current operation to finish",
-                        "请等待当前操作完成",
-                    )
+                    .text(message_key!("tui.wait_for_the_current_operation_to_finish"))
                     .to_owned();
                 return;
             }
             if app.config_path.is_some() {
                 app.message = app
                     .language
-                    .text(
-                        "Delete custom tools from the explicit TOML editor (t)",
-                        "请在显式 TOML 编辑器（t）中删除自定义工具",
-                    )
+                    .text(message_key!(
+                        "tui.delete_custom_tools_from_the_explicit_toml_editor_t"
+                    ))
                     .to_owned();
                 return;
             }
@@ -7583,7 +7470,7 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
                     ToolKind::BuiltIn => {
                         app.message = app
                             .language
-                            .text("Built-in tools cannot be deleted", "不能删除内置工具")
+                            .text(message_key!("tui.built_in_tools_cannot_be_deleted"))
                             .to_owned();
                     }
                 }
@@ -7608,10 +7495,9 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
             };
             let name = monitor.name.clone();
             if !monitor.enabled {
-                app.message = match app.language {
-                    Language::English => format!("{name} is disabled; edit it before selecting"),
-                    Language::Chinese => format!("{name} 已停用；请先编辑并启用"),
-                };
+                app.message = app
+                    .language
+                    .format(message_key!("message.github_monitor_disabled"), &[&name]);
             } else if !app.selected_github_monitors.remove(&name) {
                 app.selected_github_monitors.insert(name);
             }
@@ -7628,10 +7514,9 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
             if requested.is_empty() {
                 app.message = app
                     .language
-                    .text(
-                        "Select an enabled GitHub repository first",
-                        "请先选择已启用的 GitHub 仓库",
-                    )
+                    .text(message_key!(
+                        "tui.select_an_enabled_github_repository_first"
+                    ))
                     .to_owned();
                 return;
             }
@@ -7649,15 +7534,10 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
                 .collect::<Vec<_>>();
             requested.retain(|name| !current.contains(name));
             if requested.is_empty() {
-                app.message = match app.language {
-                    Language::English => format!(
-                        "Already at the latest GitHub Release: {}",
-                        current.join(", ")
-                    ),
-                    Language::Chinese => {
-                        format!("GitHub Release 已是最新：{}", current.join("，"))
-                    }
-                };
+                app.message = app.language.format(
+                    message_key!("message.github_release_already_latest"),
+                    &[&current.join(app.language.text(message_key!("format.list_separator")))],
+                );
                 return;
             }
             app.modal = Modal::ConfirmGithubMonitorUpdate {
@@ -7679,10 +7559,9 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
             if app.config_path.is_some() {
                 app.message = app
                     .language
-                    .text(
-                        "GitHub repository editing is disabled with --config",
-                        "使用 --config 时不能编辑 GitHub 仓库",
-                    )
+                    .text(message_key!(
+                        "tui.github_repository_editing_is_disabled_with_config"
+                    ))
                     .to_owned();
                 return;
             }
@@ -7694,10 +7573,9 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
             if app.config_path.is_some() {
                 app.message = app
                     .language
-                    .text(
-                        "GitHub repository editing is disabled with --config",
-                        "使用 --config 时不能编辑 GitHub 仓库",
-                    )
+                    .text(message_key!(
+                        "tui.github_repository_editing_is_disabled_with_config"
+                    ))
                     .to_owned();
                 return;
             }
@@ -7711,10 +7589,9 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
             if app.config_path.is_some() {
                 app.message = app
                     .language
-                    .text(
-                        "GitHub repository editing is disabled with --config",
-                        "使用 --config 时不能编辑 GitHub 仓库",
-                    )
+                    .text(message_key!(
+                        "tui.github_repository_editing_is_disabled_with_config"
+                    ))
                     .to_owned();
                 return;
             }
@@ -7737,10 +7614,9 @@ fn toggle_tool_selection(app: &mut App, index: usize) {
     if tool.availability == Availability::Installed {
         tool.selected = !tool.selected;
     } else {
-        app.message = match app.language {
-            Language::English => format!("{} is not available", tool.name),
-            Language::Chinese => format!("{} 当前不可用", tool.name),
-        };
+        app.message = app
+            .language
+            .format(message_key!("message.tool_unavailable"), &[&tool.name]);
     }
 }
 
@@ -8076,7 +7952,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     if flow.step == GithubReleaseStep::Asset {
                         flow.selected_asset = hitbox.field;
                     }
-                } else if let Modal::NetworkProxy { field, .. } = &mut app.modal {
+                } else if let Modal::NetworkSettings { field, .. } = &mut app.modal {
                     *field = hitbox.field;
                 } else if let Modal::GithubSettings { field, .. } = &mut app.modal {
                     *field = hitbox.field;
@@ -8159,7 +8035,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 return;
             }
             if hitbox.field == 0
-                && let Modal::NetworkProxy {
+                && let Modal::NetworkSettings {
                     proxy_mode, field, ..
                 } = &mut app.modal
             {
@@ -8258,18 +8134,24 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 input.cursor = target;
                 input.clear_selection();
                 app.modal_drag = Some((0, target));
-            } else if let Modal::NetworkProxy {
+            } else if let Modal::NetworkSettings {
                 field,
                 proxy_url,
                 no_proxy,
+                metadata_timeout,
+                release_asset_setup_timeout,
+                release_asset_body_timeout,
                 ..
             } = &mut app.modal
             {
                 *field = hitbox.field;
-                let input = if hitbox.field == 1 {
-                    proxy_url
-                } else {
-                    no_proxy
+                let input = match hitbox.field {
+                    1 => proxy_url,
+                    2 => no_proxy,
+                    3 => metadata_timeout,
+                    4 => release_asset_setup_timeout,
+                    5 => release_asset_body_timeout,
+                    _ => return,
                 };
                 input.cursor = target;
                 input.clear_selection();
@@ -8357,13 +8239,23 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                 };
                 input.cursor = target;
                 input.selection_anchor = (target != anchor).then_some(anchor);
-            } else if let Modal::NetworkProxy {
+            } else if let Modal::NetworkSettings {
                 proxy_url,
                 no_proxy,
+                metadata_timeout,
+                release_asset_setup_timeout,
+                release_asset_body_timeout,
                 ..
             } = &mut app.modal
             {
-                let input = if field == 1 { proxy_url } else { no_proxy };
+                let input = match field {
+                    1 => proxy_url,
+                    2 => no_proxy,
+                    3 => metadata_timeout,
+                    4 => release_asset_setup_timeout,
+                    5 => release_asset_body_timeout,
+                    _ => return,
+                };
                 input.cursor = target;
                 input.selection_anchor = (target != anchor).then_some(anchor);
             }
@@ -8490,8 +8382,10 @@ fn modal_field_is_editable(modal: &Modal, field: usize) -> bool {
             | GithubReleaseStep::Application => field == 0,
             GithubReleaseStep::Confirm => false,
         },
-        Modal::NetworkProxy { proxy_mode, .. } => {
-            field == 0 || (*proxy_mode == ProxyMode::Explicit && field <= 2)
+        Modal::NetworkSettings { proxy_mode, .. } => {
+            field == 0
+                || (3..=5).contains(&field)
+                || (*proxy_mode == ProxyMode::Explicit && (1..=2).contains(&field))
         }
         _ => false,
     }
@@ -8547,19 +8441,21 @@ fn modal_cursor_at(app: &App, hitbox: ModalInputHitbox, column: u16) -> Option<u
             3 => model,
             _ => return None,
         },
-        Modal::NetworkProxy {
+        Modal::NetworkSettings {
             proxy_url,
             no_proxy,
+            metadata_timeout,
+            release_asset_setup_timeout,
+            release_asset_body_timeout,
             ..
-        } => {
-            if hitbox.field == 1 {
-                proxy_url
-            } else if hitbox.field == 2 {
-                no_proxy
-            } else {
-                return None;
-            }
-        }
+        } => match hitbox.field {
+            1 => proxy_url,
+            2 => no_proxy,
+            3 => metadata_timeout,
+            4 => release_asset_setup_timeout,
+            5 => release_asset_body_timeout,
+            _ => return None,
+        },
         _ => return None,
     };
     let relative_column = usize::from(column.saturating_sub(hitbox.area.x));
@@ -8679,31 +8575,29 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(3), Constraint::Length(1)])
         .split(chunks[0]);
 
-    let titles = match app.language {
-        Language::English => ["Tools", "Activity", "Jobs", "Doctor", "Settings"],
-        Language::Chinese => ["工具", "活动", "任务", "诊断", "设置"],
-    }
-    .into_iter()
-    .map(Line::from)
-    .collect::<Vec<_>>();
+    let titles = app
+        .language
+        .list([
+            message_key!("tabs.tools"),
+            message_key!("tabs.activity"),
+            message_key!("tabs.jobs"),
+            message_key!("tabs.doctor"),
+            message_key!("tabs.settings"),
+        ])
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     app.tab_hitboxes = tab_hitboxes(header_chunks[0], &titles);
     let title = Line::from(vec![
-        Span::raw(match app.language {
-            Language::English => {
-                format!(" dvup — {} running — policy: ", app.running)
-            }
-            Language::Chinese => {
-                format!(" dvup — {} 项运行中 — 策略：", app.running)
-            }
-        }),
+        Span::raw(
+            app.language
+                .format(message_key!("header.running_policy"), &[&app.running]),
+        ),
         Span::styled(
             app.process_strategy.label(app.language),
             app.process_strategy.style(),
         ),
-        Span::raw(match app.language {
-            Language::English => " — language: EN ",
-            Language::Chinese => " — 语言：中文 ",
-        }),
+        Span::raw(app.language.text(message_key!("header.language"))),
         Span::styled(
             format!("— {} ", datetime::now()),
             Style::default().fg(SUBTLE),
@@ -8742,68 +8636,32 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Settings => draw_settings(frame, app, chunks[1]),
     }
 
-    let shared_tool_help = match app.language {
-        Language::English => {
-            "Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab"
-        }
-        Language::Chinese => {
-            "Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页"
-        }
-    };
-    let help = match (app.tab, app.language) {
-        (Tab::Tools, Language::English) => match app.tool_view {
-            ToolView::Commands => [
-                "↑↓/hover move · click/Space select · a all · Enter latest · v choose version · Tab GitHub",
-                shared_tool_help,
-            ],
-            ToolView::Github => [
-                "↑↓/hover move · click/Space select · a all · Enter install · Tab command tools",
-                shared_tool_help,
-            ],
-        },
-        (Tab::Tools, Language::Chinese) => match app.tool_view {
-            ToolView::Commands => [
-                "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 更新 · v 指定版本 · Tab GitHub",
-                shared_tool_help,
-            ],
-            ToolView::Github => [
-                "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 安装 · Tab 命令工具",
-                shared_tool_help,
-            ],
-        },
-        (Tab::Activity, Language::English) => [
-            "↑↓ scroll · click execution to expand · Home/End · r refresh",
-            "Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
+    let help_keys = match app.tab {
+        Tab::Tools => [
+            match app.tool_view {
+                ToolView::Commands => message_key!("help.tools.commands"),
+                ToolView::Github => message_key!("help.tools.github"),
+            },
+            message_key!("help.tools.shared"),
         ],
-        (Tab::Activity, Language::Chinese) => [
-            "↑↓ 滚动 · 点击执行展开 · Home/End · r 刷新",
-            "Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
+        Tab::Activity => [
+            message_key!("help.activity.primary"),
+            message_key!("help.activity.secondary"),
         ],
-        (Tab::Jobs, Language::English) => [
-            "↑↓/hover move · click/Enter expand result · PgUp/PgDn scroll · r refresh",
-            "Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy",
+        Tab::Jobs => [
+            message_key!("help.jobs.primary"),
+            message_key!("help.jobs.secondary"),
         ],
-        (Tab::Jobs, Language::Chinese) => [
-            "↑↓/悬停 移动 · 点击/Enter 展开结果 · PgUp/PgDn 滚动 · r 刷新",
-            "Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略",
+        Tab::Doctor => [
+            message_key!("help.doctor.primary"),
+            message_key!("help.doctor.secondary"),
         ],
-        (Tab::Doctor, Language::English) => [
-            "Enter scan/expand · r rescan · ↑↓/hover move · PgUp/PgDn scroll",
-            "Ctrl+C quit · ←/→ or click tab · L 中/EN",
-        ],
-        (Tab::Doctor, Language::Chinese) => [
-            "Enter 扫描/展开 · r 重新扫描 · ↑↓/悬停 移动 · PgUp/PgDn 滚动",
-            "Ctrl+C 退出 · ←/→ 或点击标签页",
-        ],
-        (Tab::Settings, Language::English) => [
-            "↑↓/hover move · click/Space/Enter open or toggle setting",
-            "Ctrl+C quit · settings save immediately · ←/→ or click tab · L 中/EN",
-        ],
-        (Tab::Settings, Language::Chinese) => [
-            "↑↓/悬停 移动 · 点击/Space/Enter 打开或切换设置",
-            "Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击标签页 · L 中/EN",
+        Tab::Settings => [
+            message_key!("help.settings.primary"),
+            message_key!("help.settings.secondary"),
         ],
     };
+    let help = app.language.list(help_keys);
     let footer = Paragraph::new(vec![
         Line::from(Span::styled(
             format!(" {}", app.message),
@@ -8828,22 +8686,23 @@ fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_github_rate_limit(frame: &mut Frame, app: &App, area: Rect) {
     let (ratio, color, label) = if let Some(rate) = &app.github_rate_limit {
         let suffix = if app.github_rate_limit_loading {
-            app.language.text(" · refreshing…", " · 刷新中…")
+            app.language.text(message_key!("tui.refreshing_spaced_1_0"))
         } else if app.github_rate_limit_error.is_some() {
-            app.language.text(" · refresh failed", " · 刷新失败")
+            app.language
+                .text(message_key!("tui.refresh_failed_spaced_1_0"))
         } else {
             ""
         };
-        let label = match app.language {
-            Language::English => format!(
-                "GitHub API  @{} · used {} / {} · remaining {}{}",
-                rate.owner, rate.used, rate.limit, rate.remaining, suffix
-            ),
-            Language::Chinese => format!(
-                "GitHub API  @{} · 已用 {} / {} · 剩余 {}{}",
-                rate.owner, rate.used, rate.limit, rate.remaining, suffix
-            ),
-        };
+        let label = app.language.format(
+            message_key!("header.github_rate_limit"),
+            &[
+                &rate.owner,
+                &rate.used,
+                &rate.limit,
+                &rate.remaining,
+                &suffix,
+            ],
+        );
         (
             rate.used as f64 / rate.limit as f64,
             github_rate_limit_color(rate),
@@ -8854,10 +8713,7 @@ fn draw_github_rate_limit(frame: &mut Frame, app: &App, area: Rect) {
             0.0,
             ERROR_COLOR,
             app.language
-                .text(
-                    "GitHub API · encrypted settings error",
-                    "GitHub API · 加密配置错误",
-                )
+                .text(message_key!("tui.github_api_encrypted_settings_error"))
                 .to_owned(),
         )
     } else if app.github_rate_limit_loading {
@@ -8865,10 +8721,7 @@ fn draw_github_rate_limit(frame: &mut Frame, app: &App, area: Rect) {
             0.0,
             ACCENT,
             app.language
-                .text(
-                    "GitHub API · loading @Token owner and quota…",
-                    "GitHub API · 正在加载 @Token 主人和配额…",
-                )
+                .text(message_key!("tui.github_api_loading_token_owner_and_quota"))
                 .to_owned(),
         )
     } else if app.github_rate_limit_error.is_some() {
@@ -8876,10 +8729,7 @@ fn draw_github_rate_limit(frame: &mut Frame, app: &App, area: Rect) {
             0.0,
             ERROR_COLOR,
             app.language
-                .text(
-                    "GitHub API · owner and quota unavailable",
-                    "GitHub API · 无法获取主人和配额",
-                )
+                .text(message_key!("tui.github_api_owner_and_quota_unavailable"))
                 .to_owned(),
         )
     } else {
@@ -8887,10 +8737,7 @@ fn draw_github_rate_limit(frame: &mut Frame, app: &App, area: Rect) {
             0.0,
             SUBTLE,
             app.language
-                .text(
-                    "GitHub API · Token not configured",
-                    "GitHub API · Token 未配置",
-                )
+                .text(message_key!("tui.github_api_token_not_configured"))
                 .to_owned(),
         )
     };
@@ -8935,7 +8782,7 @@ fn draw_initial_load(
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(PANEL_BG))
         .title(Span::styled(
-            language.text(" Starting dvup ", " 正在启动 dvup "),
+            language.text(message_key!("tui.starting_dvup_spaced_1_1")),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(panel);
@@ -8998,13 +8845,15 @@ fn draw_tools(frame: &mut Frame, app: &mut App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(3)])
         .split(area);
-    let titles = match app.language {
-        Language::English => ["Command tools", "GitHub repositories"],
-        Language::Chinese => ["命令工具", "GitHub 仓库"],
-    }
-    .into_iter()
-    .map(Line::from)
-    .collect::<Vec<_>>();
+    let titles = app
+        .language
+        .list([
+            message_key!("tool_view.commands"),
+            message_key!("tool_view.github"),
+        ])
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     app.tool_view_hitboxes = tab_hitboxes(sections[0], &titles);
     frame.render_widget(
         Tabs::new(titles)
@@ -9015,7 +8864,7 @@ fn draw_tools(frame: &mut Frame, app: &mut App, area: Rect) {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(BORDER))
                     .title(Span::styled(
-                        app.language.text(" Tool views ", " 工具视图 "),
+                        app.language.text(message_key!("tui.tool_views_spaced_1_1")),
                         Style::default().fg(ACCENT),
                     )),
             )
@@ -9046,28 +8895,16 @@ fn draw_command_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             Cell::from(tool.command.clone()),
         ]))
     });
-    let header = Row::new(match app.language {
-        Language::English => [
-            "",
-            "TOOL",
-            "AVAILABLE",
-            "INSTALLED",
-            "LATEST",
-            "RESULT",
-            "TYPE",
-            "COMMAND",
-        ],
-        Language::Chinese => [
-            "",
-            "工具",
-            "可用性",
-            "已安装版本",
-            "最新版本",
-            "结果",
-            "类型",
-            "命令",
-        ],
-    })
+    let header = Row::new([
+        "",
+        app.language.text(message_key!("table.tool")),
+        app.language.text(message_key!("table.availability")),
+        app.language.text(message_key!("table.installed")),
+        app.language.text(message_key!("table.latest")),
+        app.language.text(message_key!("table.result")),
+        app.language.text(message_key!("table.kind")),
+        app.language.text(message_key!("table.command")),
+    ])
     .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
     let table = Table::new(
@@ -9090,7 +8927,7 @@ fn draw_command_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(BORDER))
             .title(Span::styled(
-                app.language.text(" Tools ", " 工具 "),
+                app.language.text(message_key!("tui.tools_spaced_1_1")),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
     )
@@ -9160,9 +8997,9 @@ fn draw_github_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             .and_then(|status| status.installed_tag.as_deref())
             .unwrap_or("—");
         let latest = if !monitor.enabled {
-            app.language.text("disabled", "已停用")
+            app.language.text(message_key!("tui.disabled"))
         } else if app.release_probe_running {
-            app.language.text("checking…", "检查中…")
+            app.language.text(message_key!("tui.checking"))
         } else {
             status
                 .and_then(|status| status.latest_tag.as_deref())
@@ -9183,28 +9020,16 @@ fn draw_github_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             Cell::from(monitor.target_directory.display().to_string()),
         ])
     });
-    let header = Row::new(match app.language {
-        Language::English => [
-            "",
-            "TOOL",
-            "REPOSITORY",
-            "INSTALLED",
-            "LATEST",
-            "STATUS",
-            "POLICY",
-            "TARGET",
-        ],
-        Language::Chinese => [
-            "",
-            "工具",
-            "仓库",
-            "已安装版本",
-            "最新版本",
-            "状态",
-            "策略",
-            "目标目录",
-        ],
-    })
+    let header = Row::new([
+        "",
+        app.language.text(message_key!("table.tool")),
+        app.language.text(message_key!("table.repository")),
+        app.language.text(message_key!("table.installed")),
+        app.language.text(message_key!("table.latest")),
+        app.language.text(message_key!("table.status")),
+        app.language.text(message_key!("table.policy")),
+        app.language.text(message_key!("table.target")),
+    ])
     .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
     .bottom_margin(1);
     let table = Table::new(
@@ -9227,7 +9052,8 @@ fn draw_github_tools(frame: &mut Frame, app: &mut App, area: Rect) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(BORDER))
             .title(Span::styled(
-                app.language.text(" GitHub repositories ", " GitHub 仓库 "),
+                app.language
+                    .text(message_key!("tui.github_repositories_spaced_1_1")),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
     )
@@ -9280,33 +9106,35 @@ fn github_monitor_result(
 ) -> (String, Style) {
     if !monitor.enabled {
         return (
-            language.text("disabled", "已停用").to_owned(),
+            language.text(message_key!("tui.disabled")).to_owned(),
             Style::default().fg(SUBTLE),
         );
     }
     let Some(status) = status else {
         return (
-            language.text("not checked", "尚未检查").to_owned(),
+            language.text(message_key!("tui.not_checked")).to_owned(),
             Style::default().fg(DIM),
         );
     };
-    if status.error.is_some() {
+    if let Some(failure) = &status.failure {
         return (
-            language.text("fetch failed", "获取失败").to_owned(),
+            release_failure_label(failure.stage(), language).to_owned(),
             Style::default().fg(ERROR_COLOR),
         );
     }
     match (&status.installed_tag, &status.latest_tag) {
         (Some(installed), Some(latest)) if release::release_versions_match(installed, latest) => (
-            language.text("up to date", "已是最新").to_owned(),
+            language.text(message_key!("tui.up_to_date")).to_owned(),
             Style::default().fg(SUCCESS),
         ),
         (_, Some(_)) => (
-            language.text("update available", "可更新").to_owned(),
+            language
+                .text(message_key!("tui.update_available"))
+                .to_owned(),
             Style::default().fg(WARNING_COLOR),
         ),
         _ => (
-            language.text("not checked", "尚未检查").to_owned(),
+            language.text(message_key!("tui.not_checked")).to_owned(),
             Style::default().fg(DIM),
         ),
     }
@@ -9362,19 +9190,20 @@ fn draw_activity(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(line, _)| line)
         .collect::<Vec<_>>();
     let title = Line::from(vec![
-        Span::raw(app.language.text(" Activity  ", " 活动  ")),
+        Span::raw(app.language.text(message_key!("tui.activity_spaced_1_2"))),
         Span::styled(
-            app.language.text("● success", "● 成功"),
+            app.language.text(message_key!("tui.legend_success")),
             Style::default().fg(SUCCESS),
         ),
         Span::raw("  "),
         Span::styled(
-            app.language.text("● queued", "● 已排队"),
+            app.language.text(message_key!("tui.legend_queued")),
             Style::default().fg(WARNING_COLOR),
         ),
         Span::raw("  "),
         Span::styled(
-            app.language.text("● failed ", "● 失败 "),
+            app.language
+                .text(message_key!("tui.legend_failed_spaced_0_1")),
             Style::default().fg(ERROR_COLOR),
         ),
     ]);
@@ -9505,10 +9334,12 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
         ],
     )
     .header(
-        Row::new(match app.language {
-            Language::English => ["TOOL", "STATUS", "UPDATED", "JOB"],
-            Language::Chinese => ["工具", "状态", "更新时间", "任务"],
-        })
+        Row::new(app.language.list([
+            message_key!("table.tool"),
+            message_key!("table.status"),
+            message_key!("table.updated"),
+            message_key!("table.job"),
+        ]))
         .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
         .bottom_margin(1),
     )
@@ -9518,7 +9349,8 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(BORDER))
             .title(Span::styled(
-                app.language.text(" Background jobs ", " 后台任务 "),
+                app.language
+                    .text(message_key!("tui.background_jobs_spaced_1_1")),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
     )
@@ -9569,7 +9401,7 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
     let detail_lines = if app.job_log.is_empty() {
         vec![Line::styled(
             app.language
-                .text("No output has been recorded yet.", "尚未记录任何输出。"),
+                .text(message_key!("tui.no_output_has_been_recorded_yet")),
             Style::default().fg(SUBTLE),
         )]
     } else {
@@ -9595,11 +9427,15 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
         .expanded_job
         .as_deref()
         .and_then(|id| app.jobs.iter().find(|job| job.id == id));
-    let detail_title = match (job, app.language) {
-        (Some(job), Language::English) => format!(" Result — {} / {} ", job.name, job.id),
-        (Some(job), Language::Chinese) => format!(" 结果 — {} / {} ", job.name, job.id),
-        (None, Language::English) => " Result ".to_owned(),
-        (None, Language::Chinese) => " 结果 ".to_owned(),
+    let detail_title = match job {
+        Some(job) => app.language.format(
+            message_key!("panel.job_result_named"),
+            &[&job.name, &job.id],
+        ),
+        None => app
+            .language
+            .text(message_key!("panel.job_result"))
+            .to_owned(),
     };
     frame.render_widget(
         Paragraph::new(detail_lines)
@@ -9636,16 +9472,12 @@ enum DoctorStatus {
 
 impl DoctorStatus {
     fn label(self, language: Language) -> &'static str {
-        match (self, language) {
-            (Self::Ok, Language::English) => "OK",
-            (Self::Ok, Language::Chinese) => "正常",
-            (Self::Conflict, Language::English) => "WARN",
-            (Self::Conflict, Language::Chinese) => "冲突",
-            (Self::Missing, Language::English) => "NOT FOUND",
-            (Self::Missing, Language::Chinese) => "未找到",
-            (Self::Unsupported, Language::English) => "UNSUPPORTED",
-            (Self::Unsupported, Language::Chinese) => "不支持",
-        }
+        language.text(match self {
+            Self::Ok => message_key!("doctor_status.ok"),
+            Self::Conflict => message_key!("doctor_status.conflict"),
+            Self::Missing => message_key!("doctor_status.missing"),
+            Self::Unsupported => message_key!("doctor_status.unsupported"),
+        })
     }
 
     fn style(self) -> Style {
@@ -9732,35 +9564,31 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
         .count();
     let (scan_status, scan_status_style) = if app.doctor_loading {
         (
-            app.language.text("● scanning", "● 扫描中"),
+            app.language.text(message_key!("tui.legend_scanning")),
             Style::default().fg(ACCENT),
         )
     } else if never_scanned {
         (
-            app.language.text("● not scanned", "● 尚未诊断"),
+            app.language.text(message_key!("tui.legend_not_scanned")),
             Style::default().fg(WARNING_COLOR),
         )
     } else {
         (
-            app.language.text("● ready", "● 已完成"),
+            app.language.text(message_key!("tui.legend_ready")),
             Style::default().fg(SUCCESS),
         )
     };
     let result_summary = if never_scanned {
         String::new()
     } else {
-        match app.language {
-            Language::English => {
-                format!("  {visible_doctor_count} tools · {conflicts} warn")
-            }
-            Language::Chinese => {
-                format!("  {visible_doctor_count} 工具 · {conflicts} 冲突")
-            }
-        }
+        app.language.format(
+            message_key!("panel.doctor_summary"),
+            &[&visible_doctor_count, &conflicts],
+        )
     };
     let title = Line::from(vec![
         Span::styled(
-            app.language.text(" Doctor  ", " 安装诊断  "),
+            app.language.text(message_key!("tui.doctor_spaced_1_2")),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(scan_status, scan_status_style),
@@ -9792,10 +9620,14 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
         ],
     )
     .header(
-        Row::new(match app.language {
-            Language::English => ["TOOL", "STATUS", "ACTIVE", "VERSION", "COPIES", "UPDATER"],
-            Language::Chinese => ["工具", "状态", "当前生效", "版本", "安装数", "更新器"],
-        })
+        Row::new(app.language.list([
+            message_key!("table.tool"),
+            message_key!("table.status"),
+            message_key!("table.active"),
+            message_key!("table.version"),
+            message_key!("table.copies"),
+            message_key!("table.updater"),
+        ]))
         .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
         .bottom_margin(1),
     )
@@ -9838,17 +9670,15 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    app.language.text(
-                        "Installation diagnostics have not been run.",
-                        "尚未运行安装冲突诊断。",
-                    ),
+                    app.language.text(message_key!(
+                        "tui.installation_diagnostics_have_not_been_run"
+                    )),
                     Style::default().fg(DIM),
                 ),
                 Line::styled(
-                    app.language.text(
-                        "Press Enter to scan; press R to rescan later.",
-                        "按 Enter 开始扫描；之后可按 R 重新扫描。",
-                    ),
+                    app.language.text(message_key!(
+                        "tui.press_enter_to_scan_press_r_to_rescan_later"
+                    )),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
             ])
@@ -9907,8 +9737,7 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|diagnosis| doctor_detail_lines(diagnosis, app.language))
         .unwrap_or_else(|| {
             vec![Line::styled(
-                app.language
-                    .text("No diagnosis selected.", "未选择诊断项。"),
+                app.language.text(message_key!("tui.no_diagnosis_selected")),
                 Style::default().fg(SUBTLE),
             )]
         });
@@ -9925,11 +9754,14 @@ fn draw_doctor(frame: &mut Frame, app: &mut App, area: Rect) {
         .sum::<usize>();
     let max_scroll = rendered_height.saturating_sub(detail_height);
     app.doctor_detail_scroll = app.doctor_detail_scroll.min(max_scroll);
-    let detail_title = match (diagnosis, app.language) {
-        (Some(diagnosis), Language::English) => format!(" Diagnosis — {} ", diagnosis.name),
-        (Some(diagnosis), Language::Chinese) => format!(" 诊断详情 — {} ", diagnosis.name),
-        (None, Language::English) => " Diagnosis ".to_owned(),
-        (None, Language::Chinese) => " 诊断详情 ".to_owned(),
+    let detail_title = match diagnosis {
+        Some(diagnosis) => app
+            .language
+            .format(message_key!("panel.diagnosis_named"), &[&diagnosis.name]),
+        None => app
+            .language
+            .text(message_key!("panel.diagnosis"))
+            .to_owned(),
     };
     frame.render_widget(
         Paragraph::new(detail_lines)
@@ -9961,11 +9793,12 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(12), Constraint::Min(3)])
         .split(area);
-    let enabled_label = |enabled| match (enabled, app.language) {
-        (true, Language::English) => "enabled",
-        (true, Language::Chinese) => "已启用",
-        (false, Language::English) => "disabled",
-        (false, Language::Chinese) => "已关闭",
+    let enabled_label = |enabled| {
+        app.language.text(if enabled {
+            message_key!("settings.enabled")
+        } else {
+            message_key!("settings.disabled")
+        })
     };
     let proxy_url = app
         .settings
@@ -9980,55 +9813,48 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
         app.settings.network.no_proxy.join(", ")
     };
     let test_state = if app.network_test_loading {
-        app.language.text("testing…", "测试中…")
+        app.language.text(message_key!("tui.testing"))
     } else if app.network_test_results.is_empty() {
-        app.language.text("press Enter", "按 Enter")
+        app.language.text(message_key!("tui.press_enter"))
     } else if app
         .network_test_results
         .iter()
         .any(|result| result.error.is_some())
     {
-        app.language.text("failed", "有失败")
+        app.language.text(message_key!("tui.failed"))
     } else {
-        app.language.text("passed", "已通过")
+        app.language.text(message_key!("tui.passed"))
     };
     let api_key_state = if app.github_credential_error.is_some() {
-        app.language.text("credential error", "凭据错误")
+        app.language.text(message_key!("tui.credential_error"))
     } else if app.github_api_key_configured {
-        app.language.text("stored securely", "已安全保存")
+        app.language.text(message_key!("tui.stored_securely"))
     } else {
-        app.language.text("not configured", "未配置")
+        app.language.text(message_key!("tui.not_configured"))
     };
-    let github_state = match app.language {
-        Language::English => format!(
-            "{api_key_state} · every {} seconds",
-            app.settings.github.poll_interval_secs
-        ),
-        Language::Chinese => format!(
-            "{api_key_state} · 每 {} 秒",
-            app.settings.github.poll_interval_secs
-        ),
-    };
-    let ai_state = match app.settings.ai.base_url.as_deref() {
-        Some(base_url) => {
-            let model = app
-                .settings
-                .ai
-                .model
-                .as_deref()
-                .unwrap_or_else(|| app.language.text("model not selected", "尚未选择模型"));
-            let key = if app.settings.ai.encrypted_api_key.is_some() {
-                app.language.text("key stored", "已保存密钥")
-            } else {
-                app.language.text("no key", "无密钥")
-            };
-            format!(
-                "{} · {model} · {key} · {base_url}",
-                enabled_label(app.settings.ai.enabled)
-            )
-        }
-        None => enabled_label(app.settings.ai.enabled).to_owned(),
-    };
+    let github_state = app.language.format(
+        message_key!("settings.github_state"),
+        &[&api_key_state, &app.settings.github.poll_interval_secs],
+    );
+    let ai_state =
+        match app.settings.ai.base_url.as_deref() {
+            Some(base_url) => {
+                let model =
+                    app.settings.ai.model.as_deref().unwrap_or_else(|| {
+                        app.language.text(message_key!("tui.model_not_selected"))
+                    });
+                let key = if app.settings.ai.encrypted_api_key.is_some() {
+                    app.language.text(message_key!("tui.key_stored"))
+                } else {
+                    app.language.text(message_key!("tui.no_key"))
+                };
+                format!(
+                    "{} · {model} · {key} · {base_url}",
+                    enabled_label(app.settings.ai.enabled)
+                )
+            }
+            None => enabled_label(app.settings.ai.enabled).to_owned(),
+        };
     let rows = vec![
         Row::new([
             format!(
@@ -10038,10 +9864,8 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     "[ ]"
                 },
-                app.language.text(
-                    "Run Doctor diagnostics when TUI starts",
-                    "进入 TUI 时自动运行 Doctor 诊断"
-                )
+                app.language
+                    .text(message_key!("tui.run_doctor_diagnostics_when_tui_starts"))
             ),
             enabled_label(app.settings.auto_diagnose_on_startup).to_owned(),
         ]),
@@ -10053,48 +9877,48 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     "[ ]"
                 },
-                app.language.text(
-                    "Hide unsupported or uninstalled tools",
-                    "隐藏不支持或未安装的工具"
-                )
+                app.language
+                    .text(message_key!("tui.hide_unsupported_or_uninstalled_tools"))
             ),
             enabled_label(app.settings.hide_unsupported_and_missing_tools).to_owned(),
         ]),
         Row::new([
-            app.language.text("Proxy mode", "代理模式").to_owned(),
+            app.language.text(message_key!("tui.proxy_mode")).to_owned(),
             app.settings.network.proxy_mode.label().to_owned(),
         ]),
         Row::new([
-            app.language.text("Proxy URL", "代理地址").to_owned(),
+            app.language.text(message_key!("tui.proxy_url")).to_owned(),
             proxy_url,
         ]),
         Row::new([
-            app.language.text("No proxy", "代理绕过").to_owned(),
+            app.language.text(message_key!("tui.no_proxy")).to_owned(),
             no_proxy,
         ]),
         Row::new([
             app.language
-                .text("Test registry connections", "测试仓库连接")
+                .text(message_key!("tui.test_registry_connections"))
                 .to_owned(),
             test_state.to_owned(),
         ]),
         Row::new([
             app.language
-                .text("GitHub access and monitoring", "GitHub 访问与监控")
+                .text(message_key!("tui.github_access_and_monitoring"))
                 .to_owned(),
             github_state,
         ]),
         Row::new([
-            app.language.text("AI generation", "AI 生成").to_owned(),
+            app.language
+                .text(message_key!("tui.ai_generation"))
+                .to_owned(),
             ai_state,
         ]),
     ];
     let table = Table::new(rows, [Constraint::Min(28), Constraint::Percentage(42)])
         .header(
-            Row::new(match app.language {
-                Language::English => ["OPTION", "STATE"],
-                Language::Chinese => ["选项", "状态"],
-            })
+            Row::new(
+                app.language
+                    .list([message_key!("table.option"), message_key!("table.state")]),
+            )
             .style(Style::default().fg(DIM).add_modifier(Modifier::BOLD))
             .bottom_margin(1),
         )
@@ -10104,7 +9928,7 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(BORDER))
                 .title(Span::styled(
-                    app.language.text(" Settings ", " 设置 "),
+                    app.language.text(message_key!("tui.settings_spaced_1_1")),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )),
         )
@@ -10138,114 +9962,78 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let (detail_title, mut description) = match app.settings_index {
         0 => (
-            app.language.text(" Startup diagnostics ", " 启动诊断 "),
+            app.language.text(message_key!("tui.startup_diagnostics_spaced_1_1")),
             vec![Line::styled(
-                app.language.text(
-                    "Runs Doctor once when the next TUI session starts; this does not change update behavior.",
-                    "下次进入 TUI 时运行一次 Doctor；不会改变更新行为。",
-                ),
+                app.language.text(message_key!("tui.runs_doctor_once_when_the_next_tui_session_starts_this_does_not_change_update_behavior")),
                 Style::default().fg(DIM),
             )],
         ),
         1 => (
-            app.language.text(" Tool visibility ", " 工具可见性 "),
+            app.language.text(message_key!("tui.tool_visibility_spaced_1_1")),
             vec![Line::styled(
-                app.language.text(
-                    "Only changes which configured tools are shown; hidden tools remain in the manifest.",
-                    "仅改变已配置工具的显示范围；隐藏的工具仍保留在清单中。",
-                ),
+                app.language.text(message_key!("tui.only_changes_which_configured_tools_are_shown_hidden_tools_remain_in_the_manifest")),
                 Style::default().fg(DIM),
             )],
         ),
         2 => (
-            app.language.text(" Proxy policy ", " 代理策略 "),
+            app.language.text(message_key!("tui.proxy_policy_spaced_1_1")),
             vec![
                 Line::styled(
-                    app.language.text(
-                        "environment inherits proxy variables; explicit uses only the configured URL; direct removes all proxies.",
-                        "environment 继承代理变量；explicit 只使用配置的地址；direct 移除全部代理。",
-                    ),
+                    app.language.text(message_key!("tui.environment_inherits_proxy_variables_explicit_uses_only_the_configured_url_direct_removes_all_proxies")),
                     Style::default().fg(DIM),
                 ),
                 Line::styled(
-                    app.language.text(
-                        "Modes never fall back to one another.",
-                        "各模式之间不会自动回退。",
-                    ),
+                    app.language.text(message_key!("tui.modes_never_fall_back_to_one_another")),
                     Style::default().fg(SUBTLE),
                 ),
             ],
         ),
         3 => (
-            app.language.text(" Explicit proxy ", " 显式代理 "),
+            app.language.text(message_key!("tui.explicit_proxy_spaced_1_1")),
             vec![Line::styled(
-                app.language.text(
-                    "Used only in explicit mode. HTTP/HTTPS CONNECT is supported; credentials and SOCKS are rejected.",
-                    "仅在 explicit 模式使用；支持 HTTP/HTTPS CONNECT，不支持代理凭据和 SOCKS。",
-                ),
+                app.language.text(message_key!("tui.used_only_in_explicit_mode_http_https_connect_is_supported_credentials_and_socks_are_rejected")),
                 Style::default().fg(DIM),
             )],
         ),
         4 => (
-            app.language.text(" Proxy bypass ", " 代理绕过 "),
+            app.language.text(message_key!("tui.proxy_bypass_spaced_1_1")),
             vec![Line::styled(
-                app.language.text(
-                    "Comma-separated hosts that bypass the explicit proxy, such as localhost or .example.com.",
-                    "以逗号分隔需要绕过显式代理的主机，例如 localhost 或 .example.com。",
-                ),
+                app.language.text(message_key!("tui.comma_separated_hosts_that_bypass_the_explicit_proxy_such_as_localhost_or_example_com")),
                 Style::default().fg(DIM),
             )],
         ),
         5 => (
-            app.language.text(" Connection results ", " 连接测试结果 "),
+            app.language.text(message_key!("tui.connection_results_spaced_1_1")),
             vec![Line::styled(
-                app.language.text(
-                    "Tests npm, PyPI, crates.io, and GitHub with the selected proxy policy.",
-                    "使用当前代理策略测试 npm、PyPI、crates.io 和 GitHub。",
-                ),
+                app.language.text(message_key!("tui.tests_npm_pypi_crates_io_and_github_with_the_selected_proxy_policy")),
                 Style::default().fg(DIM),
             )],
         ),
         6 => (
-            app.language.text(" GitHub access and monitoring ", " GitHub 访问与监控 "),
+            app.language.text(message_key!("tui.github_access_and_monitoring_spaced_1_1")),
             vec![
                 Line::styled(
-                    match app.language {
-                        Language::English => format!(
-                            "API key: {api_key_state}; release metadata refreshes every {} seconds.",
-                            app.settings.github.poll_interval_secs
-                        ),
-                        Language::Chinese => format!(
-                            "API Key：{api_key_state}；Release 元数据每 {} 秒刷新一次。",
-                            app.settings.github.poll_interval_secs
-                        ),
-                    },
+                    app.language.format(
+                        message_key!("settings.github_description"),
+                        &[&api_key_state, &app.settings.github.poll_interval_secs],
+                    ),
                     Style::default().fg(DIM),
                 ),
                 Line::styled(
-                    app.language.text(
-                        "The key is encrypted locally; installing a monitored release still requires confirmation in Tools.",
-                        "密钥在本机加密；安装监控到的 Release 仍需在工具页确认。",
-                    ),
+                    app.language.text(message_key!("tui.the_key_is_encrypted_locally_installing_a_monitored_release_still_requires_confirmation_in_tools")),
                     Style::default().fg(SUBTLE),
                 ),
             ],
         ),
         _ => (
-            app.language.text(" AI generation ", " AI 生成 "),
+            app.language.text(message_key!("tui.ai_generation_spaced_1_1")),
             vec![
                 Line::styled(
-                    app.language.text(
-                        "Uses the selected proxy policy and sends only OS, architecture, available package managers, and the natural-language identity request.",
-                        "使用当前代理策略，只发送操作系统、架构、可用包管理器和自然语言身份需求。",
-                    ),
+                    app.language.text(message_key!("tui.uses_the_selected_proxy_policy_and_sends_only_os_architecture_available_package_managers_and_the_natural_language_identity_request")),
                     Style::default().fg(DIM),
                 ),
                 Line::styled(
-                    app.language.text(
-                        "The dialog can fetch models after Base URL and API key entry; the switch does not erase saved connection settings.",
-                        "填写 Base URL 和 API Key 后可获取模型；关闭开关不会删除已保存的连接设置。",
-                    ),
+                    app.language.text(message_key!("tui.the_dialog_can_fetch_models_after_base_url_and_api_key_entry_the_switch_does_not_erase_saved_connection_settings")),
                     Style::default().fg(SUBTLE),
                 ),
             ],
@@ -10289,17 +10077,17 @@ fn doctor_detail_lines(
     let status = doctor_status(diagnosis);
     lines.push(Line::from(vec![
         Span::styled(
-            language.text("status: ", "状态："),
+            language.text(message_key!("tui.status_spaced_0_1")),
             Style::default().fg(SUBTLE),
         ),
         Span::styled(status.label(language), status.style()),
     ]));
     if !diagnosis.supported {
         lines.push(Line::styled(
-            match language {
-                Language::English => format!("unsupported on {}", std::env::consts::OS),
-                Language::Chinese => format!("当前平台 {} 不支持此工具", std::env::consts::OS),
-            },
+            language.format(
+                message_key!("doctor.unsupported_os"),
+                &[&std::env::consts::OS],
+            ),
             Style::default().fg(WARNING_COLOR),
         ));
         return lines;
@@ -10318,25 +10106,22 @@ fn doctor_detail_lines(
                 .is_some_and(doctor::ExecutableDiagnosis::versions_differ);
         lines.push(Line::styled(
             if versions_differ {
-                language.text(
-                    "conflict: PATH candidates report different versions",
-                    "冲突：PATH 候选项报告了不同版本",
-                )
+                language.text(message_key!(
+                    "tui.conflict_path_candidates_report_different_versions"
+                ))
             } else {
-                language.text(
-                    "conflict: multiple installations are visible in PATH",
-                    "冲突：PATH 中存在多个可见安装",
-                )
+                language.text(message_key!(
+                    "tui.conflict_multiple_installations_are_visible_in_path"
+                ))
             },
             Style::default()
                 .fg(WARNING_COLOR)
                 .add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::styled(
-            language.text(
-                "fix: remove the stale installation from PATH or move the intended one first",
-                "建议：从 PATH 移除旧安装，或把预期安装移动到最前面",
-            ),
+            language.text(message_key!(
+                "tui.fix_remove_the_stale_installation_from_path_or_move_the_intended_one_first"
+            )),
             Style::default().fg(DIM),
         ));
     }
@@ -10349,12 +10134,11 @@ fn append_doctor_executable_lines(
     updater: bool,
     language: Language,
 ) {
-    let label = match (updater, language) {
-        (false, Language::English) => "command: ",
-        (false, Language::Chinese) => "命令：",
-        (true, Language::English) => "updater: ",
-        (true, Language::Chinese) => "更新器：",
-    };
+    let label = language.text(if updater {
+        message_key!("doctor.updater_label")
+    } else {
+        message_key!("doctor.command_label")
+    });
     lines.push(Line::from(vec![
         Span::styled(label, Style::default().fg(SUBTLE)),
         Span::styled(
@@ -10364,18 +10148,17 @@ fn append_doctor_executable_lines(
     ]));
     if executable.candidates.is_empty() {
         lines.push(Line::styled(
-            language.text("active: not found", "当前生效：未找到"),
+            language.text(message_key!("tui.active_not_found")),
             Style::default().fg(SUBTLE),
         ));
         return;
     }
     for (index, candidate) in executable.candidates.iter().enumerate() {
-        let prefix = match (index == 0, language) {
-            (true, Language::English) => "active: ",
-            (true, Language::Chinese) => "当前生效：",
-            (false, Language::English) => "shadowed: ",
-            (false, Language::Chinese) => "被遮蔽：",
-        };
+        let prefix = language.text(if index == 0 {
+            message_key!("doctor.active_label")
+        } else {
+            message_key!("doctor.shadowed_label")
+        });
         let version = candidate.version.as_deref().unwrap_or("unknown");
         lines.push(Line::from(vec![
             Span::styled(
@@ -10388,10 +10171,7 @@ fn append_doctor_executable_lines(
                 Style::default().fg(DIM),
             ),
             Span::styled(
-                match language {
-                    Language::English => format!("version {version}"),
-                    Language::Chinese => format!("版本 {version}"),
-                },
+                language.format(message_key!("doctor.version"), &[&version]),
                 Style::default().fg(ACCENT),
             ),
         ]));
@@ -10452,7 +10232,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("Add command tool", "添加命令工具"),
+                app.language.text(message_key!("tui.add_command_tool")),
                 76,
                 12,
             );
@@ -10460,17 +10240,17 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 (
                     CommandAddChoice::Package,
                     app.language
-                        .text("Add from package manager", "从包管理器添加"),
+                        .text(message_key!("tui.add_from_package_manager")),
                 ),
                 (
                     CommandAddChoice::Custom,
                     app.language
-                        .text("Add custom update command", "添加自定义更新命令"),
+                        .text(message_key!("tui.add_custom_update_command")),
                 ),
                 (
                     CommandAddChoice::Ai,
                     app.language
-                        .text("Use AI to analyze command tool", "使用 AI 分析命令工具"),
+                        .text(message_key!("tui.use_ai_to_analyze_command_tool")),
                 ),
             ];
             let mut lines = vec![Line::raw("")];
@@ -10487,10 +10267,8 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.extend([
                 Line::raw(""),
                 Line::styled(
-                    app.language.text(
-                        "[Enter] select    [Esc] cancel",
-                        "[Enter] 选择    [Esc] 取消",
-                    ),
+                    app.language
+                        .text(message_key!("tui.enter_select_esc_cancel")),
                     Style::default().fg(SUBTLE),
                 ),
             ]);
@@ -10518,12 +10296,13 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("Package manager command", "包管理器命令"),
+                app.language
+                    .text(message_key!("tui.package_manager_command")),
                 96,
                 18,
             );
             let mut lines = vec![labeled_value(
-                app.language.text("Manager", "包管理器"),
+                app.language.text(message_key!("tui.manager")),
                 flow.manager.label(),
                 if flow.step == CommandPackageStep::Manager {
                     ACCENT
@@ -10533,25 +10312,21 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             )];
             match flow.step {
                 CommandPackageStep::Manager => lines.push(Line::styled(
-                    app.language.text(
-                        "Use arrows to choose, then Enter",
-                        "使用方向键选择，然后按 Enter",
-                    ),
+                    app.language
+                        .text(message_key!("tui.use_arrows_to_choose_then_enter")),
                     Style::default().fg(SUBTLE),
                 )),
                 CommandPackageStep::Package => lines.push(modal_input_line(
                     true,
-                    app.language.text("Package", "软件包"),
+                    app.language.text(message_key!("tui.package")),
                     &flow.package,
                     "package name",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 CommandPackageStep::ExecutableChoice => {
                     lines.push(Line::styled(
-                        app.language.text(
-                            "Choose a discovered executable:",
-                            "请选择发现的可执行命令：",
-                        ),
+                        app.language
+                            .text(message_key!("tui.choose_a_discovered_executable")),
                         Style::default().fg(DIM),
                     ));
                     lines.extend(flow.executable_candidates.iter().enumerate().map(
@@ -10569,21 +10344,21 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
                 CommandPackageStep::Executable => lines.push(modal_input_line(
                     true,
-                    app.language.text("Executable", "可执行命令"),
+                    app.language.text(message_key!("tui.executable")),
                     &flow.executable,
                     "command",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 CommandPackageStep::Name => lines.push(modal_input_line(
                     true,
-                    app.language.text("Name", "名称"),
+                    app.language.text(message_key!("tui.name")),
                     &flow.name,
                     "tool name",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 CommandPackageStep::ProbeArgs => lines.push(modal_input_line(
                     true,
-                    app.language.text("Probe args", "探测参数"),
+                    app.language.text(message_key!("tui.probe_args")),
                     &flow.probe_args,
                     "--version",
                     usize::from(inner.width.saturating_sub(20)),
@@ -10591,7 +10366,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 CommandPackageStep::VersionChoice => {
                     lines.push(Line::styled(
                         app.language
-                            .text("Choose the tool version:", "请选择工具版本："),
+                            .text(message_key!("tui.choose_the_tool_version")),
                         Style::default().fg(DIM),
                     ));
                     lines.extend(flow.current_versions.iter().enumerate().map(
@@ -10610,36 +10385,36 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 CommandPackageStep::Confirm => {
                     lines.extend([
                         labeled_value(
-                            app.language.text("Name", "名称"),
+                            app.language.text(message_key!("tui.name")),
                             flow.name.value.trim(),
                             Color::Reset,
                         ),
                         labeled_value(
-                            app.language.text("Package", "软件包"),
+                            app.language.text(message_key!("tui.package")),
                             flow.package.value.trim(),
                             Color::Reset,
                         ),
                         labeled_value(
-                            app.language.text("Executable", "可执行命令"),
+                            app.language.text(message_key!("tui.executable")),
                             flow.executable.value.trim(),
                             Color::Reset,
                         ),
                         labeled_value(
-                            app.language.text("Current", "当前版本"),
+                            app.language.text(message_key!("tui.current")),
                             flow.current_version
                                 .as_deref()
-                                .unwrap_or_else(|| app.language.text("unknown", "未知")),
+                                .unwrap_or_else(|| app.language.text(message_key!("tui.unknown"))),
                             SUCCESS,
                         ),
                         labeled_value(
-                            app.language.text("Latest", "官方最新版本"),
+                            app.language.text(message_key!("tui.latest")),
                             flow.latest_version
                                 .as_deref()
-                                .unwrap_or_else(|| app.language.text("unknown", "未知")),
+                                .unwrap_or_else(|| app.language.text(message_key!("tui.unknown"))),
                             ACCENT,
                         ),
                         labeled_value(
-                            app.language.text("Update", "更新方式"),
+                            app.language.text(message_key!("tui.update_method")),
                             &format_command_parts(
                                 &flow.manager.update_command(flow.package.value.trim()),
                             ),
@@ -10650,26 +10425,23 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             if flow.step == CommandPackageStep::ProbeArgs {
                 lines.push(Line::styled(
-                    app.language.text(
-                        "Tab cycles --version / version / -V; type any custom arguments",
-                        "Tab 可在 --version / version / -V 间切换；也可直接输入自定义参数",
-                    ),
+                    app.language.text(message_key!(
+                        "tui.tab_cycles_version_version_v_type_any_custom_arguments"
+                    )),
                     Style::default().fg(SUBTLE),
                 ));
             }
             if flow.loading {
                 lines.push(Line::styled(
-                    app.language.text("Validating…", "正在验证…"),
+                    app.language.text(message_key!("tui.validating")),
                     Style::default().fg(ACCENT),
                 ));
             }
             lines.extend([
                 Line::raw(""),
                 Line::styled(
-                    app.language.text(
-                        "[Enter] continue/save    [Esc] back",
-                        "[Enter] 继续/保存    [Esc] 返回",
-                    ),
+                    app.language
+                        .text(message_key!("tui.enter_continue_save_esc_back")),
                     Style::default().fg(SUBTLE),
                 ),
             ]);
@@ -10693,7 +10465,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     1,
-                    app.language.text("Package", "软件包"),
+                    app.language.text(message_key!("tui.package")),
                     &flow.package,
                 ),
                 CommandPackageStep::Executable => register_modal_text_input(
@@ -10701,7 +10473,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     1,
-                    app.language.text("Executable", "可执行命令"),
+                    app.language.text(message_key!("tui.executable")),
                     &flow.executable,
                 ),
                 CommandPackageStep::Name => register_modal_text_input(
@@ -10709,7 +10481,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     1,
-                    app.language.text("Name", "名称"),
+                    app.language.text(message_key!("tui.name")),
                     &flow.name,
                 ),
                 CommandPackageStep::ProbeArgs => register_modal_text_input(
@@ -10717,7 +10489,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     1,
-                    app.language.text("Probe args", "探测参数"),
+                    app.language.text(message_key!("tui.probe_args")),
                     &flow.probe_args,
                 ),
                 CommandPackageStep::ExecutableChoice => {
@@ -10761,7 +10533,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("Custom update command", "自定义更新命令"),
+                app.language.text(message_key!("tui.custom_update_command")),
                 100,
                 20,
             );
@@ -10769,21 +10541,21 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             match flow.step {
                 CustomCommandStep::Name => lines.push(modal_input_line(
                     true,
-                    app.language.text("Name", "名称"),
+                    app.language.text(message_key!("tui.name")),
                     &flow.name,
                     "tool name",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 CustomCommandStep::Update => lines.push(modal_input_line(
                     true,
-                    app.language.text("Update", "更新命令"),
+                    app.language.text(message_key!("tui.update_command")),
                     &flow.update,
                     "tool self-update",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 CustomCommandStep::Probe => lines.push(modal_input_line(
                     true,
-                    app.language.text("Probe", "版本探测命令"),
+                    app.language.text(message_key!("tui.probe")),
                     &flow.probe,
                     "tool --version",
                     usize::from(inner.width.saturating_sub(20)),
@@ -10805,7 +10577,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
                 CustomCommandStep::LatestSource => {
                     lines.push(labeled_value(
-                        app.language.text("Latest source", "官方最新版本来源"),
+                        app.language.text(message_key!("tui.latest_source")),
                         custom_latest_label(flow.latest, app.language),
                         ACCENT,
                     ));
@@ -10817,7 +10589,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 CustomCommandStep::LatestValue => {
                     lines.push(modal_input_line(
                         true,
-                        app.language.text("Source value", "来源标识"),
+                        app.language.text(message_key!("tui.source_value")),
                         &flow.latest_value,
                         "package or owner/repo",
                         usize::from(inner.width.saturating_sub(20)),
@@ -10830,31 +10602,31 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 CustomCommandStep::Confirm => {
                     lines.extend([
                         labeled_value(
-                            app.language.text("Name", "名称"),
+                            app.language.text(message_key!("tui.name")),
                             flow.name.value.trim(),
                             Color::Reset,
                         ),
                         labeled_value(
-                            app.language.text("Update", "更新命令"),
+                            app.language.text(message_key!("tui.update_command")),
                             flow.update.value.trim(),
                             Color::Reset,
                         ),
                         labeled_value(
-                            app.language.text("Probe", "版本探测命令"),
+                            app.language.text(message_key!("tui.probe")),
                             flow.probe.value.trim(),
                             Color::Reset,
                         ),
                         labeled_value(
-                            app.language.text("Current", "当前版本"),
+                            app.language.text(message_key!("tui.current")),
                             flow.current_version
                                 .as_deref()
-                                .unwrap_or_else(|| app.language.text("unknown", "未知")),
+                                .unwrap_or_else(|| app.language.text(message_key!("tui.unknown"))),
                             SUCCESS,
                         ),
                         labeled_value(
-                            app.language.text("Latest", "官方最新版本"),
+                            app.language.text(message_key!("tui.latest")),
                             flow.latest_version.as_deref().unwrap_or_else(|| {
-                                app.language.text("self-managed", "工具自行处理")
+                                app.language.text(message_key!("tui.self_managed"))
                             }),
                             ACCENT,
                         ),
@@ -10865,17 +10637,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             if flow.loading {
                 lines.push(Line::styled(
-                    app.language.text("Validating…", "正在验证…"),
+                    app.language.text(message_key!("tui.validating")),
                     Style::default().fg(ACCENT),
                 ));
             }
             lines.extend([
                 Line::raw(""),
                 Line::styled(
-                    app.language.text(
-                        "[Enter] continue/save    [Esc] back",
-                        "[Enter] 继续/保存    [Esc] 返回",
-                    ),
+                    app.language
+                        .text(message_key!("tui.enter_continue_save_esc_back")),
                     Style::default().fg(SUBTLE),
                 ),
             ]);
@@ -10891,7 +10661,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Name", "名称"),
+                    app.language.text(message_key!("tui.name")),
                     &flow.name,
                 ),
                 CustomCommandStep::Update => register_modal_text_input(
@@ -10899,7 +10669,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Update", "更新命令"),
+                    app.language.text(message_key!("tui.update_command")),
                     &flow.update,
                 ),
                 CustomCommandStep::Probe => register_modal_text_input(
@@ -10907,7 +10677,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Probe", "版本探测命令"),
+                    app.language.text(message_key!("tui.probe")),
                     &flow.probe,
                 ),
                 CustomCommandStep::LatestValue => register_modal_text_input(
@@ -10915,7 +10685,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Source value", "来源标识"),
+                    app.language.text(message_key!("tui.source_value")),
                     &flow.latest_value,
                 ),
                 CustomCommandStep::LatestSource => {
@@ -10951,7 +10721,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 app.language
-                    .text("Add GitHub repository monitor", "添加 GitHub 仓库监控"),
+                    .text(message_key!("tui.add_github_repository_monitor")),
                 82,
                 11,
             );
@@ -10959,14 +10729,12 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 (
                     GithubAddChoice::Manual,
                     app.language
-                        .text("Manually add Release monitor", "手动添加 Release 监控"),
+                        .text(message_key!("tui.manually_add_release_monitor")),
                 ),
                 (
                     GithubAddChoice::Ai,
-                    app.language.text(
-                        "Use AI to analyze GitHub repository",
-                        "使用 AI 分析 GitHub 仓库",
-                    ),
+                    app.language
+                        .text(message_key!("tui.use_ai_to_analyze_github_repository")),
                 ),
             ];
             let lines = choices
@@ -10979,10 +10747,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 })
                 .chain([
                     Line::raw(""),
-                    Line::raw(app.language.text(
-                        "[Enter] select    [Esc] cancel",
-                        "[Enter] 选择    [Esc] 取消",
-                    )),
+                    Line::raw(
+                        app.language
+                            .text(message_key!("tui.enter_select_esc_cancel")),
+                    ),
                 ])
                 .collect::<Vec<_>>();
             frame.render_widget(
@@ -11009,8 +10777,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language
-                    .text("AI GitHub analysis", "AI 分析 GitHub 仓库"),
+                app.language.text(message_key!("tui.ai_github_analysis")),
                 92,
                 12,
             );
@@ -11018,16 +10785,16 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 Paragraph::new(vec![
                     modal_input_line(
                         true,
-                        app.language.text("Request", "需求"),
+                        app.language.text(message_key!("tui.request")),
                         intent,
                         "owner/repo or repository description",
                         usize::from(inner.width.saturating_sub(20)),
                     ),
                     Line::raw(""),
-                    Line::raw(app.language.text(
-                        "[Enter] analyze    [Esc] back",
-                        "[Enter] 分析    [Esc] 返回",
-                    )),
+                    Line::raw(
+                        app.language
+                            .text(message_key!("tui.enter_analyze_esc_back")),
+                    ),
                 ])
                 .style(Style::default().bg(PANEL_BG)),
                 inner,
@@ -11037,7 +10804,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 &mut app.modal_input_hitboxes,
                 inner,
                 0,
-                app.language.text("Request", "需求"),
+                app.language.text(message_key!("tui.request")),
                 intent,
             );
         }
@@ -11046,7 +10813,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 app.language
-                    .text("GitHub Release monitor", "GitHub Release 监控"),
+                    .text(message_key!("tui.github_release_monitor")),
                 104,
                 22,
             );
@@ -11054,24 +10821,23 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             match flow.step {
                 GithubReleaseStep::Repository => lines.push(modal_input_line(
                     true,
-                    app.language.text("Repository", "仓库"),
+                    app.language.text(message_key!("tui.repository")),
                     &flow.repository,
                     "owner/repo or GitHub URL",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 GithubReleaseStep::Name => lines.push(modal_input_line(
                     true,
-                    app.language.text("Name", "名称"),
+                    app.language.text(message_key!("tui.name")),
                     &flow.name,
                     "monitor name",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 GithubReleaseStep::Asset => {
                     lines.push(Line::styled(
-                        app.language.text(
-                            "Choose one real asset from the latest Release:",
-                            "请从最新 Release 的真实资产中选择一个：",
-                        ),
+                        app.language.text(message_key!(
+                            "tui.choose_one_real_asset_from_the_latest_release"
+                        )),
                         Style::default().fg(DIM),
                     ));
                     lines.extend(flow.assets.iter().enumerate().map(|(index, asset)| {
@@ -11088,14 +10854,14 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
                 GithubReleaseStep::Variant => lines.push(modal_input_line(
                     true,
-                    app.language.text("Variant", "变体"),
+                    app.language.text(message_key!("tui.variant")),
                     &flow.variant,
                     "musl / gnu / portable / …",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
                 GithubReleaseStep::Application => lines.push(modal_input_line(
                     true,
-                    app.language.text("Application", "应用名称"),
+                    app.language.text(message_key!("tui.application")),
                     &flow.application,
                     "Example.app",
                     usize::from(inner.width.saturating_sub(20)),
@@ -11105,23 +10871,23 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                         .assets
                         .get(flow.selected_asset)
                         .map(|asset| asset.name.as_str())
-                        .unwrap_or_else(|| app.language.text("unknown", "未知"));
+                        .unwrap_or_else(|| app.language.text(message_key!("tui.unknown")));
                     lines.extend([
                         labeled_value(
-                            app.language.text("Name", "名称"),
+                            app.language.text(message_key!("tui.name")),
                             flow.name.value.trim(),
                             Color::Reset,
                         ),
                         labeled_value(
-                            app.language.text("Repository", "仓库"),
+                            app.language.text(message_key!("tui.repository")),
                             flow.repository.value.trim(),
                             Color::Reset,
                         ),
-                        labeled_value(app.language.text("Asset", "资产"), asset, SUCCESS),
+                        labeled_value(app.language.text(message_key!("tui.asset")), asset, SUCCESS),
                         labeled_value(
-                            app.language.text("Install", "安装位置"),
+                            app.language.text(message_key!("tui.install_location")),
                             if flow.application.value.trim().is_empty() {
-                                app.language.text("dvup user directory", "dvup 用户目录")
+                                app.language.text(message_key!("tui.dvup_user_directory"))
                             } else {
                                 flow.application.value.trim()
                             },
@@ -11129,10 +10895,9 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                         ),
                         Line::raw(""),
                         Line::styled(
-                            app.language.text(
-                                "Saving does not download or install the asset.",
-                                "保存不会下载或安装资产。",
-                            ),
+                            app.language.text(message_key!(
+                                "tui.saving_does_not_download_or_install_the_asset"
+                            )),
                             Style::default().fg(SUBTLE),
                         ),
                     ]);
@@ -11141,16 +10906,16 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             if flow.loading {
                 lines.push(Line::styled(
                     app.language
-                        .text("Loading GitHub Release…", "正在加载 GitHub Release…"),
+                        .text(message_key!("tui.loading_github_release")),
                     Style::default().fg(ACCENT),
                 ));
             }
             lines.extend([
                 Line::raw(""),
-                Line::raw(app.language.text(
-                    "[Enter] continue/save    [Esc] back",
-                    "[Enter] 继续/保存    [Esc] 返回",
-                )),
+                Line::raw(
+                    app.language
+                        .text(message_key!("tui.enter_continue_save_esc_back")),
+                ),
             ]);
             frame.render_widget(
                 Paragraph::new(lines)
@@ -11164,7 +10929,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Repository", "仓库"),
+                    app.language.text(message_key!("tui.repository")),
                     &flow.repository,
                 ),
                 GithubReleaseStep::Name => register_modal_text_input(
@@ -11172,7 +10937,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Name", "名称"),
+                    app.language.text(message_key!("tui.name")),
                     &flow.name,
                 ),
                 GithubReleaseStep::Application => register_modal_text_input(
@@ -11180,7 +10945,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Application", "应用名称"),
+                    app.language.text(message_key!("tui.application")),
                     &flow.application,
                 ),
                 GithubReleaseStep::Variant => register_modal_text_input(
@@ -11188,7 +10953,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     &mut app.modal_input_hitboxes,
                     inner,
                     0,
-                    app.language.text("Variant", "变体"),
+                    app.language.text(message_key!("tui.variant")),
                     &flow.variant,
                 ),
                 GithubReleaseStep::Asset => {
@@ -11215,19 +10980,18 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("AI add tool", "AI 添加工具"),
+                app.language.text(message_key!("tui.ai_add_tool")),
                 100,
                 15,
             );
-            let label = app.language.text("Request", "需求");
+            let label = app.language.text(message_key!("tui.request"));
             let value_width = input_value_width(inner.width, label);
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        app.language.text(
-                            "Describe the tool you want to update in natural language.",
-                            "请用自然语言描述你想更新的工具。",
-                        ),
+                        app.language.text(message_key!(
+                            "tui.describe_the_tool_you_want_to_update_in_natural_language"
+                        )),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Line::raw(""),
@@ -11235,27 +10999,27 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                         true,
                         label,
                         intent,
-                        app.language.text(
-                            "Update ripgrep installed with Cargo",
-                            "更新通过 Cargo 安装的 ripgrep",
-                        ),
+                        app.language
+                            .text(message_key!("tui.update_ripgrep_installed_with_cargo")),
                         value_width,
                     ),
                     Line::raw(""),
                     Line::styled(
-                        app.language.text(
-                            "Examples: update CodeGraph · update my Python tool ruff",
-                            "示例：更新 CodeGraph · 更新我的 Python 工具 ruff",
-                        ),
+                        app.language.text(message_key!(
+                            "tui.examples_update_codegraph_update_my_python_tool_ruff"
+                        )),
                         Style::default().fg(SUBTLE),
                     ),
                     Line::raw(""),
                     Line::from(vec![
                         Span::styled("[Ctrl+G/Enter]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" analyze candidates", " 分析候选")),
+                        Span::raw(
+                            app.language
+                                .text(message_key!("tui.analyze_candidates_spaced_1_0")),
+                        ),
                         Span::raw("    "),
                         Span::styled("[Esc]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" cancel", " 取消")),
+                        Span::raw(app.language.text(message_key!("tui.cancel_spaced_1_0"))),
                     ]),
                 ])
                 .style(Style::default().bg(PANEL_BG))
@@ -11306,16 +11070,13 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 app.language
-                    .text("Choose verified candidate", "选择已验证候选"),
+                    .text(message_key!("tui.choose_verified_candidate")),
                 112,
                 panel_height,
             );
             let mut lines = vec![
                 Line::styled(
-                    app.language.text(
-                        "Choose a verified update method. No source will be selected automatically.",
-                        "请选择一个已验证的更新方式；程序不会自动替你选择来源。",
-                    ),
+                    app.language.text(message_key!("tui.choose_a_verified_update_method_no_source_will_be_selected_automatically")),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(""),
@@ -11350,14 +11111,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             if !rejected.is_empty() {
                 lines.push(Line::styled(
-                    match app.language {
-                        Language::English => {
-                            format!("{} unverified candidate(s) hidden", rejected.len())
-                        }
-                        Language::Chinese => {
-                            format!("已隐藏 {} 个未验证候选", rejected.len())
-                        }
-                    },
+                    app.language.format(
+                        message_key!("modal.unverified_candidates_hidden"),
+                        &[&rejected.len()],
+                    ),
                     Style::default().fg(WARNING_COLOR),
                 ));
             }
@@ -11365,10 +11122,16 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::raw(""),
                 Line::from(vec![
                     Span::styled("[Enter]", Style::default().fg(ACCENT)),
-                    Span::raw(app.language.text(" choose and configure", " 选择并配置")),
+                    Span::raw(
+                        app.language
+                            .text(message_key!("tui.choose_and_configure_spaced_1_0")),
+                    ),
                     Span::raw("    "),
                     Span::styled("[Esc]", Style::default().fg(ACCENT)),
-                    Span::raw(app.language.text(" edit request", " 修改需求")),
+                    Span::raw(
+                        app.language
+                            .text(message_key!("tui.edit_request_spaced_1_0")),
+                    ),
                 ]),
             ]);
             frame.render_widget(
@@ -11404,16 +11167,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 app.language
-                    .text("Choose verified repository", "选择已验证仓库"),
+                    .text(message_key!("tui.choose_verified_repository")),
                 112,
                 panel_height,
             );
             let mut lines = vec![
                 Line::styled(
-                    app.language.text(
-                        "Choose a verified repository. Release assets will be selected next.",
-                        "请选择已验证仓库；下一步将选择真实 Release 资产。",
-                    ),
+                    app.language.text(message_key!(
+                        "tui.choose_a_verified_repository_release_assets_will_be_selected_next"
+                    )),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(""),
@@ -11443,17 +11205,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             if !rejected.is_empty() {
                 lines.push(Line::styled(
-                    match app.language {
-                        Language::English => {
-                            format!(
-                                "{} unverified repository candidate(s) hidden",
-                                rejected.len()
-                            )
-                        }
-                        Language::Chinese => {
-                            format!("已隐藏 {} 个未验证仓库候选", rejected.len())
-                        }
-                    },
+                    app.language.format(
+                        message_key!("modal.unverified_repositories_hidden"),
+                        &[&rejected.len()],
+                    ),
                     Style::default().fg(WARNING_COLOR),
                 ));
             }
@@ -11461,10 +11216,13 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 Line::raw(""),
                 Line::from(vec![
                     Span::styled("[Enter]", Style::default().fg(ACCENT)),
-                    Span::raw(app.language.text(" choose", " 选择")),
+                    Span::raw(app.language.text(message_key!("tui.choose_spaced_1_0"))),
                     Span::raw("    "),
                     Span::styled("[Esc]", Style::default().fg(ACCENT)),
-                    Span::raw(app.language.text(" edit request", " 修改需求")),
+                    Span::raw(
+                        app.language
+                            .text(message_key!("tui.edit_request_spaced_1_0")),
+                    ),
                 ]),
             ]);
             frame.render_widget(
@@ -11492,43 +11250,37 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 app.language
-                    .text("Install GitHub updates", "安装 GitHub 更新"),
+                    .text(message_key!("tui.install_github_updates")),
                 78,
                 12,
             );
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        match app.language {
-                            Language::English => format!(
-                                "Download and install {} selected GitHub repository update(s)?",
-                                monitors.len()
-                            ),
-                            Language::Chinese => {
-                                format!("下载并安装所选的 {} 项 GitHub 仓库更新？", monitors.len())
-                            }
-                        },
+                        app.language.format(
+                            message_key!("modal.install_github_updates_prompt"),
+                            &[&monitors.len()],
+                        ),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Line::raw(""),
                     labeled_value(
-                        app.language.text("Selected", "已选择"),
+                        app.language.text(message_key!("tui.selected")),
                         &monitors.join(", "),
                         ACCENT,
                     ),
                     Line::raw(""),
                     Line::styled(
-                        app.language.text(
-                            "Targets are replaced only after download and extraction succeed.",
-                            "仅在下载和解压成功后替换目标目录。",
-                        ),
+                        app.language.text(message_key!(
+                            "tui.targets_are_replaced_only_after_download_and_extraction_succeed"
+                        )),
                         Style::default().fg(WARNING_COLOR),
                     ),
                     Line::raw(""),
                     modal_actions(
                         app.language,
-                        app.language.text("install", "安装"),
-                        app.language.text("cancel", "取消"),
+                        app.language.text(message_key!("tui.install")),
+                        app.language.text(message_key!("tui.cancel")),
                     ),
                 ])
                 .style(Style::default().bg(PANEL_BG))
@@ -11544,32 +11296,28 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("Confirm update", "确认更新"),
+                app.language.text(message_key!("tui.confirm_update")),
                 74,
                 15,
             );
             let policy_detail = match app.process_strategy {
-                ProcessStrategy::Wait => app.language.text(
-                    "Matching processes will be waited on.",
-                    "将等待匹配的进程退出。",
-                ),
-                ProcessStrategy::Terminate => app.language.text(
-                    "Matching processes will be stopped before update.",
-                    "将在更新前终止匹配的进程。",
-                ),
+                ProcessStrategy::Wait => app
+                    .language
+                    .text(message_key!("tui.matching_processes_will_be_waited_on")),
+                ProcessStrategy::Terminate => app.language.text(message_key!(
+                    "tui.matching_processes_will_be_stopped_before_update"
+                )),
             };
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        match app.language {
-                            Language::English => format!("Update {} tool(s)?", tools.len()),
-                            Language::Chinese => format!("更新 {} 个工具？", tools.len()),
-                        },
+                        app.language
+                            .format(message_key!("modal.update_tools_prompt"), &[&tools.len()]),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Line::raw(""),
                     labeled_value(
-                        app.language.text("Selected", "已选择"),
+                        app.language.text(message_key!("tui.selected")),
                         &tools.join(", "),
                         ACCENT,
                     ),
@@ -11577,7 +11325,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                         Line::raw("")
                     } else {
                         labeled_value(
-                            app.language.text("Already latest", "已是最新"),
+                            app.language.text(message_key!("tui.already_latest")),
                             &current_tools.join(", "),
                             SUCCESS,
                         )
@@ -11586,7 +11334,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                         || Line::raw(""),
                         |version| {
                             labeled_value(
-                                app.language.text("Target version", "目标版本"),
+                                app.language.text(message_key!("tui.target_version")),
                                 version,
                                 WARNING_COLOR,
                             )
@@ -11594,7 +11342,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Line::from(vec![
                         Span::styled(
-                            format!("{}  ", app.language.text("Process policy", "进程策略")),
+                            format!(
+                                "{}  ",
+                                app.language.text(message_key!("tui.process_policy"))
+                            ),
                             Style::default().fg(DIM),
                         ),
                         Span::styled(
@@ -11606,8 +11357,8 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     Line::raw(""),
                     modal_actions(
                         app.language,
-                        app.language.text("confirm", "确认"),
-                        app.language.text("cancel", "取消"),
+                        app.language.text(message_key!("tui.confirm")),
+                        app.language.text(message_key!("tui.cancel")),
                     ),
                 ])
                 .style(Style::default().bg(PANEL_BG))
@@ -11619,29 +11370,26 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("Choose version", "指定版本"),
+                app.language.text(message_key!("tui.choose_version")),
                 68,
                 10,
             );
-            let label = app.language.text("Version", "版本");
+            let label = app.language.text(message_key!("tui.version"));
             let value_width = input_value_width(inner.width, label);
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        match app.language {
-                            Language::English => format!("Update {name} to an exact version."),
-                            Language::Chinese => format!("将 {name} 更新到指定版本。"),
-                        },
+                        app.language
+                            .format(message_key!("modal.target_version_prompt"), &[&name]),
                         Style::default().fg(DIM),
                     ),
                     Line::raw(""),
                     modal_input_line(true, label, version, "1.2.3", value_width),
                     Line::raw(""),
                     Line::styled(
-                        app.language.text(
-                            "The configured update_version command will be used.",
-                            "将使用配置中的 update_version 命令。",
-                        ),
+                        app.language.text(message_key!(
+                            "tui.the_configured_update_version_command_will_be_used"
+                        )),
                         Style::default().fg(SUBTLE),
                     ),
                     Line::raw(""),
@@ -11685,17 +11433,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("Confirm delete", "确认删除"),
+                app.language.text(message_key!("tui.confirm_delete")),
                 62,
                 9,
             );
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        app.language.text(
-                            "Remove this custom update command?",
-                            "删除这条自定义更新命令？",
-                        ),
+                        app.language
+                            .text(message_key!("tui.remove_this_custom_update_command")),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Line::raw(""),
@@ -11703,8 +11449,8 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     Line::raw(""),
                     modal_actions(
                         app.language,
-                        app.language.text("remove", "删除"),
-                        app.language.text("cancel", "取消"),
+                        app.language.text(message_key!("tui.remove")),
+                        app.language.text(message_key!("tui.cancel")),
                     ),
                 ])
                 .style(Style::default().bg(PANEL_BG))
@@ -11718,27 +11464,25 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 app.language
-                    .text("Delete repository monitor", "删除仓库监控"),
+                    .text(message_key!("tui.delete_repository_monitor")),
                 72,
                 10,
             );
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        app.language.text(
-                            "Remove this GitHub repository monitor?",
-                            "删除这项 GitHub 仓库监控？",
-                        ),
+                        app.language
+                            .text(message_key!("tui.remove_this_github_repository_monitor")),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Line::raw(""),
                     labeled_value(
-                        app.language.text("Name", "名称"),
+                        app.language.text(message_key!("tui.name")),
                         monitor.map(|value| value.name.as_str()).unwrap_or("—"),
                         ERROR_COLOR,
                     ),
                     labeled_value(
-                        app.language.text("Repository", "仓库"),
+                        app.language.text(message_key!("tui.repository")),
                         monitor
                             .map(|value| value.repository.as_str())
                             .unwrap_or("—"),
@@ -11747,8 +11491,8 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     Line::raw(""),
                     modal_actions(
                         app.language,
-                        app.language.text("delete", "删除"),
-                        app.language.text("cancel", "取消"),
+                        app.language.text(message_key!("tui.delete")),
+                        app.language.text(message_key!("tui.cancel")),
                     ),
                 ]),
                 inner,
@@ -11764,13 +11508,13 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame,
                 area,
                 app.language
-                    .text("GitHub access and monitoring", "GitHub 访问与监控"),
+                    .text(message_key!("tui.github_access_and_monitoring")),
                 88,
                 13,
             );
             let labels = [
-                app.language.text("API key", "API Key"),
-                app.language.text("Monitor interval", "监控间隔"),
+                app.language.text(message_key!("tui.api_key")),
+                app.language.text(message_key!("tui.monitor_interval")),
             ];
             let value_width = labels
                 .iter()
@@ -11786,11 +11530,11 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let masked = if *remove_api_key {
                 app.language
-                    .text("(remove on save)", "（保存时删除）")
+                    .text(message_key!("tui.remove_on_save"))
                     .to_owned()
             } else if api_key.value.is_empty() {
                 app.language
-                    .text("(unchanged / optional)", "（保持不变 / 可选）")
+                    .text(message_key!("tui.unchanged_optional"))
                     .to_owned()
             } else {
                 "•".repeat(api_key.value[key_start..key_end].chars().count())
@@ -11798,10 +11542,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        app.language.text(
-                            "Manage the encrypted API key and repository refresh cadence together.",
-                            "统一管理加密 API Key 与仓库刷新频率。",
-                        ),
+                        app.language.text(message_key!("tui.manage_the_encrypted_api_key_and_repository_refresh_cadence_together")),
                         Style::default().fg(DIM),
                     ),
                     Line::raw(""),
@@ -11831,20 +11572,17 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Line::raw(""),
                     Line::styled(
-                        app.language.text(
-                            "Interval must be 60–86400 seconds. Empty key input keeps it; Ctrl+D removes it.",
-                            "间隔必须为 60–86400 秒；密钥留空保持不变，Ctrl+D 删除。",
-                        ),
+                        app.language.text(message_key!("tui.interval_must_be_60_86400_seconds_empty_key_input_keeps_it_ctrl_plus_d_removes_it")),
                         Style::default().fg(SUBTLE),
                     ),
                     Line::raw(""),
                     Line::from(vec![
                         Span::styled("[Tab/↑↓]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" field  ", " 切换字段  ")),
+                        Span::raw(app.language.text(message_key!("tui.field_spaced_1_2"))),
                         Span::styled("[Ctrl+S]", Style::default().fg(SUCCESS)),
-                        Span::raw(app.language.text(" save  ", " 保存  ")),
+                        Span::raw(app.language.text(message_key!("tui.save_spaced_1_2"))),
                         Span::styled("[Esc]", Style::default().fg(ERROR_COLOR)),
-                        Span::raw(app.language.text(" cancel", " 取消")),
+                        Span::raw(app.language.text(message_key!("tui.cancel_spaced_1_0"))),
                     ]),
                 ])
                 .style(Style::default().bg(PANEL_BG))
@@ -11907,14 +11645,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("AI generation", "AI 生成设置"),
+                app.language
+                    .text(message_key!("tui.ai_generation_settings")),
                 96,
                 19,
             );
             let labels = [
-                app.language.text("Base URL", "Base URL"),
-                app.language.text("API key", "API Key"),
-                app.language.text("Model", "模型"),
+                app.language.text(message_key!("tui.base_url")),
+                app.language.text(message_key!("tui.api_key")),
+                app.language.text(message_key!("tui.model")),
             ];
             let value_width = labels
                 .iter()
@@ -11930,11 +11669,11 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let masked = if *remove_api_key {
                 app.language
-                    .text("(remove on save)", "（保存时删除）")
+                    .text(message_key!("tui.remove_on_save"))
                     .to_owned()
             } else if api_key.value.is_empty() {
                 app.language
-                    .text("(unchanged / optional)", "（保持不变 / 可选）")
+                    .text(message_key!("tui.unchanged_optional"))
                     .to_owned()
             } else {
                 "•".repeat(api_key.value[key_start..key_end].chars().count())
@@ -11943,53 +11682,44 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 .iter()
                 .position(|available| available == &model.value);
             let model_state = if app.ai_model_list_loading {
-                app.language.text("fetching…", "获取中…").to_owned()
+                app.language.text(message_key!("tui.fetching")).to_owned()
             } else if available_models.is_empty() {
-                app.language.text("not fetched", "尚未获取").to_owned()
+                app.language
+                    .text(message_key!("tui.not_fetched"))
+                    .to_owned()
             } else if let Some(index) = model_position {
-                match app.language {
-                    Language::English => format!(
-                        "{} available · selected {}/{} · Left/Right chooses",
-                        available_models.len(),
-                        index + 1,
-                        available_models.len()
-                    ),
-                    Language::Chinese => format!(
-                        "{} 个可用 · 已选 {}/{} · 左右键选择",
-                        available_models.len(),
-                        index + 1,
-                        available_models.len()
-                    ),
-                }
+                app.language.format(
+                    message_key!("modal.ai_models_selected"),
+                    &[
+                        &available_models.len(),
+                        &(index + 1),
+                        &available_models.len(),
+                    ],
+                )
             } else {
-                match app.language {
-                    Language::English => format!(
-                        "{} available · custom value · Left/Right chooses",
-                        available_models.len()
-                    ),
-                    Language::Chinese => {
-                        format!("{} 个可用 · 自定义值 · 左右键选择", available_models.len())
-                    }
-                }
+                app.language.format(
+                    message_key!("modal.ai_models_custom"),
+                    &[&available_models.len()],
+                )
             };
             let (connection_state, connection_style) = if app.ai_connection_test_loading {
                 (
-                    app.language.text("testing…", "测试中…"),
+                    app.language.text(message_key!("tui.testing")),
                     Style::default().fg(WARNING_COLOR),
                 )
             } else {
                 match app.ai_connection_test_succeeded {
                     Some(true) => (
-                        app.language.text("passed", "已通过"),
+                        app.language.text(message_key!("tui.passed")),
                         Style::default().fg(SUCCESS),
                     ),
                     Some(false) => (
                         app.language
-                            .text("failed — see message below", "失败 — 详见下方消息"),
+                            .text(message_key!("tui.failed_see_message_below")),
                         Style::default().fg(ERROR_COLOR),
                     ),
                     None => (
-                        app.language.text("not tested", "尚未测试"),
+                        app.language.text(message_key!("tui.not_tested")),
                         Style::default().fg(SUBTLE),
                     ),
                 }
@@ -11997,10 +11727,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        app.language.text(
-                            "OpenAI-compatible endpoint. The switch controls generation without deleting connection settings.",
-                            "使用 OpenAI 兼容接口；开关只控制生成功能，不会删除连接设置。",
-                        ),
+                        app.language.text(message_key!("tui.openai_compatible_endpoint_the_switch_controls_generation_without_deleting_connection_settings")),
                         Style::default().fg(DIM),
                     ),
                     Line::raw(""),
@@ -12014,7 +11741,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                             },
                         ),
                         Span::styled(
-                            app.language.text("Enabled  ", "启用  "),
+                            app.language.text(message_key!("tui.enabled_spaced_0_2")),
                             if *field == 0 {
                                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                             } else {
@@ -12068,15 +11795,12 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     Line::raw(""),
                     Line::styled(
-                        app.language.text(
-                            "API key is encrypted locally. Empty input keeps it; Ctrl+D removes it.",
-                            "API Key 在本机加密；留空保持不变，Ctrl+D 删除。",
-                        ),
+                        app.language.text(message_key!("tui.api_key_is_encrypted_locally_empty_input_keeps_it_ctrl_plus_d_removes_it")),
                         Style::default().fg(SUBTLE),
                     ),
                     Line::from(vec![
                         Span::styled(
-                            app.language.text("Models      ", "模型列表    "),
+                            app.language.text(message_key!("tui.models_spaced_0_6")),
                             Style::default().fg(DIM),
                         ),
                         Span::styled(
@@ -12092,7 +11816,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     ]),
                     Line::from(vec![
                         Span::styled(
-                            app.language.text("Connection  ", "连接状态  "),
+                            app.language.text(message_key!("tui.connection_spaced_0_2")),
                             Style::default().fg(DIM),
                         ),
                         Span::styled(connection_state, connection_style),
@@ -12100,15 +11824,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     Line::raw(""),
                     Line::from(vec![
                         Span::styled("[Tab/↑↓]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" field  ", " 切换字段  ")),
+                        Span::raw(app.language.text(message_key!("tui.field_spaced_1_2"))),
                         Span::styled("[Ctrl+R]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" models  ", " 获取模型  ")),
+                        Span::raw(app.language.text(message_key!("tui.models_spaced_1_2"))),
                         Span::styled("[Ctrl+T]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" test  ", " 测试  ")),
+                        Span::raw(app.language.text(message_key!("tui.test_spaced_1_2"))),
                         Span::styled("[Ctrl+S]", Style::default().fg(SUCCESS)),
-                        Span::raw(app.language.text(" save  ", " 保存  ")),
+                        Span::raw(app.language.text(message_key!("tui.save_spaced_1_2"))),
                         Span::styled("[Esc]", Style::default().fg(ERROR_COLOR)),
-                        Span::raw(app.language.text(" cancel", " 取消")),
+                        Span::raw(app.language.text(message_key!("tui.cancel_spaced_1_0"))),
                     ]),
                 ])
                 .style(Style::default().bg(PANEL_BG))
@@ -12175,24 +11899,33 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
         }
-        Modal::NetworkProxy {
+        Modal::NetworkSettings {
             proxy_mode,
             field,
             proxy_url,
             no_proxy,
+            metadata_timeout,
+            release_asset_setup_timeout,
+            release_asset_body_timeout,
         } => {
             let inner = modal_panel(
                 frame,
                 area,
-                app.language.text("Network proxy", "网络代理"),
+                app.language.text(message_key!("tui.network_settings")),
                 92,
-                15,
+                19,
             );
-            let mode_label = app.language.text("Proxy mode", "代理模式");
-            let url_label = app.language.text("Proxy URL", "代理地址");
-            let bypass_label = app.language.text("No proxy", "代理绕过");
+            let mode_label = app.language.text(message_key!("tui.proxy_mode"));
+            let url_label = app.language.text(message_key!("tui.proxy_url"));
+            let bypass_label = app.language.text(message_key!("tui.no_proxy"));
+            let metadata_label = app.language.text(message_key!("tui.metadata_timeout_s"));
+            let setup_label = app.language.text(message_key!("tui.asset_setup_timeout_s"));
+            let body_label = app.language.text(message_key!("tui.asset_body_timeout_s"));
             let url_width = input_value_width(inner.width, url_label);
             let bypass_width = input_value_width(inner.width, bypass_label);
+            let metadata_width = input_value_width(inner.width, metadata_label);
+            let setup_width = input_value_width(inner.width, setup_label);
+            let body_width = input_value_width(inner.width, body_label);
             let explicit = *proxy_mode == ProxyMode::Explicit;
             let mode_line = Line::from(vec![
                 Span::styled(
@@ -12256,33 +11989,24 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     Span::raw("  "),
                     Span::styled(format!("{label}  "), Style::default().fg(DIM)),
                     Span::styled(
-                        app.language
-                            .text("— explicit mode only", "— 仅显式模式可用"),
+                        app.language.text(message_key!("tui.explicit_mode_only")),
                         Style::default().fg(SUBTLE),
                     ),
                 ])
             };
-            let mode_description = match (*proxy_mode, app.language) {
-                (ProxyMode::Environment, Language::English) => {
-                    "Inherit standard proxy variables from the environment."
+            let mode_description = app.language.text(match proxy_mode {
+                ProxyMode::Environment => {
+                    message_key!("network.environment_description")
                 }
-                (ProxyMode::Environment, Language::Chinese) => "继承环境中的标准代理变量。",
-                (ProxyMode::Explicit, Language::English) => {
-                    "Use only the HTTP/HTTPS proxy configured here."
-                }
-                (ProxyMode::Explicit, Language::Chinese) => "只使用此处配置的 HTTP/HTTPS 代理。",
-                (ProxyMode::Direct, Language::English) => {
-                    "Connect directly and remove proxy variables from update commands."
-                }
-                (ProxyMode::Direct, Language::Chinese) => "直接连接，并从更新命令中移除代理变量。",
-            };
+                ProxyMode::Explicit => message_key!("network.explicit_description"),
+                ProxyMode::Direct => message_key!("network.direct_description"),
+            });
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
-                        app.language.text(
-                            "Choose how dvup and update commands connect to the network.",
-                            "选择 dvup 和更新命令的联网方式。",
-                        ),
+                        app.language.text(message_key!(
+                            "tui.choose_how_dvup_and_update_commands_connect_to_the_network"
+                        )),
                         Style::default().fg(DIM),
                     ),
                     Line::raw(""),
@@ -12309,29 +12033,55 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         disabled_input(bypass_label)
                     },
+                    modal_input_line(
+                        *field == 3,
+                        metadata_label,
+                        metadata_timeout,
+                        "10",
+                        metadata_width,
+                    ),
+                    modal_input_line(
+                        *field == 4,
+                        setup_label,
+                        release_asset_setup_timeout,
+                        "30",
+                        setup_width,
+                    ),
+                    modal_input_line(
+                        *field == 5,
+                        body_label,
+                        release_asset_body_timeout,
+                        "300",
+                        body_width,
+                    ),
                     Line::raw(""),
                     Line::styled(mode_description, Style::default().fg(SUBTLE)),
                     Line::styled(
-                        app.language.text(
-                            "No fallback. Explicit mode rejects credentials and SOCKS URLs.",
-                            "不会回退；显式模式拒绝凭据和 SOCKS 地址。",
-                        ),
+                        app.language.text(message_key!(
+                            "tui.no_fallback_explicit_mode_rejects_credentials_and_socks_urls"
+                        )),
+                        Style::default().fg(SUBTLE),
+                    ),
+                    Line::styled(
+                        app.language.text(message_key!(
+                            "tui.timeouts_metadata_setup_1_300_s_asset_body_1_3600_s_and_setup"
+                        )),
                         Style::default().fg(SUBTLE),
                     ),
                     Line::raw(""),
                     Line::from(vec![
                         Span::styled("[←/→/Space]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" mode    ", " 模式    ")),
+                        Span::raw(app.language.text(message_key!("tui.mode_spaced_1_4"))),
                         Span::styled("[Tab/↑↓]", Style::default().fg(ACCENT)),
-                        Span::raw(app.language.text(" field", " 切换栏")),
+                        Span::raw(app.language.text(message_key!("tui.field_spaced_1_0"))),
                     ]),
                     Line::from(vec![
                         Span::styled("[Ctrl+S]", Style::default().fg(SUCCESS)),
-                        Span::raw(app.language.text(" save    ", " 保存    ")),
+                        Span::raw(app.language.text(message_key!("tui.save_spaced_1_4"))),
                         Span::styled("[Enter]", Style::default().fg(SUCCESS)),
-                        Span::raw(app.language.text(" next/save    ", " 下一步/保存    ")),
+                        Span::raw(app.language.text(message_key!("tui.next_save_spaced_1_4"))),
                         Span::styled("[Esc]", Style::default().fg(ERROR_COLOR)),
-                        Span::raw(app.language.text(" cancel", " 取消")),
+                        Span::raw(app.language.text(message_key!("tui.cancel_spaced_1_0"))),
                     ]),
                 ])
                 .style(Style::default().bg(PANEL_BG)),
@@ -12343,14 +12093,28 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 visible_start: 0,
                 visible_end: 0,
             });
-            if !explicit {
-                return;
-            }
-            for (field, label, input, row, value_width) in [
-                (1, url_label, proxy_url, 3, url_width),
-                (2, bypass_label, no_proxy, 4, bypass_width),
+            for (field, label, input, row, value_width, enabled) in [
+                (1, url_label, proxy_url, 3, url_width, explicit),
+                (2, bypass_label, no_proxy, 4, bypass_width, explicit),
+                (3, metadata_label, metadata_timeout, 5, metadata_width, true),
+                (
+                    4,
+                    setup_label,
+                    release_asset_setup_timeout,
+                    6,
+                    setup_width,
+                    true,
+                ),
+                (
+                    5,
+                    body_label,
+                    release_asset_body_timeout,
+                    7,
+                    body_width,
+                    true,
+                ),
             ] {
-                if inner.height <= row || value_width == 0 {
+                if !enabled || inner.height <= row || value_width == 0 {
                     continue;
                 }
                 let label_width = u16::try_from(display_width(label)).unwrap_or(u16::MAX);
@@ -12372,8 +12136,11 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 });
             }
             let Some((label, input, row, value_width)) = (match *field {
-                1 => Some((url_label, proxy_url, 3, url_width)),
-                2 => Some((bypass_label, no_proxy, 4, bypass_width)),
+                1 if explicit => Some((url_label, proxy_url, 3, url_width)),
+                2 if explicit => Some((bypass_label, no_proxy, 4, bypass_width)),
+                3 => Some((metadata_label, metadata_timeout, 5, metadata_width)),
+                4 => Some((setup_label, release_asset_setup_timeout, 6, setup_width)),
+                5 => Some((body_label, release_asset_body_timeout, 7, body_width)),
                 _ => None,
             }) else {
                 return;
@@ -12403,9 +12170,9 @@ fn draw_toml_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let title = if editor.dirty {
-        language.text("TOML editor — modified", "TOML 编辑器 — 已修改")
+        language.text(message_key!("tui.toml_editor_modified"))
     } else {
-        language.text("TOML editor", "TOML 编辑器")
+        language.text(message_key!("tui.toml_editor"))
     };
     let title = format!("{title} [{}]", editor.mode.label());
     let inner = modal_panel(
@@ -12426,7 +12193,7 @@ fn draw_toml_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                language.text(" File  ", " 文件  "),
+                language.text(message_key!("tui.file_spaced_1_2")),
                 Style::default().fg(DIM),
             ),
             Span::styled(
@@ -12536,50 +12303,38 @@ fn draw_toml_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         help.extend([
             Line::from(vec![
                 Span::styled("[Ctrl+S]", Style::default().fg(SUCCESS)),
-                Span::raw(language.text(" save  ", " 保存  ")),
+                Span::raw(language.text(message_key!("tui.save_spaced_1_2"))),
                 Span::styled("[Esc]", Style::default().fg(ERROR_COLOR)),
-                Span::raw(language.text(" close  ", " 关闭  ")),
+                Span::raw(language.text(message_key!("tui.close_spaced_1_2"))),
                 Span::styled("[F2]", Style::default().fg(ACCENT)),
-                Span::raw(language.text(" Vim  ", " Vim  ")),
+                Span::raw(language.text(message_key!("tui.vim_spaced_1_2"))),
                 Span::styled("[Ctrl+C]", Style::default().fg(ACCENT)),
-                Span::raw(language.text(" copy  ", " 复制  ")),
+                Span::raw(language.text(message_key!("tui.copy_spaced_1_2"))),
                 Span::styled("[Ctrl+V]", Style::default().fg(ACCENT)),
-                Span::raw(language.text(" paste", " 粘贴")),
+                Span::raw(language.text(message_key!("tui.paste_spaced_1_0"))),
             ]),
             Line::styled(
-                language.text(
-                    "Ctrl+/ comment · Ctrl+Z/Y undo/redo · arrows move · Shift/mouse drag selects · wheel scrolls",
-                    "Ctrl+/ 注释 · Ctrl+Z/Y 撤销/重做 · 方向键移动 · Shift/鼠标拖选 · 滚轮滚动",
-                ),
+                language.text(message_key!("tui.ctrl_plus_comment_ctrl_plus_z_y_undo_redo_arrows_move_shift_mouse_drag_selects_wheel_scrolls")),
                 Style::default().fg(DIM),
             ),
         ]);
     } else {
         let vim_help = match editor.mode {
-            TomlEditorMode::VimNormal => language.text(
-                "NORMAL: h/j/k/l w/b 0/$ gg/G · i/a/I/A insert · v/V select · x dd yy p u Ctrl+R",
-                "NORMAL：h/j/k/l w/b 0/$ gg/G 移动 · i/a/I/A 插入 · v/V 选择 · x dd yy p u Ctrl+R",
-            ),
-            TomlEditorMode::VimInsert => language.text(
-                "INSERT: type to edit · Esc returns to NORMAL · arrows and standard Ctrl shortcuts work",
-                "INSERT：直接输入编辑 · Esc 返回 NORMAL · 方向键和标准 Ctrl 快捷键仍可用",
-            ),
-            TomlEditorMode::VimVisual => language.text(
-                "VISUAL: h/j/k/l w/b 0/$ select · y copy · d/x delete · c replace · Esc NORMAL",
-                "VISUAL：h/j/k/l w/b 0/$ 选择 · y 复制 · d/x 删除 · c 替换 · Esc 返回 NORMAL",
-            ),
+            TomlEditorMode::VimNormal => language.text(message_key!("tui.normal_h_j_k_l_w_b_0_gg_g_i_a_i_a_insert_v_v_select_x_dd_yy_p_u_ctrl_plus_r")),
+            TomlEditorMode::VimInsert => language.text(message_key!("tui.insert_type_to_edit_esc_returns_to_normal_arrows_and_standard_ctrl_shortcuts_work")),
+            TomlEditorMode::VimVisual => language.text(message_key!("tui.visual_h_j_k_l_w_b_0_select_y_copy_d_x_delete_c_replace_esc_normal")),
             TomlEditorMode::Standard => unreachable!(),
         };
         help.extend([
             Line::from(vec![
                 Span::styled("[F2]", Style::default().fg(ACCENT)),
-                Span::raw(language.text(" standard  ", " 标准模式  ")),
+                Span::raw(language.text(message_key!("tui.standard_spaced_1_2"))),
                 Span::styled("[Ctrl+S]", Style::default().fg(SUCCESS)),
-                Span::raw(language.text(" save  ", " 保存  ")),
+                Span::raw(language.text(message_key!("tui.save_spaced_1_2"))),
                 Span::styled("[Ctrl+Q]", Style::default().fg(ERROR_COLOR)),
-                Span::raw(language.text(" close  ", " 关闭  ")),
+                Span::raw(language.text(message_key!("tui.close_spaced_1_2"))),
                 Span::styled("[Ctrl+/]", Style::default().fg(ACCENT)),
-                Span::raw(language.text(" comment", " 注释")),
+                Span::raw(language.text(message_key!("tui.comment_spaced_1_0"))),
             ]),
             Line::styled(vim_help, Style::default().fg(DIM)),
         ]);
@@ -12837,10 +12592,7 @@ fn modal_actions(language: Language, primary: &str, secondary: &str) -> Line<'st
         ),
         Span::raw(format!(" {secondary}")),
         Span::styled(
-            match language {
-                Language::English => "    modal input only",
-                Language::Chinese => "    仅响应当前窗口",
-            },
+            language.text(message_key!("modal.input_only")),
             Style::default().fg(SUBTLE),
         ),
     ])
@@ -12851,18 +12603,18 @@ fn modal_form_actions(language: Language, multiple_fields: bool) -> Line<'static
     if multiple_fields {
         spans.extend([
             Span::styled("[Tab/↑↓]", Style::default().fg(ACCENT)),
-            Span::raw(language.text(" field    ", " 切换栏    ")),
+            Span::raw(language.text(message_key!("tui.field_spaced_1_4"))),
         ]);
     }
     spans.extend([
         Span::styled("[Shift+←/→]", Style::default().fg(ACCENT)),
-        Span::raw(language.text(" select    ", " 选择    ")),
+        Span::raw(language.text(message_key!("tui.select_spaced_1_4"))),
         Span::styled("[Ctrl+A]", Style::default().fg(ACCENT)),
-        Span::raw(language.text(" all    ", " 全选    ")),
+        Span::raw(language.text(message_key!("tui.all_spaced_1_4"))),
         Span::styled("[Enter]", Style::default().fg(SUCCESS)),
-        Span::raw(language.text(" review    ", " 预览    ")),
+        Span::raw(language.text(message_key!("tui.review_spaced_1_4"))),
         Span::styled("[Esc]", Style::default().fg(ERROR_COLOR)),
-        Span::raw(language.text(" cancel", " 取消")),
+        Span::raw(language.text(message_key!("tui.cancel_spaced_1_0"))),
     ]);
     Line::from(spans)
 }
@@ -12949,7 +12701,7 @@ fn fetch_latest_for_source(
     network: &NetworkSettings,
     encrypted_github_api_key: Option<&str>,
 ) -> Result<String> {
-    let agent = version::network_agent(network)?;
+    let agent = version::network_agent(network, version::NetworkRequestPolicy::Metadata)?;
     let github_api_key = credential::github_api_key(encrypted_github_api_key)?;
     version::fetch_latest(
         source,
@@ -13007,10 +12759,7 @@ fn spawn_dvup(
             Err(error) => AppEvent::Finished {
                 name,
                 success: false,
-                output: match language {
-                    Language::English => format!("failed to start dvup subprocess: {error}"),
-                    Language::Chinese => format!("无法启动 dvup 子进程：{error}"),
-                },
+                output: language.format(message_key!("message.subprocess_start_failed"), &[&error]),
                 operation,
                 elapsed: started.elapsed(),
             },
@@ -13033,19 +12782,23 @@ fn latest_version_label(state: &VersionState, language: Language) -> String {
     let VersionState::Failed(error) = state else {
         return state.label().to_owned();
     };
-    match (error.kind, language) {
-        (version::LatestVersionErrorKind::RateLimited, Language::English) => "rate limited",
-        (version::LatestVersionErrorKind::RateLimited, Language::Chinese) => "已限流",
-        (version::LatestVersionErrorKind::Authentication, Language::English) => "auth failed",
-        (version::LatestVersionErrorKind::Authentication, Language::Chinese) => "认证失败",
-        (version::LatestVersionErrorKind::NotFound, Language::English) => "not found",
-        (version::LatestVersionErrorKind::NotFound, Language::Chinese) => "未找到",
-        (version::LatestVersionErrorKind::RequestFailed, Language::English)
-        | (version::LatestVersionErrorKind::InvalidResponse, Language::English) => "fetch failed",
-        (version::LatestVersionErrorKind::RequestFailed, Language::Chinese)
-        | (version::LatestVersionErrorKind::InvalidResponse, Language::Chinese) => "获取失败",
-    }
-    .to_owned()
+    language
+        .text(match error.kind {
+            version::LatestVersionErrorKind::RateLimited => {
+                message_key!("latest_version.rate_limited")
+            }
+            version::LatestVersionErrorKind::Authentication => {
+                message_key!("latest_version.auth_failed")
+            }
+            version::LatestVersionErrorKind::NotFound => {
+                message_key!("latest_version.not_found")
+            }
+            version::LatestVersionErrorKind::RequestFailed
+            | version::LatestVersionErrorKind::InvalidResponse => {
+                message_key!("latest_version.fetch_failed")
+            }
+        })
+        .to_owned()
 }
 
 fn latest_version_error_message(
@@ -13053,48 +12806,22 @@ fn latest_version_error_message(
     error: &version::LatestVersionError,
     language: Language,
 ) -> String {
-    match (error.kind, language) {
-        (version::LatestVersionErrorKind::RateLimited, Language::English) => format!(
-            "Latest-version check for {name} was rate-limited; wait for quota reset or verify the GitHub Token ({})",
-            error.detail()
-        ),
-        (version::LatestVersionErrorKind::RateLimited, Language::Chinese) => format!(
-            "{name} 的最新版本检查已被限流；请等待配额重置或检查 GitHub Token（{}）",
-            error.detail()
-        ),
-        (version::LatestVersionErrorKind::Authentication, Language::English) => format!(
-            "Latest-version authentication failed for {name}; replace the GitHub Token ({})",
-            error.detail()
-        ),
-        (version::LatestVersionErrorKind::Authentication, Language::Chinese) => format!(
-            "{name} 的最新版本认证失败；请重新配置 GitHub Token（{}）",
-            error.detail()
-        ),
-        (version::LatestVersionErrorKind::NotFound, Language::English) => format!(
-            "Latest version for {name} was not found; check its repository or Release configuration ({})",
-            error.detail()
-        ),
-        (version::LatestVersionErrorKind::NotFound, Language::Chinese) => format!(
-            "未找到 {name} 的最新版本；请检查仓库或 Release 配置（{}）",
-            error.detail()
-        ),
-        (
-            version::LatestVersionErrorKind::RequestFailed
-            | version::LatestVersionErrorKind::InvalidResponse,
-            Language::English,
-        ) => format!(
-            "Could not fetch the latest version for {name}; check network/proxy settings and press r to retry ({})",
-            error.detail()
-        ),
-        (
-            version::LatestVersionErrorKind::RequestFailed
-            | version::LatestVersionErrorKind::InvalidResponse,
-            Language::Chinese,
-        ) => format!(
-            "无法获取 {name} 的最新版本；请检查网络/代理设置并按 r 重试（{}）",
-            error.detail()
-        ),
-    }
+    let key = match error.kind {
+        version::LatestVersionErrorKind::RateLimited => {
+            message_key!("latest_version.rate_limited_message")
+        }
+        version::LatestVersionErrorKind::Authentication => {
+            message_key!("latest_version.auth_failed_message")
+        }
+        version::LatestVersionErrorKind::NotFound => {
+            message_key!("latest_version.not_found_message")
+        }
+        version::LatestVersionErrorKind::RequestFailed
+        | version::LatestVersionErrorKind::InvalidResponse => {
+            message_key!("latest_version.fetch_failed_message")
+        }
+    };
+    language.format(key, &[&name, &error.detail()])
 }
 
 fn latest_version_style(tool: &ToolItem) -> Style {
@@ -13490,14 +13217,13 @@ fn custom_latest_source(
 }
 
 fn custom_latest_label(choice: CustomLatestChoice, language: Language) -> &'static str {
-    match (choice, language) {
-        (CustomLatestChoice::None, Language::English) => "self-managed",
-        (CustomLatestChoice::None, Language::Chinese) => "不需要，工具自行处理更新",
-        (CustomLatestChoice::Npm, _) => "npm Registry",
-        (CustomLatestChoice::Pypi, _) => "PyPI",
-        (CustomLatestChoice::CratesIo, _) => "crates.io",
-        (CustomLatestChoice::GithubRelease, _) => "GitHub Release",
-        (CustomLatestChoice::GithubTag, _) => "GitHub Tag",
+    match choice {
+        CustomLatestChoice::None => language.text(message_key!("latest_version.self_managed")),
+        CustomLatestChoice::Npm => "npm Registry",
+        CustomLatestChoice::Pypi => "PyPI",
+        CustomLatestChoice::CratesIo => "crates.io",
+        CustomLatestChoice::GithubRelease => "GitHub Release",
+        CustomLatestChoice::GithubTag => "GitHub Tag",
     }
 }
 
@@ -13553,10 +13279,7 @@ fn split_command_line(input: &str, language: Language) -> std::result::Result<Ve
         }
     }
     if let Some(quote) = quote {
-        return Err(match language {
-            Language::English => format!("Unclosed {quote} quote in command"),
-            Language::Chinese => format!("命令中有未闭合的 {quote} 引号"),
-        });
+        return Err(language.format(message_key!("message.unclosed_command_quote"), &[&quote]));
     }
     if started {
         arguments.push(current);
@@ -13585,6 +13308,112 @@ fn next_index(current: usize, length: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn github_monitor_for_status_test() -> GithubReleaseMonitor {
+        GithubReleaseMonitor {
+            name: "reqable-macos-arm64".to_owned(),
+            repository: "reqable/reqable-app".to_owned(),
+            asset: AssetSelector {
+                product: "reqable-app".to_owned(),
+                os: crate::config::AssetOperatingSystem::Macos,
+                arch: crate::config::AssetArchitecture::Aarch64,
+                format: ReleaseAssetFormat::Dmg,
+                variant: None,
+            },
+            target_directory: PathBuf::from("/Applications/Reqable.app"),
+            update_policy: ReleaseUpdatePolicy::Manual,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn github_monitor_status_names_the_failure_stage() {
+        let monitor = github_monitor_for_status_test();
+        let cases = [
+            (
+                release::MonitorFailureStage::Metadata,
+                "metadata failed",
+                "元数据失败",
+            ),
+            (
+                release::MonitorFailureStage::LocalInspection,
+                "inspection failed",
+                "检查失败",
+            ),
+            (
+                release::MonitorFailureStage::Download,
+                "download failed",
+                "下载失败",
+            ),
+            (
+                release::MonitorFailureStage::Installation,
+                "installation failed",
+                "安装失败",
+            ),
+        ];
+
+        for (stage, english, chinese) in cases {
+            let status = MonitorStatus {
+                name: monitor.name.clone(),
+                installed_tag: Some("3.2.2".to_owned()),
+                latest_tag: Some("3.2.9".to_owned()),
+                asset: Some("reqable-app-macos-arm64.dmg".to_owned()),
+                failure: Some(release::MonitorFailure::new(stage, "timeout: global")),
+            };
+
+            assert_eq!(
+                github_monitor_result(&monitor, Some(&status), Language::English).0,
+                english
+            );
+            assert_eq!(
+                github_monitor_result(&monitor, Some(&status), Language::Chinese).0,
+                chinese
+            );
+        }
+    }
+
+    #[test]
+    fn release_update_summary_exposes_the_original_failure() {
+        let outcomes = [MonitorOutcome::Failed {
+            name: "reqable-macos-arm64".to_owned(),
+            failure: release::MonitorFailure::new(
+                release::MonitorFailureStage::Download,
+                "timeout: global",
+            ),
+        }];
+
+        assert_eq!(
+            release_update_message(&outcomes, Language::English),
+            "Release update complete: 0 updated, 1 failed; reqable-macos-arm64 download failed: timeout: global"
+        );
+        assert_eq!(
+            release_update_message(&outcomes, Language::Chinese),
+            "Release 更新完成：0 项更新，1 项失败；reqable-macos-arm64 下载失败：timeout: global"
+        );
+    }
+
+    #[test]
+    fn release_probe_summary_exposes_the_original_failure() {
+        let statuses = [MonitorStatus {
+            name: "reqable-macos-arm64".to_owned(),
+            installed_tag: Some("3.2.2".to_owned()),
+            latest_tag: None,
+            asset: None,
+            failure: Some(release::MonitorFailure::new(
+                release::MonitorFailureStage::Metadata,
+                "HTTP 403",
+            )),
+        }];
+
+        assert_eq!(
+            release_probe_message(&statuses, Language::English),
+            "GitHub repositories refreshed: 0 update(s), 1 failed; reqable-macos-arm64 metadata failed: HTTP 403"
+        );
+        assert_eq!(
+            release_probe_message(&statuses, Language::Chinese),
+            "GitHub 仓库刷新完成：0 项可更新，1 项失败；reqable-macos-arm64 元数据失败：HTTP 403"
+        );
+    }
 
     fn render_test_screen(app: &mut App, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
@@ -17097,19 +16926,34 @@ mod tests {
     }
 
     #[test]
-    fn proxy_editor_saves_strict_explicit_settings() {
+    fn network_editor_saves_proxy_and_custom_timeout_settings() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state.clone(), None).expect("app");
 
         app.toggle_setting(2);
-        assert!(matches!(app.modal, Modal::NetworkProxy { .. }));
+        assert!(matches!(app.modal, Modal::NetworkSettings { .. }));
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         handle_paste(&mut app, "http://127.0.0.1:7890");
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         handle_paste(&mut app, "localhost, .example.com");
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Modal::NetworkSettings {
+            metadata_timeout,
+            release_asset_setup_timeout,
+            release_asset_body_timeout,
+            ..
+        } = &mut app.modal
+        else {
+            panic!("network settings modal");
+        };
+        *metadata_timeout = TextInput::new("17");
+        *release_asset_setup_timeout = TextInput::new("41");
+        *release_asset_body_timeout = TextInput::new("523");
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
         assert!(matches!(app.modal, Modal::None));
 
         let saved = AppSettings::load(&state.settings_path()).expect("saved proxy settings");
@@ -17119,15 +16963,102 @@ mod tests {
             Some("http://127.0.0.1:7890")
         );
         assert_eq!(saved.network.no_proxy, ["localhost", ".example.com"]);
+        assert_eq!(saved.network.metadata_timeout_secs, 17);
+        assert_eq!(saved.network.release_asset_setup_timeout_secs, 41);
+        assert_eq!(saved.network.release_asset_body_timeout_secs, 523);
 
         app.modal = Modal::None;
         app.toggle_setting(2);
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
         let saved = AppSettings::load(&state.settings_path()).expect("saved direct settings");
         assert_eq!(saved.network.proxy_mode, ProxyMode::Direct);
         assert!(saved.network.proxy_url.is_none());
         assert!(saved.network.no_proxy.is_empty());
+        assert_eq!(saved.network.metadata_timeout_secs, 17);
+        assert_eq!(saved.network.release_asset_setup_timeout_secs, 41);
+        assert_eq!(saved.network.release_asset_body_timeout_secs, 523);
+    }
+
+    #[test]
+    fn network_editor_prefills_timeouts_and_preserves_invalid_input() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.settings.network.metadata_timeout_secs = 19;
+        app.settings.network.release_asset_setup_timeout_secs = 43;
+        app.settings.network.release_asset_body_timeout_secs = 601;
+
+        app.toggle_setting(2);
+        let Modal::NetworkSettings {
+            field,
+            metadata_timeout,
+            release_asset_setup_timeout,
+            release_asset_body_timeout,
+            ..
+        } = &mut app.modal
+        else {
+            panic!("network settings modal");
+        };
+        assert_eq!(metadata_timeout.value, "19");
+        assert_eq!(release_asset_setup_timeout.value, "43");
+        assert_eq!(release_asset_body_timeout.value, "601");
+
+        *field = 5;
+        *release_asset_body_timeout = TextInput::new("42");
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(app.modal, Modal::NetworkSettings { .. }));
+        assert!(
+            app.message
+                .contains("release_asset_body_timeout_secs must be greater than or equal"),
+            "message: {}",
+            app.message
+        );
+        let Modal::NetworkSettings {
+            release_asset_body_timeout,
+            ..
+        } = &app.modal
+        else {
+            unreachable!();
+        };
+        assert_eq!(release_asset_body_timeout.value, "42");
+    }
+
+    #[test]
+    fn changing_metadata_timeout_rebuilds_the_cached_latest_version_agent() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.settings.network.proxy_mode = ProxyMode::Direct;
+        app.settings.network.metadata_timeout_secs = 17;
+
+        let first = app.latest_version_agent().expect("first metadata agent");
+        assert_eq!(
+            first.config().timeouts().global,
+            Some(Duration::from_secs(17))
+        );
+
+        app.settings.network.metadata_timeout_secs = 29;
+        let rebuilt = app.latest_version_agent().expect("rebuilt metadata agent");
+        assert_eq!(
+            rebuilt.config().timeouts().global,
+            Some(Duration::from_secs(29))
+        );
+        assert_eq!(
+            app.latest_agent
+                .as_ref()
+                .expect("cached metadata agent")
+                .0
+                .metadata_timeout_secs,
+            29
+        );
     }
 
     #[test]
@@ -17328,7 +17259,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_modal_can_select_and_save_direct_mode() {
+    fn network_modal_can_select_and_save_direct_mode() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
         let mut app = App::new(state.clone(), None).expect("app");
@@ -17337,7 +17268,10 @@ mod tests {
         app.toggle_setting(2);
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         handle_modal_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle_modal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
 
         assert!(matches!(app.modal, Modal::None));
         assert_eq!(app.settings.network.proxy_mode, ProxyMode::Direct);
@@ -17351,7 +17285,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_modal_renders_complete_chinese_controls_at_common_width() {
+    fn network_modal_renders_complete_chinese_controls_at_common_width() {
         use ratatui::backend::TestBackend;
 
         let temporary = tempfile::TempDir::new().expect("temp dir");
@@ -17364,7 +17298,7 @@ mod tests {
 
         terminal
             .draw(|frame| draw(frame, &mut app))
-            .expect("render proxy modal");
+            .expect("render network modal");
         let screen = terminal
             .backend()
             .buffer()
@@ -17375,7 +17309,44 @@ mod tests {
         let compact = screen.replace(' ', "");
 
         assert!(compact.contains("代理模式"), "screen: {screen}");
+        assert!(compact.contains("元数据超时（秒）"), "screen: {screen}");
+        assert!(compact.contains("安装包建立超时（秒）"), "screen: {screen}");
+        assert!(compact.contains("安装包下载超时（秒）"), "screen: {screen}");
         assert!(compact.contains("[Esc]取消"), "screen: {screen}");
+    }
+
+    #[test]
+    fn network_modal_renders_complete_english_timeout_controls_at_common_width() {
+        use ratatui::backend::TestBackend;
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.toggle_setting(2);
+        let backend = TestBackend::new(92, 26);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render network modal");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(screen.contains("Metadata timeout (s)"), "screen: {screen}");
+        assert!(
+            screen.contains("Asset setup timeout (s)"),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("Asset body timeout (s)"),
+            "screen: {screen}"
+        );
+        assert!(screen.contains("[Esc] cancel"), "screen: {screen}");
     }
 
     #[test]

@@ -39,8 +39,39 @@ pub(crate) enum MonitorOutcome {
     },
     Failed {
         name: String,
-        error: String,
+        failure: MonitorFailure,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MonitorFailureStage {
+    Metadata,
+    LocalInspection,
+    Download,
+    Installation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MonitorFailure {
+    stage: MonitorFailureStage,
+    detail: String,
+}
+
+impl MonitorFailure {
+    pub(crate) fn new(stage: MonitorFailureStage, detail: impl Into<String>) -> Self {
+        Self {
+            stage,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn stage(&self) -> MonitorFailureStage {
+        self.stage
+    }
+
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,7 +80,7 @@ pub(crate) struct MonitorStatus {
     pub(crate) installed_tag: Option<String>,
     pub(crate) latest_tag: Option<String>,
     pub(crate) asset: Option<String>,
-    pub(crate) error: Option<String>,
+    pub(crate) failure: Option<MonitorFailure>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -95,7 +126,7 @@ pub(crate) fn fetch_latest_release(
     let repository = normalize_github_repository(repository)?;
     github.validate()?;
     let api_key = credential::github_api_key(github.encrypted_api_key.as_deref())?;
-    let agent = version::network_agent(network)?;
+    let agent = version::network_agent(network, version::NetworkRequestPolicy::Metadata)?;
     let release = fetch_latest_release_with_agent(
         &repository,
         api_key.as_ref().map(|key| key.as_str()),
@@ -188,7 +219,7 @@ pub(crate) fn probe_monitors(
     let state = load_state(state_path)?;
     let enabled = monitors.iter().any(|monitor| monitor.enabled);
     let agent = enabled
-        .then(|| version::network_agent(network))
+        .then(|| version::network_agent(network, version::NetworkRequestPolicy::Metadata))
         .transpose()?;
     let api_key = enabled
         .then(|| credential::github_api_key(github.encrypted_api_key.as_deref()))
@@ -205,7 +236,10 @@ pub(crate) fn probe_monitors(
                         installed_tag: None,
                         latest_tag: None,
                         asset: None,
-                        error: Some(error.to_string()),
+                        failure: Some(MonitorFailure::new(
+                            MonitorFailureStage::LocalInspection,
+                            error.to_string(),
+                        )),
                     };
                 }
             };
@@ -215,7 +249,7 @@ pub(crate) fn probe_monitors(
                     installed_tag,
                     latest_tag: None,
                     asset: None,
-                    error: None,
+                    failure: None,
                 };
             }
             match resolve_latest_asset(
@@ -230,14 +264,17 @@ pub(crate) fn probe_monitors(
                     installed_tag,
                     latest_tag: Some(release.tag),
                     asset: Some(release.asset.name),
-                    error: None,
+                    failure: None,
                 },
                 Err(error) => MonitorStatus {
                     name: monitor.name.clone(),
                     installed_tag,
                     latest_tag: None,
                     asset: None,
-                    error: Some(error.to_string()),
+                    failure: Some(MonitorFailure::new(
+                        MonitorFailureStage::Metadata,
+                        error.to_string(),
+                    )),
                 },
             }
         })
@@ -252,7 +289,9 @@ pub(crate) fn run_selected_monitors(
     names: &[String],
 ) -> Result<Vec<MonitorOutcome>> {
     github.validate()?;
-    let agent = version::network_agent(network)?;
+    let metadata_agent = version::network_agent(network, version::NetworkRequestPolicy::Metadata)?;
+    let download_agent =
+        version::network_agent(network, version::NetworkRequestPolicy::ReleaseAsset)?;
     let api_key = credential::github_api_key(github.encrypted_api_key.as_deref())?;
     let mut state = load_state(state_path)?;
     let mut changed = false;
@@ -263,7 +302,8 @@ pub(crate) fn run_selected_monitors(
             match update_monitor(
                 monitor,
                 api_key.as_ref().map(|key| key.as_str()),
-                &agent,
+                &metadata_agent,
+                &download_agent,
                 &state,
             ) {
                 Ok(MonitorOutcome::Updated { name, tag, asset }) => {
@@ -272,9 +312,9 @@ pub(crate) fn run_selected_monitors(
                     MonitorOutcome::Updated { name, tag, asset }
                 }
                 Ok(outcome) => outcome,
-                Err(error) => MonitorOutcome::Failed {
+                Err(failure) => MonitorOutcome::Failed {
                     name: monitor.name.clone(),
-                    error: error.to_string(),
+                    failure,
                 },
             }
         })
@@ -288,11 +328,16 @@ pub(crate) fn run_selected_monitors(
 fn update_monitor(
     monitor: &GithubReleaseMonitor,
     api_key: Option<&str>,
-    agent: &ureq::Agent,
+    metadata_agent: &ureq::Agent,
+    download_agent: &ureq::Agent,
     state: &ReleaseState,
-) -> Result<MonitorOutcome> {
-    let release = resolve_latest_asset(monitor, api_key, agent)?;
-    if installed_monitor_version(monitor, state)?
+) -> std::result::Result<MonitorOutcome, MonitorFailure> {
+    let release = resolve_latest_asset(monitor, api_key, metadata_agent)
+        .map_err(|error| MonitorFailure::new(MonitorFailureStage::Metadata, error.to_string()))?;
+    if installed_monitor_version(monitor, state)
+        .map_err(|error| {
+            MonitorFailure::new(MonitorFailureStage::LocalInspection, error.to_string())
+        })?
         .as_deref()
         .is_some_and(|installed| release_versions_match(installed, &release.tag))
     {
@@ -302,7 +347,11 @@ fn update_monitor(
         });
     }
 
-    install_asset(monitor, api_key, agent, &release.asset)?;
+    let downloaded = download_asset(monitor, api_key, download_agent, &release.asset)
+        .map_err(|error| MonitorFailure::new(MonitorFailureStage::Download, error.to_string()))?;
+    install_downloaded_asset(monitor, &release.asset, downloaded).map_err(|error| {
+        MonitorFailure::new(MonitorFailureStage::Installation, error.to_string())
+    })?;
 
     Ok(MonitorOutcome::Updated {
         name: monitor.name.clone(),
@@ -457,15 +506,12 @@ fn fetch_latest_release_with_agent(
         .map_err(release_error)
 }
 
-fn install_asset(
+fn download_asset(
     monitor: &GithubReleaseMonitor,
     api_key: Option<&str>,
     agent: &ureq::Agent,
     asset: &GithubAsset,
-) -> Result<()> {
-    if monitor.asset.format != ReleaseAssetFormat::Dmg {
-        fs::create_dir_all(&monitor.target_directory)?;
-    }
+) -> Result<tempfile::NamedTempFile> {
     let parent = monitor
         .target_directory
         .parent()
@@ -497,6 +543,18 @@ fn install_asset(
     }
     downloaded.flush()?;
     downloaded.as_file().sync_all()?;
+
+    Ok(downloaded)
+}
+
+fn install_downloaded_asset(
+    monitor: &GithubReleaseMonitor,
+    asset: &GithubAsset,
+    downloaded: tempfile::NamedTempFile,
+) -> Result<()> {
+    if monitor.asset.format != ReleaseAssetFormat::Dmg {
+        fs::create_dir_all(&monitor.target_directory)?;
+    }
     match monitor.asset.format {
         ReleaseAssetFormat::File => {
             install_file(downloaded, &monitor.target_directory, &asset.name)?

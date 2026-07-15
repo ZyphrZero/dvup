@@ -8,8 +8,13 @@ use crate::{
     settings::{NetworkSettings, ProxyMode},
 };
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = concat!("dvup/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetworkRequestPolicy {
+    Metadata,
+    ReleaseAsset,
+}
 
 pub(crate) fn extract_versions(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
     let mut output = String::from_utf8_lossy(stdout).into_owned();
@@ -349,7 +354,7 @@ pub(crate) fn test_network(network: &NetworkSettings) -> Result<Vec<NetworkTestR
         ("crates.io", "https://crates.io/api/v1/crates/serde"),
         ("GitHub", "https://api.github.com/"),
     ];
-    let agent = network_agent(network)?;
+    let agent = network_agent(network, NetworkRequestPolicy::Metadata)?;
     Ok(TARGETS
         .iter()
         .map(|(name, url)| {
@@ -366,9 +371,31 @@ pub(crate) fn test_network(network: &NetworkSettings) -> Result<Vec<NetworkTestR
         .collect())
 }
 
-pub(crate) fn network_agent(network: &NetworkSettings) -> Result<ureq::Agent> {
+pub(crate) fn network_agent(
+    network: &NetworkSettings,
+    policy: NetworkRequestPolicy,
+) -> Result<ureq::Agent> {
     network.validate()?;
-    let builder = ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT));
+    let builder = match policy {
+        NetworkRequestPolicy::Metadata => ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(network.metadata_timeout_secs))),
+        NetworkRequestPolicy::ReleaseAsset => ureq::Agent::config_builder()
+            .timeout_resolve(Some(Duration::from_secs(
+                network.release_asset_setup_timeout_secs,
+            )))
+            .timeout_connect(Some(Duration::from_secs(
+                network.release_asset_setup_timeout_secs,
+            )))
+            .timeout_send_request(Some(Duration::from_secs(
+                network.release_asset_setup_timeout_secs,
+            )))
+            .timeout_recv_response(Some(Duration::from_secs(
+                network.release_asset_setup_timeout_secs,
+            )))
+            .timeout_recv_body(Some(Duration::from_secs(
+                network.release_asset_body_timeout_secs,
+            ))),
+    };
     let builder = match network.proxy_mode {
         ProxyMode::Environment => builder,
         ProxyMode::Explicit => builder.proxy(network.explicit_proxy()?),
@@ -506,24 +533,70 @@ mod tests {
     }
 
     #[test]
-    fn agent_uses_the_selected_network_policy() {
-        let direct = network_agent(&NetworkSettings {
+    fn network_policies_use_configured_timeouts_and_leave_release_global_unbounded() {
+        let direct_network = NetworkSettings {
             proxy_mode: ProxyMode::Direct,
-            proxy_url: None,
-            no_proxy: Vec::new(),
-        })
-        .expect("direct agent");
+            metadata_timeout_secs: 17,
+            release_asset_setup_timeout_secs: 41,
+            release_asset_body_timeout_secs: 523,
+            ..NetworkSettings::default()
+        };
+        let direct = network_agent(&direct_network, NetworkRequestPolicy::Metadata)
+            .expect("direct metadata agent");
         assert!(direct.config().proxy().is_none());
+        let metadata_timeouts = direct.config().timeouts();
+        assert_eq!(metadata_timeouts.global, Some(Duration::from_secs(17)));
 
-        let explicit = network_agent(&NetworkSettings {
-            proxy_mode: ProxyMode::Explicit,
-            proxy_url: Some("http://127.0.0.1:7890".to_owned()),
-            no_proxy: vec!["localhost".to_owned()],
-        })
-        .expect("explicit agent");
+        let release = network_agent(&direct_network, NetworkRequestPolicy::ReleaseAsset)
+            .expect("release asset agent");
+        let release_timeouts = release.config().timeouts();
+        assert_eq!(release_timeouts.global, None);
+        assert_eq!(release_timeouts.resolve, Some(Duration::from_secs(41)));
+        assert_eq!(release_timeouts.connect, Some(Duration::from_secs(41)));
+        assert_eq!(
+            release_timeouts.recv_response,
+            Some(Duration::from_secs(41))
+        );
+        assert_eq!(release_timeouts.recv_body, Some(Duration::from_secs(523)));
+
+        let explicit = network_agent(
+            &NetworkSettings {
+                proxy_mode: ProxyMode::Explicit,
+                proxy_url: Some("http://127.0.0.1:7890".to_owned()),
+                no_proxy: vec!["localhost".to_owned()],
+                ..NetworkSettings::default()
+            },
+            NetworkRequestPolicy::Metadata,
+        )
+        .expect("explicit metadata agent");
         let proxy = explicit.config().proxy().expect("configured proxy");
         assert_eq!(proxy.host(), "127.0.0.1");
         assert_eq!(proxy.port(), 7890);
         assert!(proxy.is_no_proxy(&"https://localhost/".parse().expect("URI")));
+    }
+
+    #[test]
+    fn metadata_policy_remains_the_only_policy_with_an_end_to_end_timeout() {
+        let settings = NetworkSettings {
+            proxy_mode: ProxyMode::Direct,
+            ..NetworkSettings::default()
+        };
+
+        assert!(
+            network_agent(&settings, NetworkRequestPolicy::Metadata)
+                .expect("metadata agent")
+                .config()
+                .timeouts()
+                .global
+                .is_some()
+        );
+        assert!(
+            network_agent(&settings, NetworkRequestPolicy::ReleaseAsset)
+                .expect("release agent")
+                .config()
+                .timeouts()
+                .global
+                .is_none()
+        );
     }
 }

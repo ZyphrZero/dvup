@@ -8,6 +8,7 @@ mod detach;
 mod doctor;
 mod error;
 mod generation;
+mod i18n;
 mod job;
 mod process;
 mod release;

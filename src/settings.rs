@@ -61,6 +61,9 @@ pub(crate) struct NetworkSettings {
     pub(crate) proxy_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) no_proxy: Vec<String>,
+    pub(crate) metadata_timeout_secs: u64,
+    pub(crate) release_asset_setup_timeout_secs: u64,
+    pub(crate) release_asset_body_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -213,12 +216,36 @@ impl Default for NetworkSettings {
             proxy_mode: ProxyMode::Environment,
             proxy_url: None,
             no_proxy: Vec::new(),
+            metadata_timeout_secs: 10,
+            release_asset_setup_timeout_secs: 30,
+            release_asset_body_timeout_secs: 300,
         }
     }
 }
 
 impl NetworkSettings {
     pub(crate) fn validate(&self) -> Result<()> {
+        if !(1..=300).contains(&self.metadata_timeout_secs) {
+            return Err(Error::InvalidConfig(
+                "network metadata_timeout_secs must be between 1 and 300".to_owned(),
+            ));
+        }
+        if !(1..=300).contains(&self.release_asset_setup_timeout_secs) {
+            return Err(Error::InvalidConfig(
+                "network release_asset_setup_timeout_secs must be between 1 and 300".to_owned(),
+            ));
+        }
+        if !(1..=3_600).contains(&self.release_asset_body_timeout_secs) {
+            return Err(Error::InvalidConfig(
+                "network release_asset_body_timeout_secs must be between 1 and 3600".to_owned(),
+            ));
+        }
+        if self.release_asset_body_timeout_secs < self.release_asset_setup_timeout_secs {
+            return Err(Error::InvalidConfig(
+                "network release_asset_body_timeout_secs must be greater than or equal to release_asset_setup_timeout_secs"
+                    .to_owned(),
+            ));
+        }
         match self.proxy_mode {
             ProxyMode::Environment | ProxyMode::Direct => {
                 if self.proxy_url.is_some() || !self.no_proxy.is_empty() {
@@ -461,6 +488,9 @@ mod tests {
                 proxy_mode: ProxyMode::Explicit,
                 proxy_url: Some("http://127.0.0.1:7890".to_owned()),
                 no_proxy: vec!["localhost".to_owned(), ".example.com".to_owned()],
+                metadata_timeout_secs: 17,
+                release_asset_setup_timeout_secs: 41,
+                release_asset_body_timeout_secs: 523,
             },
             github: GithubSettings::default(),
             ai: AiSettings::default(),
@@ -472,7 +502,74 @@ mod tests {
         assert!(!serialized.contains("version ="));
         assert!(serialized.contains("[network]"));
         assert!(serialized.contains("proxy_mode = \"explicit\""));
+        assert!(serialized.contains("metadata_timeout_secs = 17"));
+        assert!(serialized.contains("release_asset_setup_timeout_secs = 41"));
+        assert!(serialized.contains("release_asset_body_timeout_secs = 523"));
         assert!(!serialized.contains("api_key"));
+    }
+
+    #[test]
+    fn network_timeout_fields_are_required_by_the_serialized_schema() {
+        let serialized = toml::to_string(&NetworkSettings::default()).expect("network settings");
+
+        for required_field in [
+            "metadata_timeout_secs",
+            "release_asset_setup_timeout_secs",
+            "release_asset_body_timeout_secs",
+        ] {
+            let incomplete = serialized
+                .lines()
+                .filter(|line| !line.starts_with(required_field))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                toml::from_str::<NetworkSettings>(&incomplete).is_err(),
+                "missing {required_field} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn network_timeout_values_are_strictly_validated() {
+        let defaults = NetworkSettings::default();
+        assert_eq!(defaults.metadata_timeout_secs, 10);
+        assert_eq!(defaults.release_asset_setup_timeout_secs, 30);
+        assert_eq!(defaults.release_asset_body_timeout_secs, 300);
+        assert!(defaults.validate().is_ok());
+
+        for invalid in [
+            NetworkSettings {
+                metadata_timeout_secs: 0,
+                ..defaults.clone()
+            },
+            NetworkSettings {
+                metadata_timeout_secs: 301,
+                ..defaults.clone()
+            },
+            NetworkSettings {
+                release_asset_setup_timeout_secs: 0,
+                ..defaults.clone()
+            },
+            NetworkSettings {
+                release_asset_setup_timeout_secs: 301,
+                ..defaults.clone()
+            },
+            NetworkSettings {
+                release_asset_body_timeout_secs: 0,
+                ..defaults.clone()
+            },
+            NetworkSettings {
+                release_asset_body_timeout_secs: 3_601,
+                ..defaults.clone()
+            },
+            NetworkSettings {
+                release_asset_setup_timeout_secs: 60,
+                release_asset_body_timeout_secs: 59,
+                ..defaults
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]
@@ -485,6 +582,9 @@ mod tests {
             "hide_unsupported_and_missing_tools = false\n",
             "\n[network]\n",
             "proxy_mode = \"environment\"\n",
+            "metadata_timeout_secs = 10\n",
+            "release_asset_setup_timeout_secs = 30\n",
+            "release_asset_body_timeout_secs = 300\n",
             "\n[github]\n",
             "poll_interval_secs = 1800\n",
         );
@@ -507,6 +607,9 @@ mod tests {
             "hide_unsupported_and_missing_tools = false\n",
             "\n[network]\n",
             "proxy_mode = \"environment\"\n",
+            "metadata_timeout_secs = 10\n",
+            "release_asset_setup_timeout_secs = 30\n",
+            "release_asset_body_timeout_secs = 300\n",
             "\n[github]\n",
             "poll_interval_secs = 1800\n",
             "\n[ai]\n",
@@ -712,6 +815,7 @@ mod tests {
             proxy_mode: ProxyMode::Explicit,
             proxy_url: None,
             no_proxy: Vec::new(),
+            ..NetworkSettings::default()
         };
         assert!(explicit_without_url.validate().is_err());
 
@@ -720,6 +824,7 @@ mod tests {
                 proxy_mode,
                 proxy_url: Some("http://127.0.0.1:7890".to_owned()),
                 no_proxy: vec!["localhost".to_owned()],
+                ..NetworkSettings::default()
             };
             assert!(invalid.validate().is_err());
         }
@@ -737,6 +842,7 @@ mod tests {
                 proxy_mode: ProxyMode::Explicit,
                 proxy_url: Some(proxy_url.to_owned()),
                 no_proxy: Vec::new(),
+                ..NetworkSettings::default()
             };
             assert!(invalid.validate().is_err(), "accepted {proxy_url}");
         }
@@ -745,6 +851,7 @@ mod tests {
             proxy_mode: ProxyMode::Explicit,
             proxy_url: Some("https://proxy.example.com:443".to_owned()),
             no_proxy: vec!["bad host".to_owned()],
+            ..NetworkSettings::default()
         };
         assert!(invalid.validate().is_err());
     }

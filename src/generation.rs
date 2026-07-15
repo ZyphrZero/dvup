@@ -32,7 +32,7 @@ pub(crate) fn resolve_package_metadata(
     network: &NetworkSettings,
 ) -> Result<PackageMetadata> {
     validate_package(package)?;
-    let agent = version::network_agent(network)?;
+    let agent = version::network_agent(network, version::NetworkRequestPolicy::Metadata)?;
     let (latest_version, official_executables) = match manager {
         PackageManager::Npm | PackageManager::Pnpm => fetch_npm_package_metadata(package, &agent)?,
         _ => {
@@ -491,7 +491,10 @@ pub(crate) fn verify_live_command_candidates(
     github_api_key: Option<&str>,
     collected_at_unix_secs: u64,
 ) -> Result<CommandCandidateVerification> {
-    let sources = LiveAuthoritativeSources::new(version::network_agent(network)?, github_api_key);
+    let sources = LiveAuthoritativeSources::new(
+        version::network_agent(network, version::NetworkRequestPolicy::Metadata)?,
+        github_api_key,
+    );
     Ok(verify_command_candidates(
         candidates,
         &sources,
@@ -505,7 +508,10 @@ pub(crate) fn verify_live_github_candidates(
     github_api_key: Option<&str>,
     collected_at_unix_secs: u64,
 ) -> Result<GithubCandidateVerification> {
-    let sources = LiveAuthoritativeSources::new(version::network_agent(network)?, github_api_key);
+    let sources = LiveAuthoritativeSources::new(
+        version::network_agent(network, version::NetworkRequestPolicy::Metadata)?,
+        github_api_key,
+    );
     Ok(verify_github_candidates(
         candidates,
         &sources,

@@ -54,7 +54,7 @@ Settings（设置）页提供启动诊断、工具过滤和应用级网络策略
 
 三种模式都不会在代理连接失败后改为直连，也不会退回另一个模式。首个版本只接受 `http://` 和 `https://`，明确拒绝 SOCKS、带用户名或密码的代理 URL 以及无效的绕过规则。Settings 中的“测试仓库连接”会分别请求 npm、PyPI、crates.io 和 GitHub，并显示每个端点的耗时或具体错误，不会用一个笼统的“网络正常”隐藏部分失败。已经创建的前台或后台任务保存自己的网络设置快照；之后修改 Settings 只影响新任务和新版本查询。
 
-在 Settings 聚焦“代理模式”并按 `Enter` 或 `Space` 会打开统一的网络代理窗口。使用 `←`/`→` 或 `Space` 在 `environment`、`explicit`、`direct` 之间切换；`environment` 和 `direct` 可直接按 `Enter` 保存，`explicit` 按 `Enter` 后依次编辑代理地址和绕过规则。任意栏均可按 `Ctrl+S` 保存，按 `Esc` 取消；鼠标点击模式栏也可以循环切换。窗口操作提示分两行显示，在较窄的中英文终端中不会截断保存或取消快捷键。
+在 Settings 聚焦“代理模式”并按 `Enter` 或 `Space` 会打开统一的网络设置窗口。使用 `←`/`→` 或 `Space` 在 `environment`、`explicit`、`direct` 之间切换；`explicit` 模式额外开放代理地址和绕过规则。三种模式都可以编辑元数据请求、Release Asset 建立连接/等待响应头、Release Asset 正文下载这三项秒级超时。`Tab`、`↑`、`↓` 或 `Enter` 在可用栏之间移动，在最后一栏按 `Enter` 保存；任意栏均可按 `Ctrl+S` 保存，按 `Esc` 取消。鼠标可以循环切换模式、定位并编辑所有可用输入栏。
 
 `settings.toml` 使用严格 schema，未知字段和缺失的必填字段都会直接报错。默认配置保持干净，只记录当前设置和环境代理模式：
 
@@ -65,6 +65,9 @@ hide_unsupported_and_missing_tools = false
 
 [network]
 proxy_mode = "environment"
+metadata_timeout_secs = 10
+release_asset_setup_timeout_secs = 30
+release_asset_body_timeout_secs = 300
 
 [github]
 poll_interval_secs = 1800
@@ -77,7 +80,12 @@ poll_interval_secs = 1800
 proxy_mode = "explicit"
 proxy_url = "http://127.0.0.1:7890"
 no_proxy = ["localhost", "127.0.0.1", ".internal.example"]
+metadata_timeout_secs = 10
+release_asset_setup_timeout_secs = 30
+release_asset_body_timeout_secs = 300
 ```
+
+三个超时键都是 `[network]` 的必填字段，不使用 Serde 默认值，也不会对已有配置执行迁移、兼容解析或 fallback。仅当整个 `settings.toml` 尚不存在时，新配置才从 `10`、`30`、`300` 秒开始。`metadata_timeout_secs` 和 `release_asset_setup_timeout_secs` 的有效范围都是 `1..=300`，`release_asset_body_timeout_secs` 的有效范围是 `1..=3600`，并且正文下载超时不能小于建立连接/等待响应头的超时。零、越界值、非整数或缺失字段都会直接报出配置错误。
 
 Settings 的 `GitHub API Key` 行使用遮罩输入。保存时只把 `encrypted_api_key` 密文写入 `settings.toml`，应用重启后自动解密，不需要重新输入；明文不会写入配置、任务日志、Activity、子进程环境或命令行。Windows 使用绑定当前 Windows 用户的原生 DPAPI 加密，因此复制密文到其他账号无法解密；macOS/Linux 使用 AES-256-GCM，随机加密密钥分别由 Keychain/Secret Service 保存。这里没有旧凭据迁移或明文兼容路径，格式错误、密文损坏或不属于当前用户都会直接报错。Windows 上如果编辑器、安全软件或其他进程短暂占用 `settings.toml`，原子替换会先进行有限重试；最终仍无法写入时，TUI 会显示被占用的精确配置路径并保留遮罩输入，释放占用后可直接按 `Enter` 重试，不会误报为凭据或加密配置错误。保存后 GitHub Release/Tag 最新版本查询会立即重新执行，以避免匿名 API 每小时 60 次的限额。TUI 顶部会通过一次后台 `/user` 请求同时显示 `@Token主人`、已用和剩余 API 配额，并用进度条按剩余比例切换绿/黄/红警示；状态每 5 分钟低频刷新，Token 不会进入显示文本或错误信息。
 
@@ -86,6 +94,8 @@ GitHub Release 监控与命令工具完全隔离。切到 Tools 页的“GitHub 
 手动添加时输入 `owner/repo` 或 GitHub 仓库 URL。dvup 在后台调用 GitHub 官方 API 验证仓库和最新 Release，过滤源码包、checksum、签名、SBOM 以及与当前 OS/CPU 不兼容的资产，然后显示该 Release 的真实 Asset 列表。用户必须明确选择一个文件；dvup 会生成包含产品、系统、架构、格式和可选变体（例如 `musl`、`gnu`、`portable`）的语义选择器，并立即回验它只命中所选文件。零匹配会报告“没有兼容的发布文件”，多匹配会要求重新选择或填写区分变体；不会取第一个文件、最高分文件，也不会回退到其他系统、架构、格式或仓库。相同的唯一匹配规则会应用于以后每个 Release，包括自动更新策略。
 
 普通文件、ZIP 和 TAR.GZ 安装到 dvup 用户目录下的 `github-tools/<监控名>`。压缩包会先完整解压到临时目录：只有一个公共顶层目录时自动去掉这一层，否则保留原目录结构；下载大小、展开大小和文件数量使用程序内固定安全上限。安装成功或失败后都会清理临时下载与解压目录。DMG 需要再输入一个 `.app` 名称，运行时目标固定编译为 `/Applications/<Application>.app`。保存监控只写配置，不下载、不挂载、不解压、也不安装任何 Asset。
+
+GitHub 元数据与 Release Asset 使用两套独立网络策略：Release、Tag、用户和配额等小型元数据请求使用 `metadata_timeout_secs` 作为端到端超时；Asset 下载不设元数据请求的总时长上限，而是使用 `release_asset_setup_timeout_secs` 分别限制域名解析、连接、请求发送和响应头等待，并使用 `release_asset_body_timeout_secs` 限制响应体传输。调用方只选择“元数据”或“Release Asset”策略，所有实际时长都从当前 `NetworkSettings` 读取，不存在隐藏的硬编码超时或备用值。固定下载大小上限仍然生效。监控状态会按真实失败边界显示“元数据失败”“检查失败”“下载失败”或“安装失败”，底部状态栏和 Activity 同时保留原始错误，不会再把下载或安装错误统称为“获取失败”。
 
 简洁用户配置示例：
 
@@ -129,6 +139,8 @@ dvup path/to/dvup_custom.toml
 直达模式只在启动时检查文件存在且扩展名为 `.toml`，不会要求内容已经是有效配置，因此可以直接打开语法损坏或缺少字段的文件进行修复。只有按 `Ctrl+S` 时才执行完整 dvup 配置校验；校验失败仍不会覆盖原文件。
 
 TUI 默认使用英文，随时按 `L` 可切换为中文，再按一次切回英文。标签页、表头、工具与任务状态、帮助栏、表单、确认框、进程策略以及 dvup 在界面内生成的运行摘要都会即时使用当前语言；已经写入 Activity 的历史记录保留产生时的语言，外部工具 stdout/stderr 和持久化 Job 日志始终保持原文，确保诊断内容不被翻译改写。在添加命令、目标版本文本输入框和 TOML 编辑视图中，`l`/`L` 仍作为普通字符输入；退出输入界面后即可继续用 `L` 切换语言。
+
+界面文案由 `assets/i18n/en.toml` 与 `assets/i18n/zh-CN.toml` 构建并嵌入可执行文件，不需要在运行目录旁分发语言包。新增或修改文案时，两份 TOML 必须保持相同的 key 和 `{0}`、`{1}` 编号占位符；`build.rs` 会在 `cargo build`、`cargo check` 和 `cargo test` 时校验语言目录，并从目录生成类型化消息 key。缺少 key、空值、占位符不一致或调用点拼错 key 都会直接阻止构建。运行期查询同样是严格的，不会静默回退成另一种语言。
 
 在 TUI 的命令工具视图按 `c`，首先选择三条彼此独立的路径：
 

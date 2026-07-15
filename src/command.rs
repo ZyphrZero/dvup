@@ -445,6 +445,7 @@ mod tests {
             proxy_mode: ProxyMode::Explicit,
             proxy_url: Some("http://127.0.0.1:7890".to_owned()),
             no_proxy: vec!["localhost".to_owned(), ".example.com".to_owned()],
+            ..NetworkSettings::default()
         };
         let mut command = std::process::Command::new("example");
         super::apply_network_environment(&mut command, &network);
@@ -472,8 +473,7 @@ mod tests {
     fn direct_network_removes_all_proxy_environment_variables() {
         let network = NetworkSettings {
             proxy_mode: ProxyMode::Direct,
-            proxy_url: None,
-            no_proxy: Vec::new(),
+            ..NetworkSettings::default()
         };
         let mut command = std::process::Command::new("example");
         super::apply_network_environment(&mut command, &network);
