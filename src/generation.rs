@@ -591,7 +591,12 @@ pub(crate) fn verify_github_candidates(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Write, net::TcpListener, thread};
+    use std::{
+        collections::HashMap,
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        thread,
+    };
 
     use super::*;
 
@@ -713,6 +718,16 @@ mod tests {
         let address = listener.local_addr().expect("server address");
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
+            {
+                let mut request = BufReader::new(&mut stream);
+                loop {
+                    let mut line = String::new();
+                    let bytes_read = request.read_line(&mut line).expect("read request");
+                    if bytes_read == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+            }
             let body = r#"{"name":"other","versions":{"stable":"1.0.0"},"deprecated":false,"disabled":false}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -733,7 +748,10 @@ mod tests {
             .homebrew_formula("expected")
             .expect_err("mismatched metadata must fail");
         server.join().expect("join server");
-        assert!(error.to_string().contains("instead of locked formula"));
+        assert!(
+            error.to_string().contains("instead of locked formula"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
