@@ -577,3 +577,14 @@ cargo test --all-targets
 ```
 
 仓库 CI 会在 `ubuntu-latest`、`macos-latest` 和 `windows-latest` 上分别执行格式检查、Clippy、全部测试和 release 构建，确保三个平台的条件编译路径持续可用。
+
+## 发布新版本
+
+将 `Cargo.toml` 中的 `package.version` 更新为新版本、运行一次 `cargo check` 同步 `Cargo.lock` 并合并后，推送同名的 `v` 前缀标签即可触发发布，例如：
+
+```console
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+发布工作流会校验标签与包版本严格一致，随后为 Windows、Linux 和 macOS 的 x86_64/ARM64 目标构建归档，生成 `SHA256SUMS`，并创建带自动发行说明的 GitHub Release。也可以从 Actions 页面手动运行 Release 工作流，只生成可下载的构建附件而不创建 Release。
