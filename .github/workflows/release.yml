@@ -88,12 +88,14 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Install Linux ARM64 cross compiler
+      - name: Install Linux ARM64 cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get install --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
 
       - name: Build release binary
         shell: bash
