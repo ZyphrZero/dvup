@@ -29,8 +29,13 @@ pub enum ToolReadiness {
 pub(crate) fn run_readonly_probe(program: &str, args: &[String]) -> Result<Output> {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    let mut child = Command::new(program)
-        .args(args)
+    let spec = CommandSpec {
+        program: program.to_owned(),
+        args: args.to_vec(),
+        working_directory: std::env::current_dir()?,
+    };
+    let mut child = prepare_command(&spec)
+        .current_dir(&spec.working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -650,6 +655,33 @@ mod tests {
             super::run_with_network(&spec, &NetworkSettings::default()).expect("run batch script");
         assert!(result.status.success());
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "two words");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_readonly_probes_execute_batch_wrappers() {
+        let working_directory = std::env::current_dir().expect("current directory");
+        let script = tempfile::Builder::new()
+            .prefix("dvup-readonly-probe-")
+            .suffix(".cmd")
+            .tempfile_in(&working_directory)
+            .expect("temporary command")
+            .into_temp_path();
+        std::fs::write(
+            &script,
+            "@echo off\r\nif \"%~1\"==\"--version\" echo example 1.2.3\r\n",
+        )
+        .expect("write command");
+        let program = script.file_stem().expect("command stem").to_string_lossy();
+
+        let output = super::run_readonly_probe(&program, &["--version".to_owned()])
+            .expect("run batch probe");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "example 1.2.3"
+        );
     }
 
     #[cfg(windows)]
