@@ -94,7 +94,7 @@ secondary = "Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy
 
 [help.doctor]
 primary = "Enter scan/expand · r rescan · ↑↓/hover move · PgUp/PgDn scroll"
-secondary = "Ctrl+C quit · ←/→ or click tab · L 中/EN"
+secondary = "Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy"
 
 [help.jobs]
 primary = "↑↓/hover move · click/Enter expand result · PgUp/PgDn scroll · r refresh"
@@ -102,12 +102,12 @@ secondary = "Ctrl+C quit · ←/→ or click tab · L 中/EN · Shift+Tab policy
 
 [help.settings]
 primary = "↑↓/hover move · click/Space/Enter open or toggle setting"
-secondary = "Ctrl+C quit · settings save immediately · ←/→ or click tab · L 中/EN"
+secondary = "Ctrl+C quit · settings save immediately · ←/→ or click tab · L 中/EN · Shift+Tab policy"
 
 [help.tools]
 commands = "↑↓/hover move · click/Space select · a all · Enter latest · v choose version · Tab GitHub"
 github = "↑↓/hover move · click/Space select · a all · Enter install · Tab command tools"
-shared = "Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab"
+shared = "Ctrl+C quit · t TOML · o editor · c add · e edit · d del · r refresh · L 中/EN · ←/→ tab · Shift+Tab policy"
 
 [message]
 already_latest = "Already at the latest version: {0}"

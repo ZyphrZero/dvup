@@ -94,7 +94,7 @@ secondary = "Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Ta
 
 [help.doctor]
 primary = "Enter 扫描/展开 · r 重新扫描 · ↑↓/悬停 移动 · PgUp/PgDn 滚动"
-secondary = "Ctrl+C 退出 · ←/→ 或点击标签页"
+secondary = "Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略"
 
 [help.jobs]
 primary = "↑↓/悬停 移动 · 点击/Enter 展开结果 · PgUp/PgDn 滚动 · r 刷新"
@@ -102,12 +102,12 @@ secondary = "Ctrl+C 退出 · ←/→ 或点击标签页 · L 中/EN · Shift+Ta
 
 [help.settings]
 primary = "↑↓/悬停 移动 · 点击/Space/Enter 打开或切换设置"
-secondary = "Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击标签页 · L 中/EN"
+secondary = "Ctrl+C 退出 · 设置立即保存 · ←/→ 或点击标签页 · L 中/EN · Shift+Tab 策略"
 
 [help.tools]
 commands = "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 更新 · v 指定版本 · Tab GitHub"
 github = "↑↓/悬停 移动 · 点击/Space 选择 · a 全选 · Enter 安装 · Tab 命令工具"
-shared = "Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页"
+shared = "Ctrl+C 退出 · t TOML · o 编辑器 · c 添加 · e 编辑 · d 删除 · r 刷新 · L 中/EN · ←/→ 标签页 · Shift+Tab 策略"
 
 [message]
 already_latest = "已是最新版本：{0}"

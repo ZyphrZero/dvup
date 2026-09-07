@@ -16049,6 +16049,43 @@ mod tests {
     }
 
     #[test]
+    fn footer_mentions_shift_tab_policy_on_every_tab_in_both_languages() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        for tab in [
+            Tab::Tools,
+            Tab::Activity,
+            Tab::Jobs,
+            Tab::Doctor,
+            Tab::Settings,
+        ] {
+            app.tab = tab;
+            let english = render_test_screen(&mut app, 160, 20);
+            assert!(
+                english.contains("Shift+Tab policy"),
+                "english footer on {tab:?}: {english}"
+            );
+        }
+
+        app.language = Language::Chinese;
+        for tab in [
+            Tab::Tools,
+            Tab::Activity,
+            Tab::Jobs,
+            Tab::Doctor,
+            Tab::Settings,
+        ] {
+            app.tab = tab;
+            let chinese = render_test_screen(&mut app, 160, 20);
+            assert!(
+                chinese.contains("Shift+Tab 策 略"),
+                "chinese footer on {tab:?}: {chinese}"
+            );
+        }
+    }
+
+    #[test]
     fn doctor_footer_omits_the_active_and_shadowed_legend() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
