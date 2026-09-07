@@ -29,6 +29,7 @@
 
 # A custom command may compare against one explicit official source.
 # Supported providers are npm, pypi, crates_io, github_release, and github_tag.
+# The TUI infers npm Registry for single-package npm/pnpm/Bun install or upgrade commands.
 #
 # [commands.deno]
 # type = "custom"

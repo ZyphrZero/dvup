@@ -1626,6 +1626,7 @@ struct CustomCommandFlow {
     latest: CustomLatestChoice,
     latest_value: TextInput,
     latest_version: Option<String>,
+    latest_inferred: bool,
     validation_request_id: Option<u64>,
     loading: bool,
 }
@@ -1645,6 +1646,7 @@ impl CustomCommandFlow {
             latest: CustomLatestChoice::None,
             latest_value: TextInput::new(String::new()),
             latest_version: None,
+            latest_inferred: false,
             validation_request_id: None,
             loading: false,
         }
@@ -5930,6 +5932,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Left | KeyCode::Up if flow.step == CustomCommandStep::LatestSource => {
                     flow.latest = flow.latest.cycle(-1);
+                    flow.latest_inferred = false;
                     flow.validation_request_id = None;
                     flow.loading = false;
                     flow.latest_version = None;
@@ -5938,6 +5941,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                     if flow.step == CustomCommandStep::LatestSource =>
                 {
                     flow.latest = flow.latest.cycle(1);
+                    flow.latest_inferred = false;
                     flow.validation_request_id = None;
                     flow.loading = false;
                     flow.latest_version = None;
@@ -5986,6 +5990,16 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                                     return Err(Error::Message(format!(
                                         "update program `{program}` is unavailable"
                                     )));
+                                }
+                                if !flow.latest_inferred
+                                    && flow.latest == CustomLatestChoice::None
+                                    && flow.latest_value.value.trim().is_empty()
+                                    && let Some(source) = infer_custom_latest_source(&update)
+                                {
+                                    let (latest, value) = custom_latest_choice(Some(&source));
+                                    flow.latest = latest;
+                                    flow.latest_value = TextInput::new(value);
+                                    flow.latest_inferred = true;
                                 }
                                 flow.step = CustomCommandStep::Probe;
                             }
@@ -6062,7 +6076,16 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 _ => {
                     match flow.step {
                         CustomCommandStep::Name => handle_text_input_key(&mut flow.name, key),
-                        CustomCommandStep::Update => handle_text_input_key(&mut flow.update, key),
+                        CustomCommandStep::Update => {
+                            let changed = handle_text_input_key(&mut flow.update, key);
+                            if changed && flow.latest_inferred {
+                                flow.latest = CustomLatestChoice::None;
+                                flow.latest_value = TextInput::new(String::new());
+                                flow.latest_version = None;
+                                flow.latest_inferred = false;
+                            }
+                            changed
+                        }
                         CustomCommandStep::Probe => {
                             let changed = handle_text_input_key(&mut flow.probe, key);
                             if changed {
@@ -6076,6 +6099,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         CustomCommandStep::LatestValue => {
                             let changed = handle_text_input_key(&mut flow.latest_value, key);
                             if changed {
+                                flow.latest_inferred = false;
                                 flow.validation_request_id = None;
                                 flow.loading = false;
                                 flow.latest_version = None;
@@ -7082,7 +7106,15 @@ fn handle_paste(app: &mut App, text: &str) {
         },
         Modal::CustomCommandFlow(flow) => match flow.step {
             CustomCommandStep::Name => flow.name.insert_text(text),
-            CustomCommandStep::Update => flow.update.insert_text(text),
+            CustomCommandStep::Update => {
+                flow.update.insert_text(text);
+                if flow.latest_inferred {
+                    flow.latest = CustomLatestChoice::None;
+                    flow.latest_value = TextInput::new(String::new());
+                    flow.latest_version = None;
+                    flow.latest_inferred = false;
+                }
+            }
             CustomCommandStep::Probe => {
                 flow.probe.insert_text(text);
                 flow.validation_request_id = None;
@@ -7092,6 +7124,7 @@ fn handle_paste(app: &mut App, text: &str) {
             }
             CustomCommandStep::LatestValue => {
                 flow.latest_value.insert_text(text);
+                flow.latest_inferred = false;
                 flow.validation_request_id = None;
                 flow.loading = false;
                 flow.latest_version = None;
@@ -8015,6 +8048,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
             if let Modal::CustomCommandFlow(flow) = &mut app.modal {
                 if flow.step == CustomCommandStep::LatestSource {
                     flow.latest = flow.latest.cycle(1);
+                    flow.latest_inferred = false;
                     flow.validation_request_id = None;
                     flow.loading = false;
                     flow.latest_version = None;
@@ -13164,6 +13198,107 @@ fn format_command_parts(parts: &[String]) -> String {
     format_editable_command(program, args)
 }
 
+fn infer_custom_latest_source(update: &[String]) -> Option<LatestVersionSource> {
+    let program = update.first()?;
+    let executable = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let executable = [".exe", ".cmd", ".bat", ".ps1"]
+        .into_iter()
+        .find_map(|suffix| executable.strip_suffix(suffix))
+        .unwrap_or(&executable);
+    if !matches!(executable, "npm" | "pnpm" | "bun") {
+        return None;
+    }
+
+    let subcommand = update.iter().skip(1).position(|argument| {
+        matches!(
+            argument.as_str(),
+            "install" | "i" | "add" | "update" | "up" | "upgrade"
+        )
+    })?;
+    let package = infer_registry_package(&update[subcommand + 2..])?;
+    Some(LatestVersionSource::Npm { package })
+}
+
+fn infer_registry_package(arguments: &[String]) -> Option<String> {
+    let mut packages = Vec::new();
+    let mut skip_next = false;
+    for argument in arguments {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if argument == "--" {
+            continue;
+        }
+        if argument.starts_with('-') {
+            skip_next = matches!(
+                argument.as_str(),
+                "--cache"
+                    | "--filter"
+                    | "--include"
+                    | "--install-strategy"
+                    | "--loglevel"
+                    | "--omit"
+                    | "--prefix"
+                    | "--registry"
+                    | "--tag"
+                    | "--userconfig"
+                    | "--workspace"
+            );
+            continue;
+        }
+        if let Some(package) = normalize_registry_package(argument) {
+            packages.push(package);
+        }
+    }
+    (packages.len() == 1).then(|| packages.pop().expect("one package was collected"))
+}
+
+fn normalize_registry_package(argument: &str) -> Option<String> {
+    if argument.is_empty()
+        || argument.starts_with('-')
+        || argument.starts_with('.')
+        || argument.starts_with('/')
+        || argument.contains(':')
+        || argument.contains('\\')
+    {
+        return None;
+    }
+    let name_end = if argument.starts_with('@') {
+        let slash = argument.find('/')?;
+        argument[slash + 1..]
+            .find('@')
+            .map(|offset| slash + 1 + offset)
+            .unwrap_or(argument.len())
+    } else {
+        argument.find('@').unwrap_or(argument.len())
+    };
+    let name = &argument[..name_end];
+    let valid = if let Some(scope_end) = name.find('/') {
+        name.starts_with('@')
+            && scope_end > 1
+            && scope_end + 1 < name.len()
+            && name[1..scope_end]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+            && name[scope_end + 1..]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    } else {
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    };
+    valid.then(|| name.to_owned())
+}
+
 fn custom_latest_choice(source: Option<&LatestVersionSource>) -> (CustomLatestChoice, String) {
     match source {
         None => (CustomLatestChoice::None, String::new()),
@@ -13681,6 +13816,87 @@ mod tests {
                 r#"folder\name with space"#,
             ]
         );
+    }
+
+    #[test]
+    fn infers_npm_latest_source_from_a_global_install_command() {
+        let update = [
+            "npm",
+            "install",
+            "--global",
+            "--ignore-scripts",
+            "@earendil-works/pi-coding-agent",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            infer_custom_latest_source(&update),
+            Some(LatestVersionSource::Npm {
+                package: "@earendil-works/pi-coding-agent".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn infers_registry_packages_from_wrapped_commands_and_version_specs() {
+        let update = [
+            r#"C:\Program Files\nodejs\npm.cmd"#,
+            "i",
+            "--prefix",
+            "C:\\Users\\example\\AppData\\Roaming\\npm",
+            "@scope/tool@latest",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            infer_custom_latest_source(&update),
+            Some(LatestVersionSource::Npm {
+                package: "@scope/tool".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_guess_a_registry_source_for_ambiguous_or_non_registry_updates() {
+        let ambiguous = ["npm", "install", "--global", "one", "two"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let non_registry = ["deno", "upgrade"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(infer_custom_latest_source(&ambiguous), None);
+        assert_eq!(infer_custom_latest_source(&non_registry), None);
+    }
+
+    #[test]
+    fn editing_an_inferred_update_command_clears_the_inferred_source() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let mut flow = CustomCommandFlow::new(DeclarationMode::Add);
+        flow.step = CustomCommandStep::Update;
+        flow.update = TextInput::new("npm install --global example".to_owned());
+        flow.latest = CustomLatestChoice::Npm;
+        flow.latest_value = TextInput::new("example".to_owned());
+        flow.latest_inferred = true;
+        app.modal = Modal::CustomCommandFlow(flow);
+
+        handle_paste(&mut app, "-changed");
+
+        assert!(matches!(
+            &app.modal,
+            Modal::CustomCommandFlow(flow)
+                if flow.latest == CustomLatestChoice::None
+                    && flow.latest_value.value.is_empty()
+                    && !flow.latest_inferred
+        ));
     }
 
     #[test]

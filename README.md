@@ -259,6 +259,8 @@ dvup list
 
 `dvup add <name> ...` 会创建 `type = "custom"` 声明，把更新命令保存为 `update = [...]`，并使用 `probe = ["<name>", "--version"]`。保存前必须实际运行该只读探针并提取到版本号；失败时命令会停止并提示使用 TUI 选择不同的 executable 或 probe 参数。更新命令本身不会在添加时执行。
 
+在 TUI 的自定义命令向导中，如果更新命令是对单个 npm、pnpm 或 Bun 包执行的 `install`/`add`/`upgrade`，向导会自动推断 npm Registry 和包名，并在官方最新版本步骤中预填；仍可手动切换来源或改写标识。
+
 删除自定义命令：
 
 ```console
