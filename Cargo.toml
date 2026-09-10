@@ -1,6 +1,6 @@
 [package]
 name = "dvup"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A lock-aware, cross-platform toolchain updater"
 license = "MIT"
