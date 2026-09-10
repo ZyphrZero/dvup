@@ -1722,6 +1722,19 @@ impl GithubReleaseFlow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImportEntryStatus {
+    New,
+    Overwrite,
+    Ignored,
+}
+
+#[derive(Clone, Debug)]
+struct ImportEntry {
+    name: String,
+    status: ImportEntryStatus,
+}
+
 #[derive(Clone)]
 enum Modal {
     None,
@@ -1762,6 +1775,11 @@ enum Modal {
     },
     ConfirmDelete {
         name: String,
+    },
+    ConfirmImport {
+        config: UserConfig,
+        command_entries: Vec<ImportEntry>,
+        monitor_entries: Vec<ImportEntry>,
     },
     TomlEditor {
         editor: TomlEditor,
@@ -4775,6 +4793,247 @@ impl App {
         Ok(())
     }
 
+    fn user_config_path(&self) -> PathBuf {
+        self.config_path
+            .clone()
+            .unwrap_or_else(|| self.state.custom_config_path())
+    }
+
+    fn load_backing_user_config(&self) -> Result<UserConfig> {
+        let path = self.user_config_path();
+        if path.is_file() {
+            UserConfig::load(&path)
+        } else {
+            Ok(UserConfig::empty())
+        }
+    }
+
+    fn command_copy_names(&self) -> Option<Vec<String>> {
+        let selected = self
+            .tools
+            .iter()
+            .filter(|tool| tool.selected && matches!(tool.kind, ToolKind::Custom))
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        if !selected.is_empty() {
+            return Some(selected);
+        }
+        match self.focused_tool() {
+            Some(tool) if matches!(tool.kind, ToolKind::Custom) => Some(vec![tool.name.clone()]),
+            Some(_) => None,
+            None => Some(Vec::new()),
+        }
+    }
+
+    fn copy_command_declarations(&mut self) {
+        let Some(names) = self.command_copy_names() else {
+            self.message = self
+                .language
+                .text(message_key!("tui.built_in_tools_cannot_be_copied"))
+                .to_owned();
+            return;
+        };
+        if names.is_empty() {
+            return;
+        }
+        let result = self
+            .load_backing_user_config()
+            .and_then(|custom| export_declarations(&custom, &names, &[]));
+        match result {
+            Ok(text) => {
+                match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+                    Ok(()) => {
+                        self.message = self.language.format(
+                            message_key!("tui.copied_commands_to_clipboard"),
+                            &[&names.len()],
+                        );
+                    }
+                    Err(error) => {
+                        self.message = self
+                            .language
+                            .format(message_key!("message.clipboard_copy_failed"), &[&error]);
+                    }
+                }
+            }
+            Err(error) => {
+                self.message = self.language.format(
+                    message_key!("message.custom_command_load_failed"),
+                    &[&error],
+                );
+            }
+        }
+    }
+
+    fn copy_github_monitor_declarations(&mut self) {
+        let names = if self.selected_github_monitors.is_empty() {
+            self.focused_github_monitor()
+                .map(|monitor| vec![monitor.name.clone()])
+                .unwrap_or_default()
+        } else {
+            self.github_monitors
+                .iter()
+                .filter(|monitor| self.selected_github_monitors.contains(&monitor.name))
+                .map(|monitor| monitor.name.clone())
+                .collect()
+        };
+        if names.is_empty() {
+            return;
+        }
+        let result = self
+            .load_backing_user_config()
+            .and_then(|custom| export_declarations(&custom, &[], &names));
+        match result {
+            Ok(text) => {
+                match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+                    Ok(()) => {
+                        self.message = self.language.format(
+                            message_key!("tui.copied_monitors_to_clipboard"),
+                            &[&names.len()],
+                        );
+                    }
+                    Err(error) => {
+                        self.message = self
+                            .language
+                            .format(message_key!("message.clipboard_copy_failed"), &[&error]);
+                    }
+                }
+            }
+            Err(error) => {
+                self.message = self
+                    .language
+                    .format(message_key!("message.clipboard_import_invalid"), &[&error]);
+            }
+        }
+    }
+
+    fn start_clipboard_import(&mut self) {
+        if self.running > 0 {
+            self.message = self
+                .language
+                .text(message_key!("tui.wait_for_the_current_operation_to_finish"))
+                .to_owned();
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => self.begin_import_from_text(&text),
+            Err(error) => {
+                self.message = self
+                    .language
+                    .format(message_key!("message.clipboard_paste_failed"), &[&error]);
+            }
+        }
+    }
+
+    fn begin_import_from_text(&mut self, text: &str) {
+        let trimmed = text.trim();
+        let incoming = if trimmed.is_empty() {
+            None
+        } else {
+            match UserConfig::parse(trimmed) {
+                Ok(config) => (!config.is_empty()).then_some(config),
+                Err(error) => {
+                    self.message = self
+                        .language
+                        .format(message_key!("message.clipboard_import_invalid"), &[&error]);
+                    return;
+                }
+            }
+        };
+        let Some(incoming) = incoming else {
+            self.message = self
+                .language
+                .text(message_key!("tui.clipboard_has_no_declarations"))
+                .to_owned();
+            return;
+        };
+        let current = match self.load_backing_user_config() {
+            Ok(current) => current,
+            Err(error) => {
+                self.message = self.language.format(
+                    message_key!("message.custom_command_load_failed"),
+                    &[&error],
+                );
+                return;
+            }
+        };
+        let (command_entries, monitor_entries) = import_preview(&incoming, &current);
+        if command_entries
+            .iter()
+            .chain(&monitor_entries)
+            .all(|entry| entry.status == ImportEntryStatus::Ignored)
+        {
+            self.message = self
+                .language
+                .text(message_key!("tui.import_all_conflict_with_built_in_tools"))
+                .to_owned();
+            return;
+        }
+        self.modal = Modal::ConfirmImport {
+            config: incoming,
+            command_entries,
+            monitor_entries,
+        };
+    }
+
+    fn apply_import(
+        &mut self,
+        config: &UserConfig,
+        command_entries: &[ImportEntry],
+        monitor_entries: &[ImportEntry],
+    ) {
+        let result: Result<(usize, usize)> = (|| {
+            if self.config_path.is_some() {
+                return Err(Error::Message(
+                    "importing is disabled with --config".to_owned(),
+                ));
+            }
+            let path = self.state.custom_config_path();
+            let mut custom = self.load_backing_user_config()?;
+            let mut imported_commands = 0;
+            for entry in command_entries {
+                if entry.status == ImportEntryStatus::Ignored {
+                    continue;
+                }
+                if let Some(spec) = config.commands.get(&entry.name) {
+                    custom.commands.insert(entry.name.clone(), spec.clone());
+                    imported_commands += 1;
+                }
+            }
+            let mut imported_monitors = 0;
+            for entry in monitor_entries {
+                if entry.status == ImportEntryStatus::Ignored {
+                    continue;
+                }
+                if let Some(spec) = config.github.monitors.get(&entry.name) {
+                    custom
+                        .github
+                        .monitors
+                        .insert(entry.name.clone(), spec.clone());
+                    imported_monitors += 1;
+                }
+            }
+            custom.save(&path)?;
+            Ok((imported_commands, imported_monitors))
+        })();
+        match result {
+            Ok((commands, monitors)) => {
+                if let Err(error) = self.refresh_tools() {
+                    self.message = error.to_string();
+                    return;
+                }
+                self.message = self.language.format(
+                    message_key!("tui.imported_declarations"),
+                    &[&commands, &monitors],
+                );
+            }
+            Err(error) => {
+                self.message = self
+                    .language
+                    .format(message_key!("message.import_save_failed"), &[&error]);
+            }
+        }
+    }
+
     fn start_delete(&mut self, name: String) {
         self.running += 1;
         self.push_activity(
@@ -6561,6 +6820,18 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
             _ => {}
         },
+        Modal::ConfirmImport {
+            config,
+            command_entries,
+            monitor_entries,
+        } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                app.modal = Modal::None;
+                app.apply_import(&config, &command_entries, &monitor_entries);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
+            _ => {}
+        },
         Modal::NetworkSettings {
             mut proxy_mode,
             mut field,
@@ -7368,6 +7639,64 @@ fn handle_tools_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Serializes the chosen declarations into the same TOML shape as the user
+/// manifest so the clipboard payload can be imported on another device.
+fn export_declarations(
+    config: &UserConfig,
+    command_names: &[String],
+    monitor_names: &[String],
+) -> Result<String> {
+    let mut subset = UserConfig::empty();
+    for name in command_names {
+        if let Some(command) = config.commands.get(name) {
+            subset.commands.insert(name.clone(), command.clone());
+        }
+    }
+    for name in monitor_names {
+        if let Some(monitor) = config.github.monitors.get(name) {
+            subset.github.monitors.insert(name.clone(), monitor.clone());
+        }
+    }
+    Ok(toml::to_string(&subset)?)
+}
+
+/// Classifies every incoming declaration against the local manifest and the
+/// built-in tools before the import confirmation is shown.
+fn import_preview(
+    incoming: &UserConfig,
+    current: &UserConfig,
+) -> (Vec<ImportEntry>, Vec<ImportEntry>) {
+    let built_in = Config::starter();
+    let command_entries = incoming
+        .commands
+        .keys()
+        .map(|name| ImportEntry {
+            status: if built_in.tools.contains_key(name) {
+                ImportEntryStatus::Ignored
+            } else if current.commands.contains_key(name) {
+                ImportEntryStatus::Overwrite
+            } else {
+                ImportEntryStatus::New
+            },
+            name: name.clone(),
+        })
+        .collect();
+    let monitor_entries = incoming
+        .github
+        .monitors
+        .keys()
+        .map(|name| ImportEntry {
+            status: if current.github.monitors.contains_key(name) {
+                ImportEntryStatus::Overwrite
+            } else {
+                ImportEntryStatus::New
+            },
+            name: name.clone(),
+        })
+        .collect();
+    (command_entries, monitor_entries)
+}
+
 fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -7455,6 +7784,17 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
                 name: tool.name.clone(),
                 version: TextInput::new(String::new()),
             };
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.copy_command_declarations(),
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            if app.config_path.is_some() {
+                app.message = app
+                    .language
+                    .text(message_key!("tui.custom_commands_disabled_with_config_add"))
+                    .to_owned();
+            } else {
+                app.start_clipboard_import();
+            }
         }
         KeyCode::Char('c') | KeyCode::Char('C') => {
             if app.running > 0 {
@@ -7587,6 +7927,19 @@ fn handle_github_tools_key(app: &mut App, key: KeyEvent) {
                 .filter(|monitor| monitor.enabled && should_select)
                 .map(|monitor| monitor.name.clone())
                 .collect();
+        }
+        KeyCode::Char('y' | 'Y') => app.copy_github_monitor_declarations(),
+        KeyCode::Char('p' | 'P') => {
+            if app.config_path.is_some() {
+                app.message = app
+                    .language
+                    .text(message_key!(
+                        "tui.github_repository_editing_is_disabled_with_config"
+                    ))
+                    .to_owned();
+                return;
+            }
+            app.start_clipboard_import();
         }
         KeyCode::Char('c' | 'C') => {
             if app.config_path.is_some() {
@@ -11489,6 +11842,60 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 ])
                 .style(Style::default().bg(PANEL_BG))
                 .wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+        Modal::ConfirmImport {
+            config: _,
+            command_entries,
+            monitor_entries,
+        } => {
+            let rows = command_entries.len() + monitor_entries.len();
+            let inner = modal_panel(
+                frame,
+                area,
+                app.language.text(message_key!("tui.confirm_import")),
+                74,
+                (10 + rows.min(8)) as u16,
+            );
+            let status_line = |entry: &ImportEntry| -> Line<'static> {
+                let (key, color) = match entry.status {
+                    ImportEntryStatus::New => (message_key!("tui.import_status_new"), SUCCESS),
+                    ImportEntryStatus::Overwrite => {
+                        (message_key!("tui.import_status_overwrite"), WARNING_COLOR)
+                    }
+                    ImportEntryStatus::Ignored => (message_key!("tui.import_status_ignored"), DIM),
+                };
+                labeled_value(&entry.name, app.language.text(key), color)
+            };
+            let mut lines = vec![
+                Line::styled(
+                    app.language.format(
+                        message_key!("modal.import_prompt"),
+                        &[&command_entries.len(), &monitor_entries.len()],
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+            ];
+            lines.extend(command_entries.iter().map(status_line));
+            lines.extend(monitor_entries.iter().map(status_line));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                app.language
+                    .text(message_key!("tui.import_replaces_matching")),
+                Style::default().fg(WARNING_COLOR),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(modal_actions(
+                app.language,
+                app.language.text(message_key!("tui.confirm")),
+                app.language.text(message_key!("tui.cancel")),
+            ));
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .style(Style::default().bg(PANEL_BG))
+                    .wrap(Wrap { trim: false }),
                 inner,
             );
         }
@@ -16049,6 +16456,20 @@ mod tests {
     }
 
     #[test]
+    fn tools_footer_mentions_copy_and_paste_shortcuts_in_both_languages() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let english = render_test_screen(&mut app, 160, 20);
+        assert!(english.contains("y copy · p paste"), "screen: {english}");
+
+        app.language = Language::Chinese;
+        let chinese = render_test_screen(&mut app, 160, 20);
+        assert!(chinese.contains("y 复 制"), "screen: {chinese}");
+        assert!(chinese.contains("p 粘 贴"), "screen: {chinese}");
+    }
+
+    #[test]
     fn footer_mentions_shift_tab_policy_on_every_tab_in_both_languages() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -17895,6 +18316,194 @@ mod tests {
         let saved = UserConfig::load(&state.custom_config_path()).expect("saved declarations");
         assert!(saved.commands.contains_key("safe-save"));
         assert!(saved.github.monitors.contains_key("example-release"));
+    }
+
+    fn npm_package_command(package: &str, probe_args: &[&str]) -> UserCommandSpec {
+        UserCommandSpec::Package(PackageCommandSpec {
+            manager: PackageManager::Npm,
+            package: package.to_owned(),
+            executable: package.to_owned(),
+            probe_args: probe_args.iter().map(|arg| (*arg).to_owned()).collect(),
+        })
+    }
+
+    #[test]
+    fn export_declarations_round_trips_selected_entries() {
+        let mut config = UserConfig::empty();
+        config
+            .commands
+            .insert("dsh".to_owned(), npm_package_command("dsh", &["--version"]));
+        config.commands.insert(
+            "dsh-tui".to_owned(),
+            npm_package_command("dsh-tui", &["--version"]),
+        );
+        config.github.monitors.insert(
+            "example-release".to_owned(),
+            GithubMonitorSpec {
+                repository: "owner/repository".to_owned(),
+                asset: AssetSelector {
+                    product: "example".to_owned(),
+                    os: crate::config::AssetOperatingSystem::Linux,
+                    arch: crate::config::AssetArchitecture::X86_64,
+                    format: ReleaseAssetFormat::TarGz,
+                    variant: None,
+                },
+                install: GithubInstallSpec::UserDirectory,
+                update_policy: ReleaseUpdatePolicy::Manual,
+                enabled: true,
+            },
+        );
+
+        let exported = export_declarations(
+            &config,
+            &["dsh".to_owned(), "dsh-tui".to_owned(), "missing".to_owned()],
+            &["example-release".to_owned()],
+        )
+        .expect("export declarations");
+
+        assert!(exported.contains("[commands.dsh]"));
+        assert!(exported.contains("[commands.dsh-tui]"));
+        assert!(exported.contains("[github.monitors.example-release]"));
+        let parsed = UserConfig::parse(&exported).expect("round trip");
+        assert_eq!(parsed.commands.len(), 2);
+        assert_eq!(parsed.github.monitors.len(), 1);
+        assert_eq!(
+            parsed.commands["dsh"],
+            npm_package_command("dsh", &["--version"])
+        );
+    }
+
+    #[test]
+    fn clipboard_import_merges_overwrites_and_skips_built_in_names() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state.clone(), None).expect("app");
+        app.save_command_declaration(
+            &DeclarationMode::Add,
+            "dsh".to_owned(),
+            npm_package_command("dsh", &["--version"]),
+        )
+        .expect("seed existing dsh declaration");
+
+        let built_in_name = Config::starter()
+            .tools
+            .keys()
+            .next()
+            .cloned()
+            .expect("starter manifest has built-in tools");
+        let mut incoming = UserConfig::empty();
+        incoming
+            .commands
+            .insert("dsh".to_owned(), npm_package_command("dsh", &["-V"]));
+        incoming.commands.insert(
+            "dsh-tui".to_owned(),
+            npm_package_command("dsh-tui", &["--version"]),
+        );
+        incoming.commands.insert(
+            built_in_name.clone(),
+            npm_package_command(&built_in_name, &["--version"]),
+        );
+        let payload = export_declarations(
+            &incoming,
+            &[
+                "dsh".to_owned(),
+                "dsh-tui".to_owned(),
+                built_in_name.clone(),
+            ],
+            &[],
+        )
+        .expect("clipboard payload");
+
+        app.begin_import_from_text(&payload);
+        let (commands, monitors) = match &app.modal {
+            Modal::ConfirmImport {
+                command_entries,
+                monitor_entries,
+                ..
+            } => (command_entries.clone(), monitor_entries.clone()),
+            _ => panic!(
+                "import confirmation modal expected, message: {}",
+                app.message
+            ),
+        };
+        let status_of = |entries: &[ImportEntry], name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.status)
+        };
+        assert_eq!(
+            status_of(&commands, "dsh"),
+            Some(ImportEntryStatus::Overwrite)
+        );
+        assert_eq!(
+            status_of(&commands, "dsh-tui"),
+            Some(ImportEntryStatus::New)
+        );
+        assert_eq!(
+            status_of(&commands, &built_in_name),
+            Some(ImportEntryStatus::Ignored)
+        );
+        assert!(monitors.is_empty());
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.modal, Modal::None));
+
+        let saved = UserConfig::load(&state.custom_config_path()).expect("saved import");
+        let UserCommandSpec::Package(dsh) = saved.commands.get("dsh").expect("dsh saved") else {
+            panic!("dsh stays a package command");
+        };
+        assert_eq!(dsh.probe_args, vec!["-V".to_owned()]);
+        assert!(saved.commands.contains_key("dsh-tui"));
+        assert!(!saved.commands.contains_key(&built_in_name));
+        assert!(app.tools.iter().any(|tool| tool.name == "dsh-tui"));
+        assert!(app.message.contains("Imported 2 command"));
+    }
+
+    #[test]
+    fn clipboard_import_rejects_unusable_payloads() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().join("state"));
+        let mut app = App::new(state, None).expect("app");
+
+        app.begin_import_from_text("   ");
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            app.message,
+            "The clipboard contains no dvup command or repository declarations"
+        );
+
+        app.begin_import_from_text(
+            "[commands.oops]\ntype = \"package\"\nmanager = \"npm\"\npackage = \"x\"\nexecutable = \"x\"\nbogus_field = 1\n",
+        );
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.message.starts_with("Could not read dvup declarations"));
+    }
+
+    #[test]
+    fn copying_a_built_in_tool_shows_guidance() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let (tool_row, _) = app
+            .tools
+            .iter()
+            .enumerate()
+            .find(|(_, tool)| matches!(tool.kind, ToolKind::BuiltIn))
+            .expect("starter manifest provides built-in tools");
+        let position = app
+            .visible_tool_indices
+            .iter()
+            .position(|&visible| visible == tool_row)
+            .expect("built-in tool is visible");
+        app.tool_index = position;
+
+        handle_command_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert!(app.message.contains("Built-in tools"));
     }
 
     #[test]
