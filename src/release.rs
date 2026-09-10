@@ -378,14 +378,7 @@ fn installed_monitor_version(
 }
 
 pub(crate) fn release_versions_match(installed: &str, release_tag: &str) -> bool {
-    fn without_v_prefix(value: &str) -> &str {
-        value
-            .strip_prefix('v')
-            .or_else(|| value.strip_prefix('V'))
-            .unwrap_or(value)
-    }
-
-    installed == release_tag || without_v_prefix(installed) == without_v_prefix(release_tag)
+    version::version_is_current(installed, release_tag)
 }
 
 #[cfg(target_os = "macos")]

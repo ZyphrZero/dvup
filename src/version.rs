@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    cmp::Ordering,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 
@@ -438,6 +441,144 @@ fn normalize_release(raw: &str) -> Result<String> {
     Ok(value[start..].to_owned())
 }
 
+/// Structured release used to order an installed version against the latest one.
+#[derive(Debug, Eq, PartialEq)]
+struct Release {
+    core: Vec<u64>,
+    prerelease: Vec<ReleaseIdentifier>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ReleaseIdentifier {
+    Numeric(u64),
+    Alphanumeric(String),
+}
+
+impl Release {
+    /// Parses release strings such as `0.10.0`, `v1.2.3-beta.4`, or `2.0.0+build.7`.
+    fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        let trimmed = trimmed
+            .strip_prefix('v')
+            .or_else(|| trimmed.strip_prefix('V'))
+            .unwrap_or(trimmed);
+        let without_build = trimmed.split('+').next().unwrap_or(trimmed);
+        let (core, prerelease) = match without_build.split_once('-') {
+            Some((core, prerelease)) => (core, Some(prerelease)),
+            None => (without_build, None),
+        };
+        let core = core
+            .split('.')
+            .map(|segment| segment.parse::<u64>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        if core.is_empty() {
+            return None;
+        }
+        let mut identifiers = Vec::new();
+        if let Some(prerelease) = prerelease {
+            for identifier in prerelease.split('.') {
+                if identifier.is_empty() {
+                    return None;
+                }
+                identifiers.push(match identifier.parse::<u64>() {
+                    Ok(number) => ReleaseIdentifier::Numeric(number),
+                    Err(_)
+                        if identifier.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || character == '-'
+                        }) =>
+                    {
+                        ReleaseIdentifier::Alphanumeric(identifier.to_owned())
+                    }
+                    Err(_) => return None,
+                });
+            }
+        }
+        Some(Self {
+            core,
+            prerelease: identifiers,
+        })
+    }
+
+    /// Cores compare with zero padding so `1.2` matches `1.2.0`.
+    fn same_core(&self, other: &Self) -> bool {
+        let depth = self.core.len().max(other.core.len());
+        (0..depth).all(|index| {
+            self.core.get(index).copied().unwrap_or_default()
+                == other.core.get(index).copied().unwrap_or_default()
+        })
+    }
+}
+
+impl Ord for Release {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let depth = self.core.len().max(other.core.len());
+        for index in 0..depth {
+            let ordering = self
+                .core
+                .get(index)
+                .copied()
+                .unwrap_or_default()
+                .cmp(&other.core.get(index).copied().unwrap_or_default());
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => compare_prereleases(&self.prerelease, &other.prerelease),
+        }
+    }
+}
+
+impl PartialOrd for Release {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compare_prereleases(left: &[ReleaseIdentifier], right: &[ReleaseIdentifier]) -> Ordering {
+    for (left, right) in left.iter().zip(right.iter()) {
+        let ordering = match (left, right) {
+            (ReleaseIdentifier::Numeric(left), ReleaseIdentifier::Numeric(right)) => {
+                left.cmp(right)
+            }
+            (ReleaseIdentifier::Numeric(_), ReleaseIdentifier::Alphanumeric(_)) => Ordering::Less,
+            (ReleaseIdentifier::Alphanumeric(_), ReleaseIdentifier::Numeric(_)) => {
+                Ordering::Greater
+            }
+            (ReleaseIdentifier::Alphanumeric(left), ReleaseIdentifier::Alphanumeric(right)) => {
+                left.cmp(right)
+            }
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+/// Decides whether an installed version counts as current against the latest
+/// release reported by an authoritative source.
+///
+/// Versions are compared semantically (numeric core, then prerelease
+/// precedence), and an installed prerelease counts as current when the latest
+/// release is the stable version it precedes, so a `0.10.0-beta.4` install is
+/// not flagged as outdated once `0.10.0` ships. Unparseable versions fall back
+/// to an exact string match.
+pub(crate) fn version_is_current(installed: &str, latest: &str) -> bool {
+    match (Release::parse(installed), Release::parse(latest)) {
+        (Some(installed), Some(latest)) => {
+            installed >= latest
+                || (!installed.prerelease.is_empty()
+                    && latest.prerelease.is_empty()
+                    && installed.same_core(&latest))
+        }
+        _ => installed == latest,
+    }
+}
+
 pub(crate) fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -470,6 +611,36 @@ mod tests {
             "1.3.14"
         );
         assert!(normalize_release("release-without-version").is_err());
+    }
+
+    #[test]
+    fn treats_prereleases_of_the_latest_stable_release_as_current() {
+        assert!(version_is_current("0.10.0", "0.10.0"));
+        assert!(version_is_current("0.10.0-beta.4", "0.10.0"));
+        assert!(version_is_current("v0.10.0-beta.4", "v0.10.0"));
+        assert!(version_is_current("0.10.0-beta.4", "0.10.0+build.7"));
+        assert!(version_is_current("0.10.0+build.7", "0.10.0"));
+        assert!(version_is_current("0.10.1-beta.2", "0.10.0"));
+        assert!(version_is_current("1.2", "1.2.0"));
+        assert!(version_is_current("0.10.0", "0.10.0-rc.1"));
+    }
+
+    #[test]
+    fn flags_actual_upgrades_across_release_trains_and_prereleases() {
+        assert!(!version_is_current("0.9.3", "0.10.0"));
+        assert!(!version_is_current("0.10.0", "0.11.0"));
+        assert!(!version_is_current("1.2", "1.2.1"));
+        assert!(!version_is_current("0.10.0-beta.4", "0.10.0-beta.5"));
+        assert!(!version_is_current("0.10.0-beta.9", "0.10.0-beta.10"));
+        assert!(!version_is_current("0.10.0-beta.4", "0.10.0-rc.1"));
+        assert!(!version_is_current("0.10.0-beta.4", "0.10.1"));
+    }
+
+    #[test]
+    fn falls_back_to_exact_matches_for_unparseable_versions() {
+        assert!(version_is_current("main-20260910", "main-20260910"));
+        assert!(!version_is_current("main-20260910", "main-20260911"));
+        assert!(!version_is_current("1.2.x", "1.2.3"));
     }
 
     #[test]

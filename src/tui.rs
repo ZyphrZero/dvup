@@ -12861,7 +12861,7 @@ fn latest_version_error_message(
 fn latest_version_style(tool: &ToolItem) -> Style {
     match (&tool.version, &tool.latest_version) {
         (VersionState::Available(installed), VersionState::Available(latest))
-            if installed == latest =>
+            if version::version_is_current(installed, latest) =>
         {
             Style::default().fg(SUCCESS)
         }
@@ -12876,7 +12876,7 @@ fn tool_is_up_to_date(tool: &ToolItem) -> bool {
     matches!(
         (&tool.version, &tool.latest_version),
         (VersionState::Available(installed), VersionState::Available(latest))
-            if installed == latest
+            if version::version_is_current(installed, latest)
     )
 }
 
