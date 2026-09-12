@@ -12,6 +12,7 @@
 - **并行更新**：独立工具并行执行，共享同一安装目录的工具（如多个 npm 全局包）自动串行排队
 - **安装冲突诊断**：`doctor` 按真实 PATH 顺序找出重复安装、被遮蔽的旧版本和路径冲突
 - **GitHub Release 监控**：跟踪任意仓库的 Release，用语义选择器精确匹配资产，支持直接安装
+- **对称的卸载**：包管理器包、自定义命令和内置工具都能按各自声明的反安装命令移除，同样锁感知
 - **自定义更新命令**：一条命令添加任意工具的更新方式，也可在 TUI 向导中通过官方 Registry 验证后添加
 - **中英双语界面**：TUI 内按 `L` 随时切换
 
@@ -53,7 +54,9 @@ dvup doctor               # 诊断 PATH 中的安装冲突
 | `dvup update [tool] [args...]` | 更新全部或指定工具，参数追加到工具命令 |
 | `dvup update <tool> --to <version>` | 将工具更新或降级到精确版本（需工具支持） |
 | `dvup add <name> <command...>` | 添加用户级自定义更新命令 |
-| `dvup remove <name>` | 删除自定义命令 |
+| `dvup remove <name>` | 删除自定义命令声明 |
+| `dvup uninstall <tool>` | 卸载工具（包管理器包走官方反安装命令） |
+| `dvup uninstall <tool> --purge` | 卸载后同时删除该工具的用户声明 |
 | `dvup init` | 创建全局用户配置文件 `dvup_custom.toml` |
 | `dvup doctor [tool]` | 诊断重复安装和版本冲突 |
 | `dvup self-update [--force]` | 从 crates.io 更新 dvup 自身 |
@@ -65,19 +68,42 @@ dvup doctor               # 诊断 PATH 中的安装冲突
 
 ## 内置工具
 
-| 名称 | 更新方式 | 平台 |
-| --- | --- | --- |
-| `dvup` | `cargo install dvup --locked`（后台替换自身） | 全平台 |
-| `bun` | 官方安装器（Windows: `install.ps1`；Unix: Bash 安装器） | 全平台 |
-| `brew` | `brew update`（拉取 Homebrew 自身及软件源） | macOS、Linux |
-| `deno` | `deno upgrade` | 全平台 |
-| `mise` | `mise self-update` | 全平台 |
-| `pixi` | `pixi self-update` | 全平台 |
-| `rustup` | `rustup update` | 全平台 |
-| `scoop` | `scoop update` | Windows |
-| `uv` | Astral 官方安装器 | 全平台 |
+| 名称 | 更新方式 | 平台 | `dvup uninstall` |
+| --- | --- | --- | --- |
+| `dvup` | `cargo install dvup --locked`（后台替换自身） | 全平台 | `cargo uninstall dvup` |
+| `bun` | 官方安装器（Windows: `install.ps1`；Unix: Bash 安装器） | 全平台 | 未声明，需自行配置 |
+| `brew` | `brew update`（拉取 Homebrew 自身及软件源） | macOS、Linux | `brew uninstall brew` |
+| `deno` | `deno upgrade` | 全平台 | 未声明，需自行配置 |
+| `mise` | `mise self-update` | 全平台 | `mise implode --yes` |
+| `pixi` | `pixi self-update` | 全平台 | 未声明，需自行配置 |
+| `rustup` | `rustup update` | 全平台 | `rustup self uninstall -y` |
+| `scoop` | `scoop update` | Windows | `scoop uninstall scoop` |
+| `uv` | Astral 官方安装器 | 全平台 | 未声明，需自行配置 |
 
 `dvup update` 会跳过未安装或当前平台不支持的工具，单项失败不影响其他工具，结束后统一汇总。
+
+## 卸载工具
+
+`dvup uninstall <tool>` 用工具自己的方式把它从本机移除，和更新一样锁感知：工具正在运行时按进程策略等待或终止，绝不在占用状态下硬删文件。
+
+```console
+dvup uninstall ripgrep           # brew uninstall ripgrep（由 manager 模板生成）
+dvup uninstall codegraph         # npm uninstall --global @colbymchenry/codegraph
+dvup uninstall rustup            # rustup self uninstall -y
+dvup uninstall release-tool --purge   # 卸载后同时删除这条用户声明
+```
+
+反安装命令的来源分三种：
+
+| 工具类型 | 反安装命令来源 |
+| --- | --- |
+| `type = "package"`（`dvup add` 的包管理器路径、TUI 添加） | 由 manager 模板本地确定：`brew uninstall`、`npm uninstall --global`、`pnpm remove --global`、`cargo uninstall`、`pipx uninstall`、`uv tool uninstall` |
+| `type = "custom"` | 由 `uninstall = [...]` 字段显式声明；没有声明就拒绝卸载并提示如何添加 |
+| 内置预置 | 仅在内置清单里确实存在确定性反安装命令时才提供：`dvup`、`rustup`、`brew`、`scoop`、`mise` |
+
+像 `bun`、`uv`、`deno`、`pixi` 这类只能靠删除安装目录、改 shell 配置或 PATH 才能移除的工具，dvup 不会猜命令——需要的话在声明里写清 `uninstall`。
+
+卸载默认**保留配置声明**，工具随后显示为 `missing`，随时可以重新安装或继续更新；只有显式加 `--purge` 才会连声明一起删掉（TUI 里对应 `d` 键，只删声明、不执行反安装命令）。
 
 ## 添加自定义工具
 
@@ -100,7 +126,7 @@ dvup add codegraph npm install --global @colbymchenry/codegraph@latest
 
 命令按 argv 安全拆分，不经 shell 拼接，支持绝对路径（如 `/opt/homebrew/bin/brew`）。通过 npm/pnpm 添加的命令自动共享 `node-global` 资源组，Homebrew 包共享 `homebrew` 资源组——共享同一安装目录的任务会自动排队，不同资源组之间仍然并行。
 
-在 TUI 的 Tools 页按 `c` 还有两条引导路径：**从包管理器添加**（Homebrew/npm/pnpm/Cargo/pipx/uv，经官方 Registry 验证，自动发现可执行文件）和 **AI 分析**（可选，仅提取包管理器和包名，验证流程与手动完全一致）。
+在 TUI 的 Tools 页按 `c` 还有两条引导路径：**从包管理器添加**（Homebrew/npm/pnpm/Cargo/pipx/uv，经官方 Registry 验证，自动发现可执行文件）和 **AI 分析**（可选，仅提取包管理器和包名，验证流程与手动完全一致）。添加自定义命令的向导里也可以顺手写一条可选的卸载命令，留空表示该命令不支持卸载。
 
 ## GitHub Release 监控
 
@@ -169,6 +195,7 @@ dvup doctor rustup      # 只检查一个工具
 | `c` | 添加命令或 GitHub 监控 |
 | `e` | 编辑当前工具 |
 | `d` | 删除选中的自定义项 |
+| `u` | 卸载选中的已安装工具（需确认） |
 | `t` / `o` | 内置 TOML 编辑器 / 系统编辑器打开配置 |
 | `v` | 指定目标版本（需工具支持） |
 | `r` | 重载配置并刷新 |
@@ -206,19 +233,25 @@ release_asset_body_timeout_secs = 300
 普通用法不需要配置文件——内置预置始终生效，自定义内容保存在用户数据目录的全局 `dvup_custom.toml`（`dvup init` 创建，或直接在 TUI 中编辑）。文件只有两个顶层分区，schema 严格校验，未知字段直接报错：
 
 ```toml
-# 包管理器命令：更新命令、最新版本来源、资源组等由 manager 模板本地确定
+# 包管理器命令：更新命令、反安装命令、最新版本来源、资源组等由 manager 模板本地确定
 [commands.codegraph]
 type = "package"
 manager = "npm"
 package = "@colbymchenry/codegraph"
 executable = "codegraph"
 
-# 自定义命令：argv 数组，不经 shell；可选显式声明最新版本来源
+# 自定义命令：argv 数组，不经 shell；可选显式声明最新版本来源和卸载命令
 [commands.deno]
 type = "custom"
 update = ["deno", "upgrade"]
 probe = ["deno", "--version"]
 latest = { provider = "github_release", repository = "denoland/deno" }
+
+[commands.mise]
+type = "custom"
+update = ["mise", "self-update"]
+probe = ["mise", "--version"]
+uninstall = ["mise", "implode", "--yes"]
 
 # GitHub Release 监控
 [github.monitors.ripgrep]

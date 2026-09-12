@@ -27,6 +27,18 @@
 # update = ["deno", "upgrade"]
 # probe = ["deno", "--version"]
 
+# A custom command may declare how `dvup uninstall <name>` removes it. Omit the
+# field to make the command explicitly non-uninstallable. Package-manager
+# declarations never need it: brew/npm/pnpm/cargo/pipx/uv removal is local.
+# The command is a plain argv array with no shell expansion, so prefer the
+# tool's own uninstaller over shell built-ins.
+#
+# [commands.mise]
+# type = "custom"
+# update = ["mise", "self-update"]
+# probe = ["mise", "--version"]
+# uninstall = ["mise", "implode", "--yes"]
+
 # A custom command may compare against one explicit official source.
 # Supported providers are npm, pypi, crates_io, github_release, and github_tag.
 # The TUI infers npm Registry for single-package npm/pnpm/Bun install or upgrade commands.

@@ -413,6 +413,9 @@ struct ToolItem {
     latest_source: Option<LatestVersionSource>,
     latest_probe_id: u64,
     supports_target_version: bool,
+    /// The declared removal command, rendered for confirmation; `None` when the
+    /// declaration does not say how this tool is uninstalled.
+    uninstall: Option<String>,
     availability: Availability,
     kind: ToolKind,
     selected: bool,
@@ -1606,6 +1609,7 @@ enum CustomCommandStep {
     Name,
     Update,
     Probe,
+    Uninstall,
     VersionChoice,
     LatestSource,
     LatestValue,
@@ -1619,6 +1623,7 @@ struct CustomCommandFlow {
     name: TextInput,
     update: TextInput,
     probe: TextInput,
+    uninstall: TextInput,
     probe_output: String,
     current_versions: Vec<String>,
     selected_version: usize,
@@ -1627,6 +1632,9 @@ struct CustomCommandFlow {
     latest_value: TextInput,
     latest_version: Option<String>,
     latest_inferred: bool,
+    /// Step to enter after the version probe succeeds; `Uninstall` while the
+    /// flow is still collecting the optional removal command.
+    probe_success_step: CustomCommandStep,
     validation_request_id: Option<u64>,
     loading: bool,
 }
@@ -1639,6 +1647,7 @@ impl CustomCommandFlow {
             name: TextInput::new(String::new()),
             update: TextInput::new(String::new()),
             probe: TextInput::new(String::new()),
+            uninstall: TextInput::new(String::new()),
             probe_output: String::new(),
             current_versions: Vec::new(),
             selected_version: 0,
@@ -1647,6 +1656,7 @@ impl CustomCommandFlow {
             latest_value: TextInput::new(String::new()),
             latest_version: None,
             latest_inferred: false,
+            probe_success_step: CustomCommandStep::Probe,
             validation_request_id: None,
             loading: false,
         }
@@ -1776,6 +1786,10 @@ enum Modal {
     ConfirmDelete {
         name: String,
     },
+    ConfirmUninstall {
+        name: String,
+        command: Option<String>,
+    },
     ConfirmImport {
         config: UserConfig,
         command_entries: Vec<ImportEntry>,
@@ -1817,6 +1831,7 @@ enum Modal {
 enum Operation {
     Update,
     Delete,
+    Uninstall,
 }
 
 impl Operation {
@@ -1824,6 +1839,7 @@ impl Operation {
         language.text(match self {
             Self::Update => message_key!("operation.update"),
             Self::Delete => message_key!("operation.delete"),
+            Self::Uninstall => message_key!("operation.uninstall"),
         })
     }
 
@@ -1839,6 +1855,12 @@ impl Operation {
             (Self::Delete, true) => language.format(message_key!("operation.removed"), &[&name]),
             (Self::Delete, false) => {
                 language.format(message_key!("operation.remove_failed"), &[&name])
+            }
+            (Self::Uninstall, true) => {
+                language.format(message_key!("operation.uninstalled"), &[&name])
+            }
+            (Self::Uninstall, false) => {
+                language.format(message_key!("operation.uninstall_failed"), &[&name])
             }
             (Self::Update, success) => language.format(
                 message_key!("operation.completed"),
@@ -4005,7 +4027,15 @@ impl App {
                             flow.probe_output = resolution.output;
                             flow.current_versions = resolution.versions;
                             flow.selected_version = 0;
-                            if flow.current_versions.len() > 1 {
+                            let next_step = flow.probe_success_step;
+                            flow.probe_success_step = CustomCommandStep::Probe;
+                            if next_step == CustomCommandStep::Uninstall {
+                                flow.step = CustomCommandStep::Uninstall;
+                                self.message = self
+                                    .language
+                                    .text(message_key!("tui.version_probe_succeeded_add_an_optional_uninstall_command"))
+                                    .to_owned();
+                            } else if flow.current_versions.len() > 1 {
                                 flow.step = CustomCommandStep::VersionChoice;
                                 self.message = self
                                     .language
@@ -4546,6 +4576,12 @@ impl App {
                 flow.name = TextInput::new(selected.name);
                 flow.update = TextInput::new(format_command_parts(&spec.update));
                 flow.probe = TextInput::new(format_command_parts(&spec.probe));
+                flow.uninstall = TextInput::new(
+                    spec.uninstall
+                        .as_deref()
+                        .map(format_command_parts)
+                        .unwrap_or_default(),
+                );
                 let (latest, value) = custom_latest_choice(spec.latest.as_ref());
                 flow.latest = latest;
                 flow.latest_value = TextInput::new(value);
@@ -5047,6 +5083,29 @@ impl App {
             vec!["remove".to_owned(), name.clone()],
             name,
             Operation::Delete,
+            self.language,
+        );
+        self.tab = Tab::Tools;
+    }
+
+    fn start_uninstall(&mut self, name: String) {
+        self.running += 1;
+        self.push_activity(
+            self.language
+                .format(message_key!("tui.uninstalling"), &[&name]),
+        );
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.name == name) {
+            tool.run_state = RunState::Running;
+            tool.selected = false;
+            tool.elapsed = None;
+        }
+        spawn_dvup(
+            self.tx.clone(),
+            self.executable.clone(),
+            self.state.root().to_path_buf(),
+            uninstall_arguments(&name, self.config_path.as_deref()),
+            name,
+            Operation::Uninstall,
             self.language,
         );
         self.tab = Tab::Tools;
@@ -6177,8 +6236,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                         }
                         CustomCommandStep::Update => CustomCommandStep::Name,
                         CustomCommandStep::Probe => CustomCommandStep::Update,
-                        CustomCommandStep::VersionChoice => CustomCommandStep::Probe,
-                        CustomCommandStep::LatestSource => CustomCommandStep::Probe,
+                        CustomCommandStep::Uninstall => CustomCommandStep::Probe,
+                        CustomCommandStep::VersionChoice => CustomCommandStep::Uninstall,
+                        CustomCommandStep::LatestSource => CustomCommandStep::Uninstall,
                         CustomCommandStep::LatestValue => CustomCommandStep::LatestSource,
                         CustomCommandStep::Confirm => {
                             if flow.latest == CustomLatestChoice::None {
@@ -6265,7 +6325,22 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                             CustomCommandStep::Probe => {
                                 let probe =
                                     split_flow_command(flow.probe.value.trim(), app.language)?;
+                                flow.probe_success_step = CustomCommandStep::Uninstall;
                                 app.start_custom_probe(&mut flow, probe);
+                            }
+                            CustomCommandStep::Uninstall => {
+                                if !flow.uninstall.value.trim().is_empty() {
+                                    let uninstall = split_flow_command(
+                                        flow.uninstall.value.trim(),
+                                        app.language,
+                                    )?;
+                                    if uninstall.first().is_none_or(|part| part.trim().is_empty()) {
+                                        return Err(Error::InvalidConfig(
+                                            "uninstall command cannot be empty".to_owned(),
+                                        ));
+                                    }
+                                }
+                                flow.step = CustomCommandStep::VersionChoice;
                             }
                             CustomCommandStep::VersionChoice => {
                                 flow.current_version =
@@ -6306,6 +6381,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                                         app.language,
                                     )?,
                                     latest,
+                                    uninstall: optional_flow_command(
+                                        flow.uninstall.value.trim(),
+                                        app.language,
+                                    )?,
                                 });
                                 app.save_command_declaration(
                                     &flow.mode,
@@ -6354,6 +6433,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                                 flow.current_version = None;
                             }
                             changed
+                        }
+                        CustomCommandStep::Uninstall => {
+                            handle_text_input_key(&mut flow.uninstall, key)
                         }
                         CustomCommandStep::LatestValue => {
                             let changed = handle_text_input_key(&mut flow.latest_value, key);
@@ -6816,6 +6898,21 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 app.modal = Modal::None;
                 app.start_delete(name);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
+            _ => {}
+        },
+        Modal::ConfirmUninstall { name, command } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if command.is_none() {
+                    app.message = app
+                        .language
+                        .format(message_key!("tui.uninstall_no_command"), &[&name]);
+                    app.modal = Modal::None;
+                    return;
+                }
+                app.modal = Modal::None;
+                app.start_uninstall(name);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
             _ => {}
@@ -7393,6 +7490,7 @@ fn handle_paste(app: &mut App, text: &str) {
                 flow.probe_output.clear();
                 flow.current_version = None;
             }
+            CustomCommandStep::Uninstall => flow.uninstall.insert_text(text),
             CustomCommandStep::LatestValue => {
                 flow.latest_value.insert_text(text);
                 flow.latest_inferred = false;
@@ -7814,6 +7912,39 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('e') | KeyCode::Char('E') => app.open_edit_command(),
+        KeyCode::Char('u') | KeyCode::Char('U') => {
+            if app.running > 0 {
+                app.message = app
+                    .language
+                    .text(message_key!("tui.wait_for_the_current_operation_to_finish"))
+                    .to_owned();
+                return;
+            }
+            let Some(tool) = app.focused_tool() else {
+                app.message = app
+                    .language
+                    .text(message_key!("tui.select_an_installed_tool_first"))
+                    .to_owned();
+                return;
+            };
+            if tool.availability != Availability::Installed {
+                app.message = app
+                    .language
+                    .text(message_key!("tui.select_an_installed_tool_first"))
+                    .to_owned();
+                return;
+            }
+            if tool.uninstall.is_none() {
+                app.message = app
+                    .language
+                    .format(message_key!("tui.uninstall_no_command"), &[&tool.name]);
+                return;
+            }
+            app.modal = Modal::ConfirmUninstall {
+                name: tool.name.clone(),
+                command: tool.uninstall.clone(),
+            };
+        }
         KeyCode::Char('t') | KeyCode::Char('T') => app.open_toml_editor(),
         KeyCode::Char('o') | KeyCode::Char('O') => app.open_toml_in_system_editor(),
         KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -8504,6 +8635,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     CustomCommandStep::Name => &mut flow.name,
                     CustomCommandStep::Update => &mut flow.update,
                     CustomCommandStep::Probe => &mut flow.probe,
+                    CustomCommandStep::Uninstall => &mut flow.uninstall,
                     CustomCommandStep::LatestValue => &mut flow.latest_value,
                     _ => return,
                 };
@@ -8611,6 +8743,7 @@ fn handle_modal_mouse(app: &mut App, mouse: MouseEvent) {
                     CustomCommandStep::Name => &mut flow.name,
                     CustomCommandStep::Update => &mut flow.update,
                     CustomCommandStep::Probe => &mut flow.probe,
+                    CustomCommandStep::Uninstall => &mut flow.uninstall,
                     CustomCommandStep::LatestValue => &mut flow.latest_value,
                     _ => return,
                 };
@@ -8757,6 +8890,7 @@ fn modal_field_is_editable(modal: &Modal, field: usize) -> bool {
             CustomCommandStep::Name
             | CustomCommandStep::Update
             | CustomCommandStep::Probe
+            | CustomCommandStep::Uninstall
             | CustomCommandStep::LatestSource
             | CustomCommandStep::LatestValue => field == 0,
             CustomCommandStep::Confirm => false,
@@ -8794,6 +8928,7 @@ fn modal_cursor_at(app: &App, hitbox: ModalInputHitbox, column: u16) -> Option<u
             CustomCommandStep::Name => &flow.name,
             CustomCommandStep::Update => &flow.update,
             CustomCommandStep::Probe => &flow.probe,
+            CustomCommandStep::Uninstall => &flow.uninstall,
             CustomCommandStep::LatestValue => &flow.latest_value,
             _ => return None,
         },
@@ -10947,6 +11082,20 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     "tool --version",
                     usize::from(inner.width.saturating_sub(20)),
                 )),
+                CustomCommandStep::Uninstall => {
+                    lines.push(modal_input_line(
+                        true,
+                        app.language.text(message_key!("tui.uninstall_command")),
+                        &flow.uninstall,
+                        "tool uninstall",
+                        usize::from(inner.width.saturating_sub(20)),
+                    ));
+                    lines.push(Line::styled(
+                        app.language
+                            .text(message_key!("tui.leave_empty_to_disable_uninstall")),
+                        Style::default().fg(SUBTLE),
+                    ));
+                }
                 CustomCommandStep::VersionChoice => {
                     lines.push(Line::raw(flow.probe_output.clone()));
                     lines.extend(flow.current_versions.iter().enumerate().map(
@@ -11001,6 +11150,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                         labeled_value(
                             app.language.text(message_key!("tui.probe")),
                             flow.probe.value.trim(),
+                            Color::Reset,
+                        ),
+                        labeled_value(
+                            app.language.text(message_key!("tui.uninstall_command")),
+                            if flow.uninstall.value.trim().is_empty() {
+                                app.language.text(message_key!("tui.not_configured"))
+                            } else {
+                                flow.uninstall.value.trim()
+                            },
                             Color::Reset,
                         ),
                         labeled_value(
@@ -11066,6 +11224,14 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     0,
                     app.language.text(message_key!("tui.probe")),
                     &flow.probe,
+                ),
+                CustomCommandStep::Uninstall => register_modal_text_input(
+                    frame,
+                    &mut app.modal_input_hitboxes,
+                    inner,
+                    0,
+                    app.language.text(message_key!("tui.uninstall_command")),
+                    &flow.uninstall,
                 ),
                 CustomCommandStep::LatestValue => register_modal_text_input(
                     frame,
@@ -11837,6 +12003,52 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                     modal_actions(
                         app.language,
                         app.language.text(message_key!("tui.remove")),
+                        app.language.text(message_key!("tui.cancel")),
+                    ),
+                ])
+                .style(Style::default().bg(PANEL_BG))
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+        Modal::ConfirmUninstall { name, command } => {
+            let title = app
+                .language
+                .format(message_key!("tui.uninstall_named"), &[&name]);
+            let inner = modal_panel(frame, area, &title, 74, 12);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        app.language
+                            .text(message_key!("tui.uninstall_the_selected_tool")),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw(""),
+                    labeled_value(
+                        app.language.text(message_key!("tui.name")),
+                        name,
+                        ERROR_COLOR,
+                    ),
+                    labeled_value(
+                        app.language.text(message_key!("tui.uninstall_command")),
+                        command.as_deref().unwrap_or("—"),
+                        ACCENT,
+                    ),
+                    Line::raw(""),
+                    Line::styled(
+                        app.language
+                            .text(message_key!("tui.uninstall_removes_installed_files")),
+                        Style::default().fg(SUBTLE),
+                    ),
+                    Line::styled(
+                        app.language
+                            .text(message_key!("tui.uninstalled_tools_keep_their_declaration")),
+                        Style::default().fg(SUBTLE),
+                    ),
+                    Line::raw(""),
+                    modal_actions(
+                        app.language,
+                        app.language.text(message_key!("tui.uninstall")),
                         app.language.text(message_key!("tui.cancel")),
                     ),
                 ])
@@ -13313,11 +13525,29 @@ fn update_arguments(
     arguments
 }
 
+fn uninstall_arguments(name: &str, config_path: Option<&Path>) -> Vec<String> {
+    let mut arguments = vec![
+        "uninstall".to_owned(),
+        "--background".to_owned(),
+        "auto".to_owned(),
+    ];
+    if let Some(config_path) = config_path {
+        arguments.push("--config".to_owned());
+        arguments.push(config_path.to_string_lossy().into_owned());
+    }
+    arguments.push(name.to_owned());
+    arguments
+}
+
 fn output_was_queued(name: &str, output: &str) -> bool {
     let queued = format!("queued {name}:");
-    let updated = format!("updated {name}:");
+    let settled = [
+        format!("updated {name}:"),
+        format!("uninstalled {name}:"),
+        format!("removed {name}"),
+    ];
     for line in output.lines().rev().map(str::trim) {
-        if line.starts_with(&updated) {
+        if settled.iter().any(|prefix| line.starts_with(prefix)) {
             return false;
         }
         if line.starts_with(&queued) {
@@ -13535,6 +13765,10 @@ fn build_tool_item(
         latest_source: tool.latest,
         latest_probe_id: 0,
         supports_target_version: tool.update_version.is_some(),
+        uninstall: tool
+            .uninstall
+            .as_deref()
+            .map(|command| format_command_parts(command).trim().to_owned()),
         selected: false,
         run_state: RunState::Idle,
         elapsed: None,
@@ -13587,6 +13821,7 @@ fn user_command_spec_from_tool(_name: &str, tool: &Tool) -> UserCommandSpec {
             .chain(tool.probe.args.iter().cloned())
             .collect(),
         latest: tool.latest.clone(),
+        uninstall: tool.uninstall.clone(),
     })
 }
 
@@ -13785,6 +14020,14 @@ fn split_flow_command(input: &str, language: Language) -> Result<Vec<String>> {
     split_command_line(input, language).map_err(Error::Message)
 }
 
+/// Parses an optional command field, where an empty value means "not configured".
+fn optional_flow_command(input: &str, language: Language) -> Result<Option<Vec<String>>> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    split_flow_command(input, language).map(Some)
+}
+
 fn split_command_line(input: &str, language: Language) -> std::result::Result<Vec<String>, String> {
     let mut arguments = Vec::new();
     let mut current = String::new();
@@ -13972,6 +14215,21 @@ mod tests {
             .collect()
     }
 
+    /// Moves the command-tool cursor onto one visible tool row.
+    fn focus_tool_named(app: &mut App, name: &str) {
+        let row = app
+            .tools
+            .iter()
+            .position(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("tool `{name}` is configured"));
+        let position = app
+            .visible_tool_indices
+            .iter()
+            .position(|&visible| visible == row)
+            .unwrap_or_else(|| panic!("tool `{name}` is visible"));
+        app.tool_index = position;
+    }
+
     #[test]
     fn startup_loading_screen_renders_progress_before_tools_are_ready() {
         use ratatui::backend::TestBackend;
@@ -14123,6 +14381,7 @@ mod tests {
                 package: name.to_owned(),
             }),
             latest_probe_id: 0,
+            uninstall: None,
             supports_target_version: false,
             availability,
             kind: ToolKind::BuiltIn,
@@ -15119,6 +15378,7 @@ mod tests {
             latest_version: VersionState::Unavailable,
             latest_source: None,
             latest_probe_id: 0,
+            uninstall: None,
             supports_target_version: false,
             availability: Availability::Installed,
             kind: ToolKind::BuiltIn,
@@ -15615,6 +15875,7 @@ mod tests {
                 latest_version: VersionState::Unavailable,
                 latest_source: None,
                 latest_probe_id: 0,
+                uninstall: None,
                 supports_target_version: false,
                 availability: Availability::Installed,
                 kind: ToolKind::BuiltIn,
@@ -15631,6 +15892,7 @@ mod tests {
                 latest_version: VersionState::Unavailable,
                 latest_source: None,
                 latest_probe_id: 0,
+                uninstall: None,
                 supports_target_version: false,
                 availability: Availability::Missing,
                 kind: ToolKind::BuiltIn,
@@ -15702,6 +15964,7 @@ mod tests {
                 latest_version: VersionState::Unavailable,
                 latest_source: None,
                 latest_probe_id: 0,
+                uninstall: None,
                 supports_target_version: false,
                 availability: Availability::Missing,
                 kind: ToolKind::BuiltIn,
@@ -15718,6 +15981,7 @@ mod tests {
                 latest_version: VersionState::Unavailable,
                 latest_source: None,
                 latest_probe_id: 0,
+                uninstall: None,
                 supports_target_version: false,
                 availability: Availability::Installed,
                 kind: ToolKind::BuiltIn,
@@ -15790,6 +16054,7 @@ mod tests {
                 latest_version: VersionState::Unavailable,
                 latest_source: None,
                 latest_probe_id: 0,
+                uninstall: None,
                 supports_target_version: false,
                 availability: Availability::Installed,
                 kind: ToolKind::BuiltIn,
@@ -16716,6 +16981,14 @@ mod tests {
         assert!(!output_was_queued(
             "example",
             "the word queued in ordinary output\nupdated example: command"
+        ));
+        assert!(!output_was_queued(
+            "example",
+            "queued example: text from the tool\nuninstalled example: brew uninstall example"
+        ));
+        assert!(!output_was_queued(
+            "example",
+            "queued example: text from the tool\nremoved example"
         ));
     }
 
@@ -18024,6 +18297,78 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_steps_round_trip_through_the_custom_command_flow() {
+        assert_eq!(
+            optional_flow_command("  ", Language::English).expect("blank stays unset"),
+            None
+        );
+        assert_eq!(
+            optional_flow_command("tool remove --purge", Language::English)
+                .expect("parse uninstall command"),
+            Some(vec![
+                "tool".to_owned(),
+                "remove".to_owned(),
+                "--purge".to_owned()
+            ])
+        );
+
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state.clone(), None).expect("app");
+        let mut flow = CustomCommandFlow::new(DeclarationMode::Add);
+        flow.name = TextInput::new("example".to_owned());
+        flow.update = TextInput::new("example upgrade".to_owned());
+        flow.probe = TextInput::new("example --version".to_owned());
+        flow.uninstall = TextInput::new("example remove --purge".to_owned());
+        flow.step = CustomCommandStep::Confirm;
+        app.modal = Modal::CustomCommandFlow(flow);
+
+        handle_modal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None));
+        let saved = UserConfig::load(&state.custom_config_path()).expect("saved declaration");
+        let UserCommandSpec::Custom(spec) = saved.commands.get("example").expect("saved command")
+        else {
+            panic!("a custom flow saves a custom declaration");
+        };
+        assert_eq!(
+            spec.uninstall
+                .as_deref()
+                .map(|command| command.join(" "))
+                .as_deref(),
+            Some("example remove --purge")
+        );
+    }
+
+    #[test]
+    fn editing_a_custom_command_prefills_its_uninstall_command() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        state.ensure().expect("state directory");
+        UserConfig::parse(concat!(
+            "[commands.example]\n",
+            "type = \"custom\"\n",
+            "update = [\"example\", \"upgrade\"]\n",
+            "probe = [\"example\", \"--version\"]\n",
+            "uninstall = [\"example\", \"remove\"]\n",
+        ))
+        .expect("parse declaration")
+        .save(&state.custom_config_path())
+        .expect("seed declaration");
+        let mut app = App::new(state, None).expect("app");
+        focus_tool_named(&mut app, "example");
+
+        app.open_edit_command();
+
+        assert!(matches!(
+            &app.modal,
+            Modal::CustomCommandFlow(flow)
+                if flow.uninstall.value == "example remove"
+                    && flow.step == CustomCommandStep::Name
+        ));
+    }
+
+    #[test]
     fn stale_package_resolution_is_discarded_after_pasted_identity_change() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -18289,6 +18634,7 @@ mod tests {
                 ],
                 probe: vec![update_program.display().to_string(), "--version".to_owned()],
                 latest: None,
+                uninstall: None,
             }),
         )
         .expect("save command without executing it");
@@ -18478,6 +18824,138 @@ mod tests {
         );
         assert!(matches!(app.modal, Modal::None));
         assert!(app.message.starts_with("Could not read dvup declarations"));
+    }
+
+    #[test]
+    fn uninstall_shortcut_confirms_a_declared_removal_command() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        focus_tool_named(&mut app, "rustup");
+
+        handle_command_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+
+        match &app.modal {
+            Modal::ConfirmUninstall { name, command } => {
+                assert_eq!(name, "rustup");
+                assert_eq!(
+                    command.as_deref(),
+                    Some("rustup self uninstall -y"),
+                    "the confirmation shows the command dvup will run"
+                );
+            }
+            _ => panic!("expected the uninstall confirmation"),
+        }
+        let screen = render_test_screen(&mut app, 120, 30);
+        assert!(screen.contains("Uninstall rustup"), "screen: {screen}");
+        assert!(
+            screen.contains("rustup self uninstall -y"),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn uninstall_shortcut_explains_a_missing_removal_command() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        focus_tool_named(&mut app, "bun");
+
+        handle_command_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.message, "No uninstall command is configured for bun");
+    }
+
+    #[test]
+    fn uninstall_shortcut_requires_an_installed_tool() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.settings.hide_unsupported_and_missing_tools = false;
+        focus_tool_named(&mut app, "rustup");
+        let index = app
+            .tools
+            .iter()
+            .position(|tool| tool.name == "rustup")
+            .expect("rustup row");
+        app.tools[index].availability = Availability::Missing;
+        app.rebuild_visible_tool_indices(Some("rustup"));
+
+        handle_command_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.message, "Select an installed tool first");
+    }
+
+    #[test]
+    fn confirming_the_uninstall_modal_starts_one_operation() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::ConfirmUninstall {
+            name: "rustup".to_owned(),
+            command: Some("rustup self uninstall -y".to_owned()),
+        };
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.running, 1);
+        assert!(app.activity.iter().any(|line| line.contains("rustup")));
+        let tool = app
+            .tools
+            .iter()
+            .find(|tool| tool.name == "rustup")
+            .expect("rustup row");
+        assert_eq!(tool.run_state, RunState::Running);
+    }
+
+    #[test]
+    fn cancelling_the_uninstall_modal_changes_nothing() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        app.modal = Modal::ConfirmUninstall {
+            name: "rustup".to_owned(),
+            command: Some("rustup self uninstall -y".to_owned()),
+        };
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.running, 0);
+    }
+
+    #[test]
+    fn uninstall_arguments_target_the_same_declaration() {
+        assert_eq!(
+            uninstall_arguments("rustup", None),
+            ["uninstall", "--background", "auto", "rustup"]
+        );
+        assert_eq!(
+            uninstall_arguments("rustup", Some(Path::new("configs/tools.toml"))),
+            [
+                "uninstall",
+                "--background",
+                "auto",
+                "--config",
+                "configs/tools.toml",
+                "rustup"
+            ]
+        );
     }
 
     #[test]

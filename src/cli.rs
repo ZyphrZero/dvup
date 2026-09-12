@@ -123,6 +123,20 @@ enum Commands {
         execution: ExecutionOptions,
     },
 
+    /// Uninstall one installed tool through its own package manager or removal command.
+    Uninstall {
+        /// Built-in or configured tool name.
+        tool: String,
+        /// Also delete this tool's declaration from the user manifest.
+        #[arg(long)]
+        purge: bool,
+        /// Explicit user manifest layered on built-ins; otherwise use global dvup_custom.toml.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(flatten)]
+        execution: ExecutionOptions,
+    },
+
     /// Update dvup itself from crates.io in a detached worker.
     SelfUpdate {
         /// Reinstall even when the installed version is already current.
@@ -242,23 +256,12 @@ pub fn run(cli: Cli) -> Result<u8> {
                 );
             }
             let tool = tool.expect("tool is present after all-tools branch");
-            let mut definition = manifest
-                .tools
-                .get(&tool)
-                .cloned()
-                .ok_or_else(|| Error::ToolNotFound(tool.clone()))?;
-            if !definition.supports_current_platform() {
-                return Err(Error::Message(format!(
-                    "tool `{tool}` is not enabled on {}",
-                    std::env::consts::OS
-                )));
-            }
+            let mut definition = require_tool(&manifest, &working_directory, &tool, "updated")?;
             if let Some(version) = target_version.as_deref() {
                 let (program, args) = definition.update_for_version(&tool, version)?;
                 definition.program = program;
                 definition.args = args;
             }
-            ensure_tool_ready(&tool, &definition, &working_directory)?;
             let background = effective_background(execution.background, definition.background);
             definition.args.extend(extra_args);
             let mut job = Job::from_tool(
@@ -272,6 +275,32 @@ pub fn run(cli: Cli) -> Result<u8> {
             }
             execute(job, background, state)
         }
+        Some(Commands::Uninstall {
+            tool,
+            purge,
+            config,
+            execution,
+        }) => {
+            let (manifest, working_directory, _) = load_manifest(config.clone(), &state)?;
+            let definition = require_installed_tool(&manifest, &working_directory, &tool)?;
+            let (uninstall_program, uninstall_args) = definition.uninstall_command(&tool)?;
+            let background = effective_background(execution.background, definition.background);
+            let mut job = Job::from_tool_with_command(
+                tool.clone(),
+                definition,
+                working_directory,
+                settings.network.clone(),
+                (uninstall_program, uninstall_args),
+            );
+            if execution.terminate_locking_processes {
+                job.terminate_waiting_processes()?;
+            }
+            let code = execute_with_outcome(job, background, state.clone(), "uninstalled")?;
+            if purge {
+                purge_tool_declaration(&state, config.as_deref(), &tool)?;
+            }
+            Ok(code)
+        }
         Some(Commands::SelfUpdate { force }) => {
             let mut definition = Config::starter()
                 .tools
@@ -281,7 +310,7 @@ pub fn run(cli: Cli) -> Result<u8> {
                 definition.args.push("--force".to_owned());
             }
             let working_directory = std::env::current_dir()?;
-            ensure_tool_ready("dvup", &definition, &working_directory)?;
+            ensure_tool_ready("dvup", &definition, &working_directory, "updated")?;
             let job = Job::from_tool(
                 "dvup".to_owned(),
                 definition,
@@ -327,6 +356,7 @@ pub fn run(cli: Cli) -> Result<u8> {
                 },
                 latest: None,
                 update_version: None,
+                uninstall: None,
                 background: ToolBackground::Auto,
                 processes,
                 lock_timeout_secs,
@@ -359,7 +389,12 @@ fn should_update_all(explicit_all: bool, tool: &Option<String>) -> bool {
     explicit_all || tool.is_none()
 }
 
-fn ensure_tool_ready(name: &str, tool: &Tool, working_directory: &std::path::Path) -> Result<()> {
+fn ensure_tool_ready(
+    name: &str,
+    tool: &Tool,
+    working_directory: &std::path::Path,
+    verb: &str,
+) -> Result<()> {
     match command::tool_readiness(tool, working_directory) {
         command::ToolReadiness::Installed => Ok(()),
         command::ToolReadiness::TargetMissing => Err(Error::Message(format!(
@@ -367,7 +402,7 @@ fn ensure_tool_ready(name: &str, tool: &Tool, working_directory: &std::path::Pat
             tool.probe.program
         ))),
         command::ToolReadiness::UpdaterMissing => Err(Error::Message(format!(
-            "tool `{name}` cannot be updated because `{}` is not installed or not on PATH",
+            "tool `{name}` cannot be {verb} because `{}` is not installed or not on PATH",
             tool.program
         ))),
         command::ToolReadiness::Unsupported => Err(Error::Message(format!(
@@ -375,6 +410,96 @@ fn ensure_tool_ready(name: &str, tool: &Tool, working_directory: &std::path::Pat
             std::env::consts::OS
         ))),
     }
+}
+
+/// Resolves one configured tool and rejects a platform the tool does not support.
+fn require_tool(
+    manifest: &Config,
+    working_directory: &std::path::Path,
+    name: &str,
+    verb: &str,
+) -> Result<Tool> {
+    let definition = manifest
+        .tools
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Error::ToolNotFound(name.to_owned()))?;
+    if !definition.supports_current_platform() {
+        return Err(Error::Message(format!(
+            "tool `{name}` is not enabled on {}",
+            std::env::consts::OS
+        )));
+    }
+    ensure_tool_ready(name, &definition, working_directory, verb)?;
+    Ok(definition)
+}
+
+/// Resolves one tool for removal. The update program is irrelevant here, so a
+/// missing package manager never blocks uninstalling the tool it installed.
+fn require_installed_tool(
+    manifest: &Config,
+    working_directory: &std::path::Path,
+    name: &str,
+) -> Result<Tool> {
+    let definition = manifest
+        .tools
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Error::ToolNotFound(name.to_owned()))?;
+    if !definition.supports_current_platform() {
+        return Err(Error::Message(format!(
+            "tool `{name}` is not enabled on {}",
+            std::env::consts::OS
+        )));
+    }
+    if command::tool_readiness(&definition, working_directory)
+        == command::ToolReadiness::TargetMissing
+    {
+        return Err(Error::Message(format!(
+            "tool `{name}` is not installed or `{}` is not on PATH",
+            definition.probe.program
+        )));
+    }
+    Ok(definition)
+}
+
+/// Removes one user-authored declaration, leaving built-in presets untouched.
+fn purge_tool_declaration(
+    state: &StateDirs,
+    config_path: Option<&std::path::Path>,
+    name: &str,
+) -> Result<()> {
+    if let Some(path) = config_path {
+        let mut custom = UserConfig::load(path)?;
+        if custom.commands.remove(name).is_some() {
+            custom.save(path)?;
+            println!("purged {name} from {}", path.display());
+        } else {
+            println!(
+                "nothing to purge: {} does not declare `{name}`",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let path = state.custom_config_path();
+    if !path.is_file() {
+        println!("nothing to purge: {name} is a built-in preset");
+        return Ok(());
+    }
+    let mut custom = UserConfig::load(&path)?;
+    if custom.commands.remove(name).is_none() {
+        println!("nothing to purge: {name} is a built-in preset");
+        return Ok(());
+    }
+    if custom.is_empty() {
+        fs::remove_file(&path)?;
+    } else {
+        custom.save(&path)?;
+    }
+    println!("purged {name} from {}", path.display());
+    Ok(())
 }
 
 fn effective_background(requested: BackgroundMode, configured: ToolBackground) -> BackgroundMode {
@@ -800,6 +925,15 @@ fn init(state: &StateDirs, path: Option<PathBuf>, force: bool) -> Result<u8> {
 }
 
 fn execute(job: Job, mode: BackgroundMode, state: StateDirs) -> Result<u8> {
+    execute_with_outcome(job, mode, state, "updated")
+}
+
+fn execute_with_outcome(
+    job: Job,
+    mode: BackgroundMode,
+    state: StateDirs,
+    outcome: &str,
+) -> Result<u8> {
     let store = JobStore::new(state.clone())?;
     detach::cleanup_workers(store.dirs())?;
     let name = job.name.clone();
@@ -809,7 +943,7 @@ fn execute(job: Job, mode: BackgroundMode, state: StateDirs) -> Result<u8> {
         Ok(success) => {
             write_captured_output(&success.stdout, &success.stderr)?;
             match success.kind {
-                ExecutionKind::Updated => println!("updated {name}: {command_display}"),
+                ExecutionKind::Updated => println!("{outcome} {name}: {command_display}"),
                 ExecutionKind::Queued { job_id, reason } => {
                     println!("queued {name}: {reason}");
                     println!("job: {job_id}");
@@ -1526,6 +1660,7 @@ mod tests {
                 update: vec![marker.display().to_string()],
                 probe: vec!["rustc".to_owned(), "--version".to_owned()],
                 latest: None,
+                uninstall: None,
             }))
         );
         assert!(saved.github.monitors.is_empty());
@@ -1563,5 +1698,95 @@ install = { type = "user_directory" }
         let reloaded = UserConfig::load(&path).expect("GitHub partition remains");
         assert!(reloaded.commands.is_empty());
         assert!(reloaded.github.monitors.contains_key("example"));
+    }
+
+    #[test]
+    fn parses_uninstall_for_one_tool() {
+        let cli = Cli::try_parse_from(["dvup", "uninstall", "codex"]).expect("parse uninstall");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Uninstall {
+                tool,
+                purge: false,
+                config: None,
+                ..
+            }) if tool == "codex"
+        ));
+    }
+
+    #[test]
+    fn parses_uninstall_purge_and_execution_options() {
+        let cli = Cli::try_parse_from([
+            "dvup",
+            "uninstall",
+            "codex",
+            "--purge",
+            "--terminate-locking-processes",
+            "--background",
+            "always",
+            "--config",
+            "tools.toml",
+        ])
+        .expect("parse uninstall options");
+
+        match cli.command {
+            Some(Commands::Uninstall {
+                tool,
+                purge,
+                config,
+                execution,
+            }) => {
+                assert_eq!(tool, "codex");
+                assert!(purge);
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("tools.toml")));
+                assert!(execution.terminate_locking_processes);
+                assert!(matches!(execution.background, BackgroundMode::Always));
+            }
+            _ => panic!("expected uninstall command"),
+        }
+    }
+
+    #[test]
+    fn uninstall_requires_exactly_one_tool() {
+        assert!(Cli::try_parse_from(["dvup", "uninstall"]).is_err());
+    }
+
+    #[test]
+    fn uninstall_rejects_a_tool_without_an_uninstall_command() {
+        let tool = Tool::custom("example", "example".to_owned(), vec!["upgrade".to_owned()]);
+        let error = tool
+            .uninstall_command("example")
+            .expect_err("undeclared uninstall must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not declare an uninstall command")
+        );
+    }
+
+    #[test]
+    fn package_declarations_expose_a_manager_uninstall_command() {
+        let declaration = concat!(
+            "[commands.ripgrep]\n",
+            "type = \"package\"\n",
+            "manager = \"homebrew\"\n",
+            "package = \"ripgrep\"\n",
+            "executable = \"ripgrep\"\n",
+        );
+        let install_root = std::env::current_dir().expect("current directory");
+        let manifest = UserConfig::parse(declaration)
+            .expect("parse package declaration")
+            .resolve_with_install_root(&install_root)
+            .expect("compile package declaration");
+        let tool = manifest
+            .tools
+            .get("ripgrep")
+            .expect("compiled package tool");
+
+        let (program, args) = tool.uninstall_command("ripgrep").expect("manager template");
+        assert_eq!(program, "brew");
+        assert_eq!(args, ["uninstall", "ripgrep"]);
     }
 }

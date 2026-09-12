@@ -103,9 +103,32 @@ impl Job {
         working_directory: PathBuf,
         network: NetworkSettings,
     ) -> Self {
+        Self::from_tool_command(name, tool, working_directory, network, None)
+    }
+
+    /// Creates a durable job for a tool while substituting the executed command,
+    /// for example the uninstall command of the same declaration.
+    pub(crate) fn from_tool_with_command(
+        name: String,
+        tool: Tool,
+        working_directory: PathBuf,
+        network: NetworkSettings,
+        command: (String, Vec<String>),
+    ) -> Self {
+        Self::from_tool_command(name, tool, working_directory, network, Some(command))
+    }
+
+    fn from_tool_command(
+        name: String,
+        tool: Tool,
+        working_directory: PathBuf,
+        network: NetworkSettings,
+        command: Option<(String, Vec<String>)>,
+    ) -> Self {
         let now = now_unix_ms();
         let process_rules = tool.processes;
         let resource_group = tool.resource_group.unwrap_or_else(|| name.clone());
+        let (program, args) = command.unwrap_or((tool.program, tool.args));
         Self {
             schema_version: JOB_SCHEMA_VERSION,
             id: new_job_id(now),
@@ -113,8 +136,8 @@ impl Job {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             command: CommandSpec {
-                program: tool.program,
-                args: tool.args,
+                program,
+                args,
                 working_directory,
             },
             network,
@@ -286,6 +309,7 @@ mod tests {
             },
             latest: None,
             update_version: None,
+            uninstall: None,
             background: crate::config::ToolBackground::Auto,
             processes: vec![ProcessRule::wait("node".to_owned())],
             lock_timeout_secs: 10,
@@ -294,6 +318,29 @@ mod tests {
             platforms: Vec::new(),
             resource_group: None,
         }
+    }
+
+    #[test]
+    fn substituted_command_keeps_the_tool_policy() {
+        let mut tool = test_tool();
+        tool.uninstall = Some(vec!["npm".to_owned(), "uninstall".to_owned()]);
+        let job = Job::from_tool_with_command(
+            "npm-package".to_owned(),
+            tool,
+            PathBuf::from("."),
+            NetworkSettings::default(),
+            (
+                "npm".to_owned(),
+                vec!["uninstall".to_owned(), "--global".to_owned()],
+            ),
+        );
+
+        assert_eq!(job.command.program, "npm");
+        assert_eq!(job.command.args, ["uninstall", "--global"]);
+        assert_eq!(job.process_rules.len(), 1);
+        assert_eq!(job.process_rules[0].name, "node");
+        assert_eq!(job.resource_group, "npm-package");
+        assert_eq!(job.retries, 2);
     }
 
     #[test]

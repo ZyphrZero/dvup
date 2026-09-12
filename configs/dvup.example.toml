@@ -7,6 +7,7 @@ program = "cargo"
 args = ["install", "dvup", "--locked"]
 latest = { provider = "crates_io", package = "dvup" }
 update_version = ["cargo", "install", "dvup", "--version", "{version}", "--locked"]
+uninstall = ["cargo", "uninstall", "dvup"]
 background = "always"
 resource_group = "cargo-bin"
 
@@ -38,6 +39,7 @@ args = ["--version"]
 program = "brew"
 args = ["update"]
 latest = { provider = "github_release", repository = "Homebrew/brew" }
+uninstall = ["brew", "uninstall", "brew"]
 platforms = ["macos", "linux"]
 resource_group = "homebrew"
 background = "auto"
@@ -50,6 +52,7 @@ args = ["--version"]
 program = "rustup"
 args = ["update"]
 latest = { provider = "github_tag", repository = "rust-lang/rustup" }
+uninstall = ["rustup", "self", "uninstall", "-y"]
 background = "auto"
 
 [[tools.rustup.processes]]
@@ -68,6 +71,7 @@ args = ["--version"]
 program = "scoop"
 args = ["update"]
 latest = { provider = "github_release", repository = "ScoopInstaller/Scoop" }
+uninstall = ["scoop", "uninstall", "scoop"]
 platforms = ["windows"]
 resource_group = "scoop"
 background = "auto"
@@ -127,6 +131,7 @@ args = ["--version"]
 program = "mise"
 args = ["self-update"]
 latest = { provider = "github_release", repository = "jdx/mise" }
+uninstall = ["mise", "implode", "--yes"]
 resource_group = "mise"
 background = "auto"
 

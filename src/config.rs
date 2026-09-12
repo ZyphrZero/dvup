@@ -198,6 +198,18 @@ impl PackageManager {
         }
     }
 
+    /// The deterministic removal command for one package of this manager.
+    pub(crate) fn uninstall_command(self, package: &str) -> Vec<String> {
+        match self {
+            Self::Homebrew => command_parts(&["brew", "uninstall", package]),
+            Self::Npm => command_parts(&["npm", "uninstall", "--global", package]),
+            Self::Pnpm => command_parts(&["pnpm", "remove", "--global", package]),
+            Self::Cargo => command_parts(&["cargo", "uninstall", package]),
+            Self::Pipx => command_parts(&["pipx", "uninstall", package]),
+            Self::Uv => command_parts(&["uv", "tool", "uninstall", package]),
+        }
+    }
+
     pub(crate) fn latest_source(self, package: &str) -> LatestVersionSource {
         match self {
             Self::Homebrew => LatestVersionSource::Homebrew {
@@ -266,6 +278,9 @@ pub struct CustomCommandSpec {
     pub(crate) probe: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) latest: Option<LatestVersionSource>,
+    /// Explicit removal command; package declarations derive theirs from the manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uninstall: Option<Vec<String>>,
 }
 
 /// GitHub Release declarations keyed by their monitor name.
@@ -750,6 +765,9 @@ pub struct Tool {
     pub latest: Option<LatestVersionSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_version: Option<Vec<String>>,
+    /// Explicit command that removes the installed tool; omitted means it cannot be uninstalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uninstall: Option<Vec<String>>,
     pub background: ToolBackground,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<ProcessRule>,
@@ -962,6 +980,7 @@ impl Tool {
             },
             latest: None,
             update_version: None,
+            uninstall: None,
             background: ToolBackground::Auto,
             processes: vec![ProcessRule::wait(name.to_owned())],
             lock_timeout_secs: default_lock_timeout_secs(),
@@ -985,6 +1004,16 @@ impl Tool {
             .map(|part| part.replace("{version}", version))
             .collect();
         split_user_command(name, "update_version", command)
+    }
+
+    /// Builds the removal command, or explains why this tool cannot be uninstalled.
+    pub fn uninstall_command(&self, name: &str) -> Result<(String, Vec<String>)> {
+        let command = self.uninstall.clone().ok_or_else(|| {
+            Error::Message(format!(
+                "tool `{name}` does not declare an uninstall command; add `uninstall = [\"manager\", \"remove\", \"package\"]` to its declaration"
+            ))
+        })?;
+        split_user_command(name, "uninstall", command)
     }
 
     /// Returns whether this tool is enabled on the current operating system.
@@ -1047,6 +1076,11 @@ impl CommandSpec {
                 }
                 let update = spec.manager.update_command(&spec.package);
                 let (program, args) = split_user_command(name, "update", update)?;
+                let uninstall = split_user_command(
+                    name,
+                    "uninstall",
+                    spec.manager.uninstall_command(&spec.package),
+                )?;
                 Tool {
                     program,
                     args,
@@ -1056,6 +1090,11 @@ impl CommandSpec {
                     },
                     latest: Some(spec.manager.latest_source(&spec.package)),
                     update_version: spec.manager.update_version_command(&spec.package),
+                    uninstall: Some(
+                        std::iter::once(uninstall.0)
+                            .chain(uninstall.1)
+                            .collect::<Vec<_>>(),
+                    ),
                     background: ToolBackground::Auto,
                     processes: vec![ProcessRule::wait(spec.executable.clone())],
                     lock_timeout_secs: default_lock_timeout_secs(),
@@ -1077,6 +1116,14 @@ impl CommandSpec {
                 let (program, args) = split_user_command(name, "update", spec.update.clone())?;
                 let (probe_program, probe_args) =
                     split_user_command(name, "probe", spec.probe.clone())?;
+                let uninstall = spec
+                    .uninstall
+                    .clone()
+                    .map(|command| split_user_command(name, "uninstall", command))
+                    .transpose()?
+                    .map(|(program, args)| {
+                        std::iter::once(program).chain(args).collect::<Vec<_>>()
+                    });
                 let resource_group = inferred_resource_group(&program).map(str::to_owned);
                 Tool {
                     program,
@@ -1087,6 +1134,7 @@ impl CommandSpec {
                     },
                     latest: spec.latest.clone(),
                     update_version: None,
+                    uninstall,
                     background: ToolBackground::Auto,
                     processes: vec![ProcessRule::wait(probe_program)],
                     lock_timeout_secs: default_lock_timeout_secs(),
@@ -1101,6 +1149,9 @@ impl CommandSpec {
             latest.validate(&format!("command `{name}`"))?;
         }
         validate_update_version_template(name, tool.update_version.as_deref())?;
+        if let Some(uninstall) = &tool.uninstall {
+            validate_argv_command(name, "uninstall", uninstall)?;
+        }
         Ok(tool)
     }
 
@@ -1109,6 +1160,7 @@ impl CommandSpec {
             update,
             probe: vec![name.to_owned(), "--version".to_owned()],
             latest: None,
+            uninstall: None,
         })
     }
 }
@@ -1359,6 +1411,9 @@ impl Config {
                 latest.validate(&format!("tool `{name}`"))?;
             }
             validate_update_version_template(name, tool.update_version.as_deref())?;
+            if let Some(uninstall) = &tool.uninstall {
+                validate_argv_command(name, "uninstall", uninstall)?;
+            }
             if tool.lock_timeout_secs == 0 {
                 return Err(Error::InvalidConfig(format!(
                     "tool `{name}` must have lock_timeout_secs greater than zero"
@@ -1410,6 +1465,10 @@ fn split_user_command(
         )));
     }
     Ok((program.clone(), args.to_vec()))
+}
+
+fn validate_argv_command(name: &str, field: &str, command: &[String]) -> Result<()> {
+    split_user_command(name, field, command.to_vec()).map(|_| ())
 }
 
 fn validate_update_version_template(name: &str, template: Option<&[String]>) -> Result<()> {
@@ -1599,6 +1658,115 @@ mod tests {
         );
         assert!(!STARTER_TEMPLATE.contains("[tools.scoop-zedg]"));
         assert!(!STARTER_TEMPLATE.contains("[tools.example]"));
+    }
+
+    #[test]
+    fn starter_presets_declare_only_their_documented_uninstall_commands() {
+        let tools = Config::starter().tools;
+        let uninstall = |name: &str| {
+            tools
+                .get(name)
+                .unwrap_or_else(|| panic!("starter preset `{name}`"))
+                .uninstall
+                .clone()
+                .map(|command| command.join(" "))
+        };
+
+        assert_eq!(uninstall("dvup").as_deref(), Some("cargo uninstall dvup"));
+        assert_eq!(
+            uninstall("rustup").as_deref(),
+            Some("rustup self uninstall -y")
+        );
+        assert_eq!(uninstall("brew").as_deref(), Some("brew uninstall brew"));
+        assert_eq!(uninstall("scoop").as_deref(), Some("scoop uninstall scoop"));
+        assert_eq!(uninstall("mise").as_deref(), Some("mise implode --yes"));
+        for name in ["bun", "uv", "deno", "pixi"] {
+            assert!(
+                uninstall(name).is_none(),
+                "`{name}` has no deterministic removal command"
+            );
+        }
+    }
+
+    #[test]
+    fn every_package_manager_compiles_a_matching_uninstall_command() {
+        let cases = [
+            (
+                PackageManager::Homebrew,
+                vec!["brew", "uninstall", "example"],
+            ),
+            (
+                PackageManager::Npm,
+                vec!["npm", "uninstall", "--global", "example"],
+            ),
+            (
+                PackageManager::Pnpm,
+                vec!["pnpm", "remove", "--global", "example"],
+            ),
+            (PackageManager::Cargo, vec!["cargo", "uninstall", "example"]),
+            (PackageManager::Pipx, vec!["pipx", "uninstall", "example"]),
+            (
+                PackageManager::Uv,
+                vec!["uv", "tool", "uninstall", "example"],
+            ),
+        ];
+
+        for (manager, expected) in cases {
+            assert_eq!(manager.uninstall_command("example"), expected);
+        }
+    }
+
+    #[test]
+    fn custom_declarations_carry_an_optional_uninstall_command() {
+        let declaration = concat!(
+            "[commands.example]\n",
+            "type = \"custom\"\n",
+            "update = [\"example\", \"upgrade\"]\n",
+            "probe = [\"example\", \"--version\"]\n",
+            "uninstall = [\"example\", \"remove\", \"--purge\"]\n",
+        );
+        let install_root = std::env::current_dir().expect("current directory");
+        let tool = UserConfig::parse(declaration)
+            .expect("parse custom declaration")
+            .resolve_with_install_root(&install_root)
+            .expect("compile custom declaration")
+            .tools
+            .remove("example")
+            .expect("compiled custom tool");
+
+        assert_eq!(
+            tool.uninstall_command("example").expect("declared command"),
+            (
+                "example".to_owned(),
+                vec!["remove".to_owned(), "--purge".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_blank_uninstall_commands() {
+        for declaration in [
+            concat!(
+                "[commands.example]\n",
+                "type = \"custom\"\n",
+                "update = [\"example\", \"upgrade\"]\n",
+                "probe = [\"example\", \"--version\"]\n",
+                "uninstall = []\n",
+            ),
+            concat!(
+                "[commands.example]\n",
+                "type = \"custom\"\n",
+                "update = [\"example\", \"upgrade\"]\n",
+                "probe = [\"example\", \"--version\"]\n",
+                "uninstall = [\"  \"]\n",
+            ),
+        ] {
+            let error = UserConfig::parse(declaration).expect_err("blank uninstall must fail");
+            assert!(
+                error.to_string().contains("uninstall"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1971,12 +2139,14 @@ install = { type = "user_directory" }
                 update: vec!["example".to_owned(), "upgrade".to_owned()],
                 probe: vec!["example".to_owned(), "--version".to_owned()],
                 latest: Some(source.clone()),
+                uninstall: None,
             })
             .compile("example")
             .expect("compile custom declaration");
 
             assert_eq!(tool.latest, Some(source));
             assert!(tool.update_version.is_none());
+            assert!(tool.uninstall.is_none());
         }
 
         assert!(
@@ -1986,6 +2156,7 @@ install = { type = "user_directory" }
                 latest: Some(LatestVersionSource::Homebrew {
                     formula: "example".to_owned(),
                 }),
+                uninstall: None,
             })
             .compile("example")
             .is_err()
@@ -2155,6 +2326,7 @@ install = { type = "user_directory" }
                     update: vec!["shared".to_owned(), "upgrade".to_owned()],
                     probe: vec!["shared".to_owned(), "--version".to_owned()],
                     latest: None,
+                    uninstall: None,
                 }),
             )
             .expect("save same-named command");
