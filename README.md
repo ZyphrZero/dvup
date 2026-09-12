@@ -60,7 +60,7 @@ dvup doctor               # 诊断 PATH 中的安装冲突
 | `dvup init` | 创建全局用户配置文件 `dvup_custom.toml` |
 | `dvup doctor [tool]` | 诊断重复安装和版本冲突 |
 | `dvup self-update [--force]` | 从 crates.io 更新 dvup 自身 |
-| `dvup jobs [id] [--log]` | 查看后台任务列表或单个任务日志 |
+| `dvup jobs [id] [--log]` | 查看任务列表（含前台执行）或单个任务的日志 |
 | `dvup run -- <command...>` | 以锁感知方式运行任意命令 |
 | `dvup <file.toml>` | 直接在 TUI 中打开并编辑该配置文件 |
 
@@ -97,11 +97,13 @@ dvup uninstall release-tool --purge   # 卸载后同时删除这条用户声明
 
 | 工具类型 | 反安装命令来源 |
 | --- | --- |
-| `type = "package"`（`dvup add` 的包管理器路径、TUI 添加） | 由 manager 模板本地确定：`brew uninstall`、`npm uninstall --global`、`pnpm remove --global`、`cargo uninstall`、`pipx uninstall`、`uv tool uninstall` |
-| `type = "custom"` | 由 `uninstall = [...]` 字段显式声明；没有声明就拒绝卸载并提示如何添加 |
+| `type = "package"`（`dvup add` 的包管理器路径、TUI 添加） | 由 manager 模板本地确定：`brew uninstall`、`npm uninstall --global`、`pnpm remove --global`、`bun remove --global`、`cargo uninstall`、`pipx uninstall`、`uv tool uninstall` |
+| `type = "custom"` | 由 `uninstall = [...]` 字段显式声明；没写字段时，从更新命令推导单包安装的反安装命令（`npm install -g <包>`、`pnpm add -g`、`bun add -g`、`brew install`、`cargo install`、`pipx install`、`uv tool install`），其余形态拒绝卸载并提示如何补充 |
 | 内置预置 | 仅在内置清单里确实存在确定性反安装命令时才提供：`dvup`、`rustup`、`brew`、`scoop`、`mise` |
 
-像 `bun`、`uv`、`deno`、`pixi` 这类只能靠删除安装目录、改 shell 配置或 PATH 才能移除的工具，dvup 不会猜命令——需要的话在声明里写清 `uninstall`。
+推导只认**明确的单包全局安装**：`npm install <包>`（本地安装）、一次装多个包、路径安装都不会被猜成全局卸载。像 `bun`、`uv`、`deno`、`pixi` 这类只能靠删除安装目录、改 shell 配置或 PATH 才能移除的工具，dvup 也不会猜命令——需要的话在声明里写清 `uninstall`。
+
+TUI 里按 `u` 时，确认框会显示将要执行的反安装命令；如果这条命令是推导来的，还会额外标注，提醒你它并不在声明文件里（按 `e` 编辑声明即可写入或用 `uninstall` 覆盖）。
 
 卸载默认**保留配置声明**，工具随后显示为 `missing`，随时可以重新安装或继续更新；只有显式加 `--purge` 才会连声明一起删掉（TUI 里对应 `d` 键，只删声明、不执行反安装命令）。
 
@@ -124,9 +126,9 @@ dvup add codegraph npm install --global @colbymchenry/codegraph@latest
 
 保存前 dvup 会实际运行只读探针（默认 `<name> --version`）确认能取到版本号；更新命令本身不会被预执行。替换同名命令需 `dvup add --force`。
 
-命令按 argv 安全拆分，不经 shell 拼接，支持绝对路径（如 `/opt/homebrew/bin/brew`）。通过 npm/pnpm 添加的命令自动共享 `node-global` 资源组，Homebrew 包共享 `homebrew` 资源组——共享同一安装目录的任务会自动排队，不同资源组之间仍然并行。
+命令按 argv 安全拆分，不经 shell 拼接，支持绝对路径（如 `/opt/homebrew/bin/brew`）。通过 npm/pnpm 添加的命令自动共享 `node-global` 资源组，Bun 全局包用独立的 `bun-global` 资源组（和 npm 的全局目录不是一处），Homebrew 包共享 `homebrew` 资源组——共享同一安装目录的任务会自动排队，不同资源组之间仍然并行。
 
-在 TUI 的 Tools 页按 `c` 还有两条引导路径：**从包管理器添加**（Homebrew/npm/pnpm/Cargo/pipx/uv，经官方 Registry 验证，自动发现可执行文件）和 **AI 分析**（可选，仅提取包管理器和包名，验证流程与手动完全一致）。添加自定义命令的向导里也可以顺手写一条可选的卸载命令，留空表示该命令不支持卸载。
+在 TUI 的 Tools 页按 `c` 还有两条引导路径：**从包管理器添加**（Homebrew/npm/pnpm/Bun/Cargo/pipx/uv，经官方 Registry 验证，自动发现可执行文件）和 **AI 分析**（可选，仅提取包管理器和包名，验证流程与手动完全一致）。添加自定义命令的向导里，能识别出包管理器安装时还会预填一条卸载命令（可改可清空），留空且无法识别时表示该命令不支持卸载。
 
 ## GitHub Release 监控
 
@@ -152,14 +154,16 @@ install = { type = "user_directory" }
 - 终止始终带身份校验（PID + 进程名 + 启动时间），只终止命令行能确认属于目标工具的进程，绝不按名称批量杀进程
 - 遇到 `EBUSY`、文件占用、npm 锁相关 `EPERM` 时自动重试
 
-后台任务用 `dvup jobs` 查看：
+**每一次更新/卸载都是一条持久任务记录**：前台直接跑完的也会记下 `运行中 → 成功/失败` 和完整命令输出，只有撞到占用需要延后的才交给后台 worker 继续（同一个任务 id 从"运行中"变成"等待执行"，完成后变"成功"，全程可追踪）。所以任务列表是执行历史，而不是只显示排队项：
+
+命令**退出码为 0、但输出里仍报告占用或权限错误**时（典型例子：`rustup update` 的 self-update 因为 `rustup.exe` 被占用而失败，但 rustup 仍返回成功），状态会标成 `succeeded (warned)`／`成功（有告警）`，日志里保留原始错误——不会出现"列表说成功、展开却全是 error"的落差。识别同时匹配英文标记与本地化消息里的 `os error 5/32/33`（Windows）或 `os error 13/16/26`（Unix）等系统错误码，中文系统也能判出来。
 
 ```console
-dvup jobs                 # 任务列表
-dvup jobs <job-id> --log  # 单个任务日志
+dvup jobs                 # 任务列表（含前台执行的更新/卸载）
+dvup jobs <job-id> --log  # 单个任务的输出日志
 ```
 
-状态目录位置：Windows `%LOCALAPPDATA%\dvup\data`，Linux `~/.local/share/dvup`，macOS `~/Library/Application Support/dev.dvup`。
+TUI 的 **Jobs** 页同等内容：按 Enter 展开日志，在结果面板里鼠标拖选即可选中，按 `y` 把选区复制到剪贴板，Esc 取消选区。状态目录位置：Windows `%LOCALAPPDATA%\dvup\data`，Linux `~/.local/share/dvup`，macOS `~/Library/Application Support/dev.dvup`。
 
 ## 诊断安装冲突
 

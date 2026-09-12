@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{ProcessAction, ProcessRule, Tool},
+    datetime,
     error::{Error, Result},
     settings::NetworkSettings,
     state::StateDirs,
@@ -52,11 +53,35 @@ pub enum JobStatus {
     },
     Succeeded {
         exit_code: i32,
+        /// Set when the command exited successfully but still reported a locked
+        /// or permission-denied file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<JobWarning>,
     },
     Failed {
         message: String,
         exit_code: Option<i32>,
     },
+}
+
+/// One actionable problem a successful command still reported.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobWarning {
+    Lock,
+    Permission,
+}
+
+impl JobWarning {
+    /// English description used by the CLI and the job log.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Lock => "the command reported a locked file although it exited successfully",
+            Self::Permission => {
+                "the command reported a permission error although it exited successfully"
+            }
+        }
+    }
 }
 
 impl JobStatus {
@@ -66,8 +91,19 @@ impl JobStatus {
             Self::WaitingForLocks { .. } => "waiting_for_locks",
             Self::TerminatingProcesses { .. } => "terminating_processes",
             Self::Running { .. } => "running",
-            Self::Succeeded { .. } => "succeeded",
+            Self::Succeeded { warning, .. } => match warning {
+                Some(_) => "succeeded (warned)",
+                None => "succeeded",
+            },
             Self::Failed { .. } => "failed",
+        }
+    }
+
+    /// The warning a successful command still reported, if any.
+    pub fn warning(&self) -> Option<JobWarning> {
+        match self {
+            Self::Succeeded { warning, .. } => *warning,
+            _ => None,
         }
     }
 
@@ -258,6 +294,11 @@ impl JobStore {
         Ok(())
     }
 
+    /// Appends one timestamped line, the only format the job log uses.
+    pub fn log_line(&self, id: &str, line: &str) -> Result<()> {
+        self.append_log(id, datetime::timestamp_line(line).as_bytes())
+    }
+
     pub fn read_log(&self, id: &str) -> Result<Vec<u8>> {
         let path = self.dirs.log_path(id);
         if !path.exists() {
@@ -310,6 +351,7 @@ mod tests {
             latest: None,
             update_version: None,
             uninstall: None,
+            uninstall_inferred: false,
             background: crate::config::ToolBackground::Auto,
             processes: vec![ProcessRule::wait("node".to_owned())],
             lock_timeout_secs: 10,
@@ -356,13 +398,75 @@ mod tests {
         );
 
         store.save(&job).expect("save pending job");
-        job.set_status(JobStatus::Succeeded { exit_code: 0 });
+        job.set_status(JobStatus::Succeeded {
+            exit_code: 0,
+            warning: None,
+        });
         store.save(&job).expect("save completed job");
 
         let loaded = store.load(&job.id).expect("load job");
         assert!(loaded.status.is_terminal());
         assert_eq!(loaded.resource_group, "npm");
         assert_eq!(store.list().expect("list jobs").len(), 1);
+    }
+
+    #[test]
+    fn success_warnings_round_trip_and_older_jobs_still_parse() {
+        let temporary = TempDir::new().expect("temp dir");
+        let store =
+            JobStore::new(StateDirs::at(temporary.path().to_path_buf())).expect("create store");
+        let mut job = Job::from_tool(
+            "rustup".to_owned(),
+            test_tool(),
+            temporary.path().to_path_buf(),
+            NetworkSettings::default(),
+        );
+        job.set_status(JobStatus::Succeeded {
+            exit_code: 0,
+            warning: Some(JobWarning::Permission),
+        });
+        store.save(&job).expect("save warned job");
+
+        let loaded = store.load(&job.id).expect("load warned job");
+        assert_eq!(loaded.status.warning(), Some(JobWarning::Permission));
+        assert_eq!(loaded.status.label(), "succeeded (warned)");
+        assert!(loaded.status.is_terminal());
+
+        // A job completed before warnings existed keeps loading unchanged.
+        let legacy: JobStatus = serde_json::from_str(r#"{"state":"succeeded","exit_code":0}"#)
+            .expect("legacy succeeded status parses");
+        assert_eq!(legacy.warning(), None);
+
+        let clean = JobStatus::Succeeded {
+            exit_code: 0,
+            warning: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&clean).expect("serialize clean status"),
+            r#"{"state":"succeeded","exit_code":0}"#
+        );
+    }
+
+    #[test]
+    fn log_lines_are_timestamped_and_readable() {
+        let temporary = TempDir::new().expect("temp dir");
+        let store =
+            JobStore::new(StateDirs::at(temporary.path().to_path_buf())).expect("create store");
+
+        store
+            .log_line("timestamp-test", "job started")
+            .expect("write line");
+        store
+            .append_log("timestamp-test", b"raw command output\n")
+            .expect("append output");
+
+        let log = String::from_utf8(store.read_log("timestamp-test").expect("read log"))
+            .expect("utf-8 log");
+        assert!(log.ends_with("raw command output\n"), "log: {log}");
+        assert_eq!(
+            crate::datetime::strip_timestamp_prefix(&log),
+            "job started\nraw command output\n"
+        );
     }
 
     #[test]

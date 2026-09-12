@@ -34,7 +34,9 @@ pub(crate) fn resolve_package_metadata(
     validate_package(package)?;
     let agent = version::network_agent(network, version::NetworkRequestPolicy::Metadata)?;
     let (latest_version, official_executables) = match manager {
-        PackageManager::Npm | PackageManager::Pnpm => fetch_npm_package_metadata(package, &agent)?,
+        PackageManager::Npm | PackageManager::Pnpm | PackageManager::Bun => {
+            fetch_npm_package_metadata(package, &agent)?
+        }
         _ => {
             let source = manager.latest_source(package);
             let latest_version = version::fetch_latest(&source, &agent, None)
@@ -104,7 +106,8 @@ fn discover_installed_executables(manager: PackageManager, package: &str) -> Vec
         PackageManager::Cargo => manager_query("cargo", &["install", "--list"]),
         PackageManager::Pipx => manager_query("pipx", &["list", "--json"]),
         PackageManager::Uv => manager_query("uv", &["tool", "list"]),
-        PackageManager::Npm | PackageManager::Pnpm => None,
+        // Node-family managers keep their global list behind no stable local query.
+        PackageManager::Npm | PackageManager::Pnpm | PackageManager::Bun => None,
     };
     let Some(output) = output else {
         return Vec::new();
@@ -114,7 +117,7 @@ fn discover_installed_executables(manager: PackageManager, package: &str) -> Vec
         PackageManager::Cargo => indented_package_executables(&output, package),
         PackageManager::Pipx => pipx_executables(&output, package),
         PackageManager::Uv => indented_package_executables(&output, package),
-        PackageManager::Npm | PackageManager::Pnpm => Vec::new(),
+        PackageManager::Npm | PackageManager::Pnpm | PackageManager::Bun => Vec::new(),
     };
     candidates
         .into_iter()
@@ -530,7 +533,7 @@ pub(crate) fn verify_command_candidates(
         let result = candidate.validate().and_then(|()| {
             let facts = match candidate.manager {
                 PackageManager::Homebrew => sources.homebrew_formula(&candidate.package),
-                PackageManager::Npm | PackageManager::Pnpm => {
+                PackageManager::Npm | PackageManager::Pnpm | PackageManager::Bun => {
                     sources.npm_package(&candidate.package)
                 }
                 PackageManager::Cargo => sources.crate_package(&candidate.package),

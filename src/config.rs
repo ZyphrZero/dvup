@@ -113,16 +113,18 @@ pub(crate) enum PackageManager {
     Homebrew,
     Npm,
     Pnpm,
+    Bun,
     Cargo,
     Pipx,
     Uv,
 }
 
 impl PackageManager {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Homebrew,
         Self::Npm,
         Self::Pnpm,
+        Self::Bun,
         Self::Cargo,
         Self::Pipx,
         Self::Uv,
@@ -133,6 +135,7 @@ impl PackageManager {
             Self::Homebrew => "homebrew",
             Self::Npm => "npm",
             Self::Pnpm => "pnpm",
+            Self::Bun => "bun",
             Self::Cargo => "cargo",
             Self::Pipx => "pipx",
             Self::Uv => "uv",
@@ -154,6 +157,7 @@ impl PackageManager {
                 command_parts(&["npm", "install", "--global", &format!("{package}@latest")])
             }
             Self::Pnpm => command_parts(&["pnpm", "add", "--global", &format!("{package}@latest")]),
+            Self::Bun => command_parts(&["bun", "add", "--global", &format!("{package}@latest")]),
             Self::Cargo => command_parts(&["cargo", "install", package]),
             Self::Pipx => command_parts(&["pipx", "upgrade", package]),
             Self::Uv => command_parts(&["uv", "tool", "upgrade", package]),
@@ -171,6 +175,12 @@ impl PackageManager {
             ])),
             Self::Pnpm => Some(command_parts(&[
                 "pnpm",
+                "add",
+                "--global",
+                &format!("{package}@{{version}}"),
+            ])),
+            Self::Bun => Some(command_parts(&[
+                "bun",
                 "add",
                 "--global",
                 &format!("{package}@{{version}}"),
@@ -204,6 +214,7 @@ impl PackageManager {
             Self::Homebrew => command_parts(&["brew", "uninstall", package]),
             Self::Npm => command_parts(&["npm", "uninstall", "--global", package]),
             Self::Pnpm => command_parts(&["pnpm", "remove", "--global", package]),
+            Self::Bun => command_parts(&["bun", "remove", "--global", package]),
             Self::Cargo => command_parts(&["cargo", "uninstall", package]),
             Self::Pipx => command_parts(&["pipx", "uninstall", package]),
             Self::Uv => command_parts(&["uv", "tool", "uninstall", package]),
@@ -215,7 +226,7 @@ impl PackageManager {
             Self::Homebrew => LatestVersionSource::Homebrew {
                 formula: package.to_owned(),
             },
-            Self::Npm | Self::Pnpm => LatestVersionSource::Npm {
+            Self::Npm | Self::Pnpm | Self::Bun => LatestVersionSource::Npm {
                 package: package.to_owned(),
             },
             Self::Cargo => LatestVersionSource::CratesIo {
@@ -230,14 +241,16 @@ impl PackageManager {
     pub(crate) fn platforms(self) -> Vec<String> {
         match self {
             Self::Homebrew => vec!["macos".to_owned(), "linux".to_owned()],
-            Self::Npm | Self::Pnpm | Self::Cargo | Self::Pipx | Self::Uv => Vec::new(),
+            Self::Npm | Self::Pnpm | Self::Bun | Self::Cargo | Self::Pipx | Self::Uv => Vec::new(),
         }
     }
 
+    /// Bun owns its own global directory, so it never shares npm's lock.
     pub(crate) const fn resource_group(self) -> &'static str {
         match self {
             Self::Homebrew => "homebrew",
             Self::Npm | Self::Pnpm => "node-global",
+            Self::Bun => "bun-global",
             Self::Cargo => "cargo-global",
             Self::Pipx | Self::Uv => "python-global",
         }
@@ -279,6 +292,9 @@ pub struct CustomCommandSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) latest: Option<LatestVersionSource>,
     /// Explicit removal command; package declarations derive theirs from the manager.
+    ///
+    /// Omitted leaves the removal command to `infer_uninstall_command`, which recognizes
+    /// package-manager installations and ignores everything else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) uninstall: Option<Vec<String>>,
 }
@@ -660,6 +676,10 @@ fn is_enabled(value: &bool) -> bool {
     *value
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GithubReleaseMonitor {
@@ -765,9 +785,13 @@ pub struct Tool {
     pub latest: Option<LatestVersionSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_version: Option<Vec<String>>,
-    /// Explicit command that removes the installed tool; omitted means it cannot be uninstalled.
+    /// Explicit command that removes the installed tool. Omitted leaves it absent
+    /// unless the update command is a recognized package-manager installation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uninstall: Option<Vec<String>>,
+    /// Set when `uninstall` was derived from the update command instead of being declared.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub uninstall_inferred: bool,
     pub background: ToolBackground,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<ProcessRule>,
@@ -981,6 +1005,7 @@ impl Tool {
             latest: None,
             update_version: None,
             uninstall: None,
+            uninstall_inferred: false,
             background: ToolBackground::Auto,
             processes: vec![ProcessRule::wait(name.to_owned())],
             lock_timeout_secs: default_lock_timeout_secs(),
@@ -1010,7 +1035,7 @@ impl Tool {
     pub fn uninstall_command(&self, name: &str) -> Result<(String, Vec<String>)> {
         let command = self.uninstall.clone().ok_or_else(|| {
             Error::Message(format!(
-                "tool `{name}` does not declare an uninstall command; add `uninstall = [\"manager\", \"remove\", \"package\"]` to its declaration"
+                "tool `{name}` does not declare an uninstall command and its update command installs no package; add `uninstall = [\"manager\", \"remove\", \"package\"]` to its declaration"
             ))
         })?;
         split_user_command(name, "uninstall", command)
@@ -1062,6 +1087,144 @@ fn inferred_platforms(program: &str) -> &'static [&'static str] {
     }
 }
 
+/// Derives the global removal command for one recognized package-manager installation.
+///
+/// Only unambiguous installs are recognized, so a custom command that happens to start
+/// with a package manager but installs something else stays non-uninstallable.
+pub(crate) fn infer_uninstall_command(update: &[String]) -> Option<Vec<String>> {
+    let (program, arguments) = update.split_first()?;
+    let install = arguments
+        .iter()
+        .position(|argument| matches!(argument.as_str(), "install" | "i" | "add"))?;
+    let packages = &arguments[install + 1..];
+    let manager = normalized_executable_name(program);
+    match manager.as_str() {
+        // Only a global installation has a global removal command.
+        "npm" | "pnpm" | "bun" => {
+            if !arguments
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "-g" | "--global"))
+            {
+                return None;
+            }
+            let manager = match manager.as_str() {
+                "npm" => PackageManager::Npm,
+                "pnpm" => PackageManager::Pnpm,
+                _ => PackageManager::Bun,
+            };
+            let package = infer_registry_package(packages)?;
+            Some(manager.uninstall_command(&package))
+        }
+        "brew" => {
+            Some(PackageManager::Homebrew.uninstall_command(&infer_registry_package(packages)?))
+        }
+        "cargo" => {
+            Some(PackageManager::Cargo.uninstall_command(&infer_registry_package(packages)?))
+        }
+        "pipx" => Some(PackageManager::Pipx.uninstall_command(&infer_registry_package(packages)?)),
+        // `uv tool install <package>` is the only installation dvup manages with uv.
+        "uv" if install > 0 && arguments[install - 1] == "tool" => {
+            Some(PackageManager::Uv.uninstall_command(&infer_registry_package(packages)?))
+        }
+        _ => None,
+    }
+}
+
+/// Reads the single package name of a registry installation, rejecting ambiguous input.
+pub(crate) fn infer_registry_package(arguments: &[String]) -> Option<String> {
+    let mut packages = Vec::new();
+    let mut skip_next = false;
+    for argument in arguments {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if argument == "--" {
+            continue;
+        }
+        if argument.starts_with('-') {
+            skip_next = matches!(
+                argument.as_str(),
+                "--branch"
+                    | "--cache"
+                    | "--features"
+                    | "--filter"
+                    | "--git"
+                    | "--include"
+                    | "--index"
+                    | "--install-strategy"
+                    | "--loglevel"
+                    | "--omit"
+                    | "--path"
+                    | "--prefix"
+                    | "--registry"
+                    | "--rev"
+                    | "--root"
+                    | "--tag"
+                    | "--target"
+                    | "--target-dir"
+                    | "--userconfig"
+                    | "--version"
+                    | "--workspace"
+            );
+            continue;
+        }
+        if let Some(package) = normalize_registry_package(argument) {
+            packages.push(package);
+        }
+    }
+    (packages.len() == 1).then(|| packages.pop().expect("one package was collected"))
+}
+
+fn normalize_registry_package(argument: &str) -> Option<String> {
+    if argument.is_empty()
+        || argument.starts_with('-')
+        || argument.starts_with('.')
+        || argument.starts_with('/')
+        || argument.contains(':')
+        || argument.contains('\\')
+    {
+        return None;
+    }
+    let name_end = if argument.starts_with('@') {
+        let slash = argument.find('/')?;
+        version_specifier_start(argument, slash + 1).unwrap_or(argument.len())
+    } else {
+        version_specifier_start(argument, 0).unwrap_or(argument.len())
+    };
+    let name = &argument[..name_end];
+    let valid = if let Some(scope_end) = name.find('/') {
+        name.starts_with('@')
+            && scope_end > 1
+            && scope_end + 1 < name.len()
+            && name[1..scope_end]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+            && name[scope_end + 1..]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    } else {
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    };
+    valid.then(|| name.to_owned())
+}
+
+/// Returns where a registry (`name@version`) or pip (`name==version`) version starts.
+fn version_specifier_start(argument: &str, from: usize) -> Option<usize> {
+    let rest = &argument[from..];
+    match (rest.find('@'), rest.find("==")) {
+        (Some(at), Some(pip)) => Some(from + at.min(pip)),
+        (Some(at), None) => Some(from + at),
+        (None, Some(pip)) => Some(from + pip),
+        (None, None) => None,
+    }
+}
+
 impl CommandSpec {
     pub(crate) fn compile(&self, name: &str) -> Result<Tool> {
         validate_identifier("command declaration", "name", name)?;
@@ -1095,6 +1258,7 @@ impl CommandSpec {
                             .chain(uninstall.1)
                             .collect::<Vec<_>>(),
                     ),
+                    uninstall_inferred: false,
                     background: ToolBackground::Auto,
                     processes: vec![ProcessRule::wait(spec.executable.clone())],
                     lock_timeout_secs: default_lock_timeout_secs(),
@@ -1116,9 +1280,17 @@ impl CommandSpec {
                 let (program, args) = split_user_command(name, "update", spec.update.clone())?;
                 let (probe_program, probe_args) =
                     split_user_command(name, "probe", spec.probe.clone())?;
+                // An explicit declaration always wins; otherwise a recognized
+                // package-manager installation derives its own removal command.
+                let derived = match &spec.uninstall {
+                    Some(_) => None,
+                    None => infer_uninstall_command(&spec.update),
+                };
+                let uninstall_inferred = derived.is_some();
                 let uninstall = spec
                     .uninstall
                     .clone()
+                    .or(derived)
                     .map(|command| split_user_command(name, "uninstall", command))
                     .transpose()?
                     .map(|(program, args)| {
@@ -1134,6 +1306,7 @@ impl CommandSpec {
                     },
                     latest: spec.latest.clone(),
                     update_version: None,
+                    uninstall_inferred,
                     uninstall,
                     background: ToolBackground::Auto,
                     processes: vec![ProcessRule::wait(probe_program)],
@@ -1578,6 +1751,17 @@ const fn default_terminate_grace_secs() -> u64 {
 mod tests {
     use super::*;
 
+    fn compile_declaration(declaration: &str, name: &str) -> Tool {
+        let install_root = std::env::current_dir().expect("current directory");
+        UserConfig::parse(declaration)
+            .expect("parse declaration")
+            .resolve_with_install_root(&install_root)
+            .expect("compile declaration")
+            .tools
+            .remove(name)
+            .expect("compiled tool")
+    }
+
     #[test]
     fn starter_round_trips() {
         let encoded = toml::to_string_pretty(&Config::starter()).expect("serialize starter");
@@ -1703,6 +1887,10 @@ mod tests {
                 PackageManager::Pnpm,
                 vec!["pnpm", "remove", "--global", "example"],
             ),
+            (
+                PackageManager::Bun,
+                vec!["bun", "remove", "--global", "example"],
+            ),
             (PackageManager::Cargo, vec!["cargo", "uninstall", "example"]),
             (PackageManager::Pipx, vec!["pipx", "uninstall", "example"]),
             (
@@ -1714,6 +1902,25 @@ mod tests {
         for (manager, expected) in cases {
             assert_eq!(manager.uninstall_command("example"), expected);
         }
+    }
+
+    #[test]
+    fn bun_is_a_node_family_manager_with_its_own_global_lock() {
+        assert_eq!(PackageManager::Bun.resource_group(), "bun-global");
+        assert_eq!(
+            inferred_resource_group("bun"),
+            Some(PackageManager::Bun.resource_group())
+        );
+        assert_eq!(
+            PackageManager::Bun.latest_source("example"),
+            PackageManager::Npm.latest_source("example"),
+            "Bun packages come from the npm Registry"
+        );
+        assert_ne!(
+            PackageManager::Bun.resource_group(),
+            PackageManager::Npm.resource_group(),
+            "Bun's global directory is not npm's"
+        );
     }
 
     #[test]
@@ -1767,6 +1974,174 @@ mod tests {
                 "unexpected error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn infers_the_removal_command_of_recognized_package_installations() {
+        let cases = [
+            (
+                vec!["npm", "install", "-g", "example"],
+                vec!["npm", "uninstall", "--global", "example"],
+            ),
+            (
+                vec![
+                    "npm",
+                    "i",
+                    "--global",
+                    "--ignore-scripts",
+                    "@scope/tool@latest",
+                ],
+                vec!["npm", "uninstall", "--global", "@scope/tool"],
+            ),
+            (
+                vec!["pnpm", "add", "-g", "example"],
+                vec!["pnpm", "remove", "--global", "example"],
+            ),
+            (
+                vec!["npm", "-g", "install", "example"],
+                vec!["npm", "uninstall", "--global", "example"],
+            ),
+            (
+                vec!["bun", "add", "--global", "example"],
+                vec!["bun", "remove", "--global", "example"],
+            ),
+            (
+                vec!["brew", "install", "example"],
+                vec!["brew", "uninstall", "example"],
+            ),
+            (
+                vec![
+                    "cargo",
+                    "install",
+                    "example",
+                    "--version",
+                    "1.2.3",
+                    "--locked",
+                ],
+                vec!["cargo", "uninstall", "example"],
+            ),
+            (
+                vec!["pipx", "install", "example==1.2.3"],
+                vec!["pipx", "uninstall", "example"],
+            ),
+            (
+                vec!["uv", "tool", "install", "example"],
+                vec!["uv", "tool", "uninstall", "example"],
+            ),
+        ];
+
+        for (update, expected) in cases {
+            let update = update.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let expected = expected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                infer_uninstall_command(&update).as_deref(),
+                Some(expected.as_slice()),
+                "update: {update:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_infer_a_removal_command_without_a_recognized_installation() {
+        let cases = [
+            // A local npm installation has no global removal command.
+            vec!["npm", "install", "example"],
+            // Two packages leave the removal target ambiguous.
+            vec!["npm", "install", "-g", "one", "two"],
+            // A path is not a registry package.
+            vec!["npm", "install", "-g", "./local-package"],
+            // Self-updating and installer-based commands own no removal command.
+            vec!["deno", "upgrade"],
+            vec!["mise", "self-update"],
+            vec![
+                "bash",
+                "-c",
+                "curl -fsSL https://example.test/install | bash",
+            ],
+            // uv installs a global tool only through `uv tool install`.
+            vec!["uv", "pip", "install", "example"],
+        ];
+
+        for update in cases {
+            let update = update.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(infer_uninstall_command(&update), None, "update: {update:?}");
+        }
+    }
+
+    #[test]
+    fn custom_declarations_derive_a_removal_command_from_a_package_installation() {
+        let tool = compile_declaration(
+            concat!(
+                "[commands.dsh]\n",
+                "type = \"custom\"\n",
+                "update = [\"npm\", \"install\", \"-g\", \"dsh\"]\n",
+                "probe = [\"dsh\", \"--version\"]\n",
+            ),
+            "dsh",
+        );
+
+        assert_eq!(
+            tool.uninstall_command("dsh").expect("derived command"),
+            (
+                "npm".to_owned(),
+                vec![
+                    "uninstall".to_owned(),
+                    "--global".to_owned(),
+                    "dsh".to_owned()
+                ]
+            )
+        );
+        assert!(tool.uninstall_inferred);
+    }
+
+    #[test]
+    fn declared_removal_commands_override_the_derived_one() {
+        let tool = compile_declaration(
+            concat!(
+                "[commands.dsh]\n",
+                "type = \"custom\"\n",
+                "update = [\"npm\", \"install\", \"-g\", \"dsh\"]\n",
+                "probe = [\"dsh\", \"--version\"]\n",
+                "uninstall = [\"dsh\", \"self\", \"remove\"]\n",
+            ),
+            "dsh",
+        );
+
+        assert_eq!(
+            tool.uninstall_command("dsh").expect("declared command"),
+            (
+                "dsh".to_owned(),
+                vec!["self".to_owned(), "remove".to_owned()]
+            )
+        );
+        assert!(!tool.uninstall_inferred);
+    }
+
+    #[test]
+    fn package_declarations_are_not_marked_as_inferred() {
+        let tool = compile_declaration(
+            concat!(
+                "[commands.example]\n",
+                "type = \"package\"\n",
+                "manager = \"npm\"\n",
+                "package = \"example\"\n",
+                "executable = \"example\"\n",
+            ),
+            "example",
+        );
+
+        assert_eq!(
+            tool.uninstall_command("example").expect("manager command"),
+            (
+                "npm".to_owned(),
+                vec![
+                    "uninstall".to_owned(),
+                    "--global".to_owned(),
+                    "example".to_owned()
+                ]
+            )
+        );
+        assert!(!tool.uninstall_inferred);
     }
 
     #[test]
@@ -1985,6 +2360,13 @@ args = ["--version"]
                 vec![],
             ),
             (
+                PackageManager::Bun,
+                vec!["bun", "add", "--global", "example@latest"],
+                Some(vec!["bun", "add", "--global", "example@{version}"]),
+                Some("bun-global"),
+                vec![],
+            ),
+            (
                 PackageManager::Cargo,
                 vec!["cargo", "install", "example"],
                 Some(vec![
@@ -2051,9 +2433,11 @@ args = ["--version"]
                 PackageManager::Homebrew => LatestVersionSource::Homebrew {
                     formula: "example".to_owned(),
                 },
-                PackageManager::Npm | PackageManager::Pnpm => LatestVersionSource::Npm {
-                    package: "example".to_owned(),
-                },
+                PackageManager::Npm | PackageManager::Pnpm | PackageManager::Bun => {
+                    LatestVersionSource::Npm {
+                        package: "example".to_owned(),
+                    }
+                }
                 PackageManager::Cargo => LatestVersionSource::CratesIo {
                     package: "example".to_owned(),
                 },

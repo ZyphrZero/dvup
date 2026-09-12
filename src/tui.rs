@@ -33,6 +33,7 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Table, TableState, Tabs, Wrap,
     },
 };
+use unicode_width::UnicodeWidthChar;
 use zeroize::Zeroize;
 
 use crate::{
@@ -41,7 +42,7 @@ use crate::{
         AssetSelector, CommandSpec as UserCommandSpec, Config, CustomCommandSpec,
         GithubInstallSpec, GithubMonitorSpec, GithubReleaseMonitor, LatestVersionSource,
         PackageCommandSpec, PackageManager, ReleaseAssetFormat, ReleaseUpdatePolicy, Tool,
-        UserConfig,
+        UserConfig, infer_registry_package, infer_uninstall_command,
     },
     credential, datetime, detach, doctor,
     error::{Error, Result},
@@ -232,6 +233,7 @@ enum ActivityTone {
     Normal,
     Start,
     Success,
+    Warning,
     Queued,
     Error,
     Hint,
@@ -268,6 +270,9 @@ fn activity_tone(text: &str) -> ActivityTone {
         || line.contains("等待进程策略")
     {
         ActivityTone::Queued
+    } else if lower.ends_with(": ok (with warnings)") || line.ends_with(": 成功（有告警）") {
+        // The command succeeded, but its output still reported a problem.
+        ActivityTone::Warning
     } else if lower.contains(": ok ===")
         || lower.ends_with(": ok")
         || line.contains(": 成功 ===")
@@ -314,7 +319,9 @@ fn activity_style(text: &str) -> Style {
         ActivityTone::Normal => Style::default(),
         ActivityTone::Start => Style::default().fg(ACCENT),
         ActivityTone::Success => Style::default().fg(SUCCESS),
-        ActivityTone::Queued | ActivityTone::Hint => Style::default().fg(WARNING_COLOR),
+        ActivityTone::Queued | ActivityTone::Hint | ActivityTone::Warning => {
+            Style::default().fg(WARNING_COLOR)
+        }
         ActivityTone::Error => Style::default().fg(ERROR_COLOR),
         ActivityTone::Metadata => Style::default().fg(Color::Rgb(120, 170, 210)),
     };
@@ -325,11 +332,17 @@ fn activity_style(text: &str) -> Style {
     }
 }
 
-fn activity_outcome_label(success: bool, queued: bool, language: Language) -> &'static str {
-    language.text(match (success, queued) {
-        (false, _) => message_key!("activity.failed"),
-        (true, true) => message_key!("activity.queued"),
-        (true, false) => message_key!("activity.ok"),
+fn activity_outcome_label(
+    success: bool,
+    queued: bool,
+    warned: bool,
+    language: Language,
+) -> &'static str {
+    language.text(match (success, queued, warned) {
+        (false, _, _) => message_key!("activity.failed"),
+        (true, true, _) => message_key!("activity.queued"),
+        (true, false, true) => message_key!("activity.ok_with_warnings"),
+        (true, false, false) => message_key!("activity.ok"),
     })
 }
 
@@ -351,7 +364,10 @@ impl Language {
                 message_key!("job_status.terminating_processes")
             }
             JobStatus::Running { .. } => message_key!("job_status.running"),
-            JobStatus::Succeeded { .. } => message_key!("job_status.succeeded"),
+            JobStatus::Succeeded { warning, .. } => match warning {
+                Some(_) => message_key!("job_status.succeeded_with_warning"),
+                None => message_key!("job_status.succeeded"),
+            },
             JobStatus::Failed { .. } => message_key!("job_status.failed"),
         })
     }
@@ -413,9 +429,11 @@ struct ToolItem {
     latest_source: Option<LatestVersionSource>,
     latest_probe_id: u64,
     supports_target_version: bool,
-    /// The declared removal command, rendered for confirmation; `None` when the
-    /// declaration does not say how this tool is uninstalled.
+    /// The removal command, rendered for confirmation; `None` when neither the
+    /// declaration nor the update command says how this tool is uninstalled.
     uninstall: Option<String>,
+    /// Set when `uninstall` was derived from the update command rather than declared.
+    uninstall_inferred: bool,
     availability: Availability,
     kind: ToolKind,
     selected: bool,
@@ -429,6 +447,87 @@ struct JobItem {
     name: String,
     status: JobStatus,
     updated_at_unix_ms: u128,
+}
+
+/// One rendered row of a wrapped output pane.
+struct OutputRow {
+    text: String,
+    /// Index of the log line this row was wrapped from.
+    line: usize,
+}
+
+/// A drag selection inside a wrapped output pane, measured in rendered rows and
+/// display cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JobResultSelection {
+    anchor: (usize, u16),
+    cursor: (usize, u16),
+}
+
+impl JobResultSelection {
+    /// Returns the selection ordered from its first to its last cell.
+    fn ordered(self) -> ((usize, u16), (usize, u16)) {
+        let forward = self.anchor.0 < self.cursor.0
+            || (self.anchor.0 == self.cursor.0 && self.anchor.1 <= self.cursor.1);
+        if forward {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    /// Returns the byte range this selection covers inside one rendered row.
+    fn row_range(self, index: usize, text: &str) -> Option<(usize, usize)> {
+        let ((start_row, start_column), (end_row, end_column)) = self.ordered();
+        if index < start_row || index > end_row {
+            return None;
+        }
+        let from = if index == start_row {
+            byte_at_display_column(text, start_column)
+        } else {
+            0
+        };
+        let to = if index == end_row {
+            byte_at_display_column(text, end_column)
+        } else {
+            text.len()
+        };
+        (from < to).then_some((from, to))
+    }
+
+    /// Returns the selected text, joining the wrapped rows of one log line and
+    /// keeping one newline per log line.
+    fn selected_text(self, lines: &[String], width: usize) -> Option<String> {
+        let ((start_row, start_column), (end_row, end_column)) = self.ordered();
+        let rows = output_rows(lines, width);
+        let mut text = String::new();
+        let mut previous_line = None;
+        for (index, row) in rows.iter().enumerate().take(end_row.saturating_add(1)) {
+            if index < start_row {
+                continue;
+            }
+            let from = if index == start_row {
+                byte_at_display_column(&row.text, start_column)
+            } else {
+                0
+            };
+            let to = if index == end_row {
+                byte_at_display_column(&row.text, end_column)
+            } else {
+                row.text.len()
+            };
+            // A row the selection only touches at its very edge contributes nothing.
+            if (index == start_row || index == end_row) && from >= to {
+                continue;
+            }
+            if previous_line.is_some_and(|line| line != row.line) {
+                text.push('\n');
+            }
+            text.push_str(&row.text[from..to]);
+            previous_line = Some(row.line);
+        }
+        (!text.is_empty()).then_some(text)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1624,6 +1723,8 @@ struct CustomCommandFlow {
     update: TextInput,
     probe: TextInput,
     uninstall: TextInput,
+    /// Set while `uninstall` holds a command derived from the update command.
+    uninstall_inferred: bool,
     probe_output: String,
     current_versions: Vec<String>,
     selected_version: usize,
@@ -1648,6 +1749,7 @@ impl CustomCommandFlow {
             update: TextInput::new(String::new()),
             probe: TextInput::new(String::new()),
             uninstall: TextInput::new(String::new()),
+            uninstall_inferred: false,
             probe_output: String::new(),
             current_versions: Vec::new(),
             selected_version: 0,
@@ -1789,6 +1891,7 @@ enum Modal {
     ConfirmUninstall {
         name: String,
         command: Option<String>,
+        inferred: bool,
     },
     ConfirmImport {
         config: UserConfig,
@@ -2188,6 +2291,8 @@ struct App {
     expanded_job: Option<String>,
     job_log: Vec<String>,
     job_log_scroll: usize,
+    /// Drag selection inside the expanded job result panel, in rendered row cells.
+    job_result_selection: Option<JobResultSelection>,
     job_hitboxes: Vec<(Rect, usize)>,
     job_detail_area: Option<Rect>,
     doctor_diagnoses: Vec<doctor::ToolDiagnosis>,
@@ -2324,6 +2429,7 @@ impl App {
             expanded_job: None,
             job_log: Vec::new(),
             job_log_scroll: 0,
+            job_result_selection: None,
             job_hitboxes: Vec::new(),
             job_detail_area: None,
             doctor_diagnoses: Vec::new(),
@@ -3661,6 +3767,7 @@ impl App {
                     let queued = operation == Operation::Update
                         && success
                         && output_was_queued(&name, &output);
+                    let warned = success && !queued && output_was_warned(&name, &output);
                     if operation == Operation::Update {
                         if let Some(tool) = self.tools.iter_mut().find(|tool| tool.name == name) {
                             tool.run_state = if success {
@@ -3678,7 +3785,7 @@ impl App {
                     self.push_activity(format!(
                         "\n=== {} {name}: {} ===",
                         operation.label(self.language),
-                        activity_outcome_label(success, queued, self.language)
+                        activity_outcome_label(success, queued, warned, self.language)
                     ));
                     self.push_activity_output(&output);
                     if operation != Operation::Update {
@@ -4576,8 +4683,15 @@ impl App {
                 flow.name = TextInput::new(selected.name);
                 flow.update = TextInput::new(format_command_parts(&spec.update));
                 flow.probe = TextInput::new(format_command_parts(&spec.probe));
+                // A derived command is offered for review so that saving the
+                // declaration records the removal command it already runs.
+                let uninstall = spec
+                    .uninstall
+                    .clone()
+                    .or_else(|| infer_uninstall_command(&spec.update));
+                flow.uninstall_inferred = spec.uninstall.is_none() && uninstall.is_some();
                 flow.uninstall = TextInput::new(
-                    spec.uninstall
+                    uninstall
                         .as_deref()
                         .map(format_command_parts)
                         .unwrap_or_default(),
@@ -5123,6 +5237,7 @@ impl App {
             self.expanded_job = None;
             self.job_log.clear();
             self.job_log_scroll = 0;
+            self.job_result_selection = None;
             return;
         }
         match JobStore::new(self.state.clone()).and_then(|store| store.read_log(&job.id)) {
@@ -5130,11 +5245,43 @@ impl App {
                 self.expanded_job = Some(job.id);
                 self.job_log = sanitize_terminal_output(&String::from_utf8_lossy(&log));
                 self.job_log_scroll = 0;
+                self.job_result_selection = None;
             }
             Err(error) => {
                 self.message = self
                     .language
                     .format(message_key!("message.job_log_load_failed"), &[&error]);
+            }
+        }
+    }
+
+    /// Copies the drag selection inside the job result panel to the clipboard.
+    fn copy_job_result_selection(&mut self) {
+        let text = self
+            .job_detail_area
+            .map(|area| area.width.saturating_sub(2).max(1) as usize)
+            .and_then(|width| {
+                self.job_result_selection
+                    .and_then(|selection| selection.selected_text(&self.job_log, width))
+            });
+        let Some(text) = text else {
+            self.message = self
+                .language
+                .text(message_key!("tui.select_job_result_text_before_copying"))
+                .to_owned();
+            return;
+        };
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+            Ok(()) => {
+                self.message = self
+                    .language
+                    .text(message_key!("tui.copied_selection"))
+                    .to_owned()
+            }
+            Err(error) => {
+                self.message = self
+                    .language
+                    .format(message_key!("message.clipboard_copy_failed"), &[&error])
             }
         }
     }
@@ -6320,6 +6467,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                                     flow.latest_value = TextInput::new(value);
                                     flow.latest_inferred = true;
                                 }
+                                prefill_custom_uninstall(&mut flow, &update);
                                 flow.step = CustomCommandStep::Probe;
                             }
                             CustomCommandStep::Probe => {
@@ -6421,6 +6569,9 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                                 flow.latest_value = TextInput::new(String::new());
                                 flow.latest_version = None;
                                 flow.latest_inferred = false;
+                            }
+                            if changed && flow.uninstall_inferred {
+                                clear_inferred_uninstall(&mut flow);
                             }
                             changed
                         }
@@ -6902,7 +7053,11 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = Modal::None,
             _ => {}
         },
-        Modal::ConfirmUninstall { name, command } => match key.code {
+        Modal::ConfirmUninstall {
+            name,
+            command,
+            inferred: _,
+        } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 if command.is_none() {
                     app.message = app
@@ -7482,6 +7637,9 @@ fn handle_paste(app: &mut App, text: &str) {
                     flow.latest_version = None;
                     flow.latest_inferred = false;
                 }
+                if flow.uninstall_inferred {
+                    clear_inferred_uninstall(flow);
+                }
             }
             CustomCommandStep::Probe => {
                 flow.probe.insert_text(text);
@@ -7935,14 +8093,23 @@ fn handle_command_tools_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             if tool.uninstall.is_none() {
-                app.message = app
-                    .language
-                    .format(message_key!("tui.uninstall_no_command"), &[&tool.name]);
+                app.message = match tool.kind {
+                    // Built-in presets are not editable, so only custom declarations
+                    // get pointed at the declaration editor.
+                    ToolKind::Custom if app.config_path.is_none() => app.language.format(
+                        message_key!("tui.uninstall_no_command_press_e"),
+                        &[&tool.name],
+                    ),
+                    ToolKind::Custom | ToolKind::BuiltIn => app
+                        .language
+                        .format(message_key!("tui.uninstall_no_command"), &[&tool.name]),
+                };
                 return;
             }
             app.modal = Modal::ConfirmUninstall {
                 name: tool.name.clone(),
                 command: tool.uninstall.clone(),
+                inferred: tool.uninstall_inferred,
             };
         }
         KeyCode::Char('t') | KeyCode::Char('T') => app.open_toml_editor(),
@@ -8222,6 +8389,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 }
             }
             Tab::Jobs => {
+                if contains(app.job_detail_area, mouse.column, mouse.row)
+                    && let Some(cell) = job_result_cell(app, mouse.column, mouse.row)
+                {
+                    app.job_result_selection = Some(JobResultSelection {
+                        anchor: cell,
+                        cursor: cell,
+                    });
+                    return;
+                }
                 if let Some(index) = hitbox_target(&app.job_hitboxes, mouse.column, mouse.row) {
                     app.job_index = index;
                     app.toggle_job_log();
@@ -8273,6 +8449,28 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 }
             }
         },
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.tab == Tab::Jobs
+                && app.job_result_selection.is_some()
+                && let Some(cell) = job_result_cell(app, mouse.column, mouse.row)
+            {
+                app.job_result_selection =
+                    app.job_result_selection
+                        .map(|selection| JobResultSelection {
+                            cursor: cell,
+                            ..selection
+                        });
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // A click without a drag is not a selection.
+            if app
+                .job_result_selection
+                .is_some_and(|selection| selection.anchor == selection.cursor)
+            {
+                app.job_result_selection = None;
+            }
+        }
         MouseEventKind::ScrollUp => match app.tab {
             Tab::Activity => {
                 app.activity_scroll = app
@@ -8996,6 +9194,30 @@ fn modal_cursor_at(app: &App, hitbox: ModalInputHitbox, column: u16) -> Option<u
     Some(hitbox.visible_end)
 }
 
+/// Maps one screen cell inside the expanded job result panel onto its rendered
+/// row and display column, clamping to the panel so a drag past an edge still
+/// extends the selection.
+fn job_result_cell(app: &App, column: u16, row: u16) -> Option<(usize, u16)> {
+    let area = app.job_detail_area.filter(|area| !area.is_empty())?;
+    if app.job_log.is_empty() {
+        return None;
+    }
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let rows = output_rows(&app.job_log, width);
+    if rows.is_empty() {
+        return None;
+    }
+    let column = column.clamp(area.x, area.right().saturating_sub(1));
+    let row = row.clamp(area.y, area.bottom().saturating_sub(1));
+    let visible_row = usize::from(row.saturating_sub(area.y).saturating_sub(1));
+    let index = app
+        .job_log_scroll
+        .saturating_add(visible_row)
+        .min(rows.len().saturating_sub(1));
+    let cell = column.saturating_sub(area.x).saturating_sub(1);
+    Some((index, cell))
+}
+
 fn contains(area: Option<Rect>, column: u16, row: u16) -> bool {
     area.is_some_and(|area| {
         column >= area.x
@@ -9029,6 +9251,8 @@ fn handle_jobs_key(app: &mut App, key: KeyEvent) {
             app.job_index = next_index(app.job_index, app.jobs.len());
         }
         KeyCode::Enter => app.toggle_job_log(),
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.copy_job_result_selection(),
+        KeyCode::Esc => app.job_result_selection = None,
         KeyCode::PageUp if app.expanded_job.is_some() => {
             app.job_log_scroll = app.job_log_scroll.saturating_sub(5);
         }
@@ -9850,7 +10074,7 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
         rows,
         [
             Constraint::Length(16),
-            Constraint::Length(16),
+            Constraint::Length(20),
             Constraint::Length(19),
             Constraint::Min(24),
         ],
@@ -9920,6 +10144,14 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(detail_area) = detail_area else {
         return;
     };
+    let detail_height = detail_area.height.saturating_sub(2) as usize;
+    let detail_width = detail_area.width.saturating_sub(2).max(1) as usize;
+    let rows = output_rows(&app.job_log, detail_width);
+    let detail_rendered_height = rows.len();
+    let max_scroll = detail_rendered_height.saturating_sub(detail_height);
+    app.job_log_scroll = app.job_log_scroll.min(max_scroll);
+    let scroll = app.job_log_scroll;
+    let selection = app.job_result_selection;
     let detail_lines = if app.job_log.is_empty() {
         vec![Line::styled(
             app.language
@@ -9927,24 +10159,13 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(SUBTLE),
         )]
     } else {
-        app.job_log
-            .iter()
-            .map(|text| Line::styled(text.clone(), activity_style(text)))
+        rows.iter()
+            .enumerate()
+            .skip(scroll)
+            .take(detail_height)
+            .map(|(index, row)| job_result_line(row, index, selection))
             .collect()
     };
-    let detail_height = detail_area.height.saturating_sub(2) as usize;
-    let detail_width = detail_area.width.saturating_sub(2).max(1);
-    let detail_rendered_height = detail_lines
-        .iter()
-        .map(|line| {
-            Paragraph::new(line.clone())
-                .wrap(Wrap { trim: false })
-                .line_count(detail_width)
-                .max(1)
-        })
-        .sum::<usize>();
-    let max_scroll = detail_rendered_height.saturating_sub(detail_height);
-    app.job_log_scroll = app.job_log_scroll.min(max_scroll);
     let job = app
         .expanded_job
         .as_deref()
@@ -9971,8 +10192,7 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     )),
             )
-            .wrap(Wrap { trim: false })
-            .scroll((app.job_log_scroll as u16, 0)),
+            .wrap(Wrap { trim: false }),
         detail_area,
     );
     render_scrollbar(
@@ -9980,8 +10200,31 @@ fn draw_jobs(frame: &mut Frame, app: &mut App, area: Rect) {
         detail_area,
         detail_rendered_height,
         detail_height,
-        app.job_log_scroll,
+        scroll,
     );
+}
+
+/// Renders one result row, highlighting the part a drag selection covers.
+fn job_result_line(
+    row: &OutputRow,
+    index: usize,
+    selection: Option<JobResultSelection>,
+) -> Line<'static> {
+    let base = activity_style(&row.text);
+    let Some((from, to)) = selection.and_then(|selection| selection.row_range(index, &row.text))
+    else {
+        return Line::styled(row.text.clone(), base);
+    };
+    let selected = base.bg(SELECTION_BG);
+    let mut spans = Vec::new();
+    if from > 0 {
+        spans.push(Span::styled(row.text[..from].to_owned(), base));
+    }
+    spans.push(Span::styled(row.text[from..to].to_owned(), selected));
+    if to < row.text.len() {
+        spans.push(Span::styled(row.text[to..].to_owned(), base));
+    }
+    Line::from(spans)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12011,49 +12254,63 @@ fn draw_modal(frame: &mut Frame, app: &mut App, area: Rect) {
                 inner,
             );
         }
-        Modal::ConfirmUninstall { name, command } => {
+        Modal::ConfirmUninstall {
+            name,
+            command,
+            inferred,
+        } => {
             let title = app
                 .language
                 .format(message_key!("tui.uninstall_named"), &[&name]);
-            let inner = modal_panel(frame, area, &title, 74, 12);
+            let inner = modal_panel(frame, area, &title, 74, if *inferred { 14 } else { 12 });
+            let mut lines = vec![
+                Line::styled(
+                    app.language
+                        .text(message_key!("tui.uninstall_the_selected_tool")),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                labeled_value(
+                    app.language.text(message_key!("tui.name")),
+                    name,
+                    ERROR_COLOR,
+                ),
+                labeled_value(
+                    app.language.text(message_key!("tui.uninstall_command")),
+                    command.as_deref().unwrap_or("—"),
+                    ACCENT,
+                ),
+            ];
+            if *inferred {
+                lines.push(Line::styled(
+                    app.language
+                        .text(message_key!("tui.uninstall_command_was_derived")),
+                    Style::default().fg(SUBTLE),
+                ));
+            }
+            lines.extend([
+                Line::raw(""),
+                Line::styled(
+                    app.language
+                        .text(message_key!("tui.uninstall_removes_installed_files")),
+                    Style::default().fg(SUBTLE),
+                ),
+                Line::styled(
+                    app.language
+                        .text(message_key!("tui.uninstalled_tools_keep_their_declaration")),
+                    Style::default().fg(SUBTLE),
+                ),
+                Line::raw(""),
+                modal_actions(
+                    app.language,
+                    app.language.text(message_key!("tui.uninstall")),
+                    app.language.text(message_key!("tui.cancel")),
+                ),
+            ]);
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(
-                        app.language
-                            .text(message_key!("tui.uninstall_the_selected_tool")),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Line::raw(""),
-                    labeled_value(
-                        app.language.text(message_key!("tui.name")),
-                        name,
-                        ERROR_COLOR,
-                    ),
-                    labeled_value(
-                        app.language.text(message_key!("tui.uninstall_command")),
-                        command.as_deref().unwrap_or("—"),
-                        ACCENT,
-                    ),
-                    Line::raw(""),
-                    Line::styled(
-                        app.language
-                            .text(message_key!("tui.uninstall_removes_installed_files")),
-                        Style::default().fg(SUBTLE),
-                    ),
-                    Line::styled(
-                        app.language
-                            .text(message_key!("tui.uninstalled_tools_keep_their_declaration")),
-                        Style::default().fg(SUBTLE),
-                    ),
-                    Line::raw(""),
-                    modal_actions(
-                        app.language,
-                        app.language.text(message_key!("tui.uninstall")),
-                        app.language.text(message_key!("tui.cancel")),
-                    ),
-                ])
-                .style(Style::default().bg(PANEL_BG))
-                .wrap(Wrap { trim: false }),
+                Paragraph::new(lines)
+                    .style(Style::default().bg(PANEL_BG))
+                    .wrap(Wrap { trim: false }),
                 inner,
             );
         }
@@ -13095,6 +13352,74 @@ fn display_width(value: &str) -> usize {
     Line::from(value).width()
 }
 
+/// Display width of one character, matching the renderer's own measurement.
+fn character_width(character: char) -> usize {
+    UnicodeWidthChar::width(character).unwrap_or(0)
+}
+
+/// Returns the byte offset of one display column inside a rendered row.
+fn byte_at_display_column(text: &str, column: u16) -> usize {
+    let target = usize::from(column);
+    let mut cells = 0;
+    for (offset, character) in text.char_indices() {
+        if cells >= target {
+            return offset;
+        }
+        cells += character_width(character);
+    }
+    text.len()
+}
+
+/// Splits log lines into the display rows an output pane renders.
+fn output_rows(lines: &[String], width: usize) -> Vec<OutputRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for (line, text) in lines.iter().enumerate() {
+        for (start, end) in wrap_output_line(text, width) {
+            rows.push(OutputRow {
+                text: text[start..end].to_owned(),
+                line,
+            });
+        }
+    }
+    rows
+}
+
+/// Returns the byte ranges one log line wraps into, breaking at the last space
+/// that fits and hard-breaking anything wider than the pane.
+fn wrap_output_line(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut cells = 0;
+        let mut end = start;
+        let mut last_space = None;
+        for (offset, character) in text[start..].char_indices() {
+            let character_cells = character_width(character);
+            if end > start && cells + character_cells > width {
+                break;
+            }
+            cells += character_cells;
+            end = start + offset + character.len_utf8();
+            if character.is_whitespace() {
+                last_space = Some(end);
+            }
+        }
+        let row_end = match last_space.filter(|space| *space > start) {
+            // Keep whole words whenever a break point fits.
+            Some(space) if end < text.len() => space,
+            _ => end,
+        };
+        ranges.push((start, row_end));
+        start = row_end;
+    }
+    ranges
+}
+
 fn input_value_width(line_width: u16, label: &str) -> usize {
     usize::from(line_width).saturating_sub(4 + display_width(label))
 }
@@ -13539,6 +13864,15 @@ fn uninstall_arguments(name: &str, config_path: Option<&Path>) -> Vec<String> {
     arguments
 }
 
+/// Returns whether a settled operation reported a warning alongside its success.
+fn output_was_warned(name: &str, output: &str) -> bool {
+    let warning = format!("warning {name}:");
+    output
+        .lines()
+        .map(str::trim)
+        .any(|line| line.starts_with(&warning))
+}
+
 fn output_was_queued(name: &str, output: &str) -> bool {
     let queued = format!("queued {name}:");
     let settled = [
@@ -13769,6 +14103,7 @@ fn build_tool_item(
             .uninstall
             .as_deref()
             .map(|command| format_command_parts(command).trim().to_owned()),
+        uninstall_inferred: tool.uninstall_inferred,
         selected: false,
         run_state: RunState::Idle,
         elapsed: None,
@@ -13865,80 +14200,22 @@ fn infer_custom_latest_source(update: &[String]) -> Option<LatestVersionSource> 
     Some(LatestVersionSource::Npm { package })
 }
 
-fn infer_registry_package(arguments: &[String]) -> Option<String> {
-    let mut packages = Vec::new();
-    let mut skip_next = false;
-    for argument in arguments {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if argument == "--" {
-            continue;
-        }
-        if argument.starts_with('-') {
-            skip_next = matches!(
-                argument.as_str(),
-                "--cache"
-                    | "--filter"
-                    | "--include"
-                    | "--install-strategy"
-                    | "--loglevel"
-                    | "--omit"
-                    | "--prefix"
-                    | "--registry"
-                    | "--tag"
-                    | "--userconfig"
-                    | "--workspace"
-            );
-            continue;
-        }
-        if let Some(package) = normalize_registry_package(argument) {
-            packages.push(package);
-        }
-    }
-    (packages.len() == 1).then(|| packages.pop().expect("one package was collected"))
+/// Drops the removal command derived from an update command the user has replaced.
+fn clear_inferred_uninstall(flow: &mut CustomCommandFlow) {
+    flow.uninstall = TextInput::new(String::new());
+    flow.uninstall_inferred = false;
 }
 
-fn normalize_registry_package(argument: &str) -> Option<String> {
-    if argument.is_empty()
-        || argument.starts_with('-')
-        || argument.starts_with('.')
-        || argument.starts_with('/')
-        || argument.contains(':')
-        || argument.contains('\\')
+/// Fills in the removal command implied by the edited update command, until the
+/// user reviews or replaces that command.
+fn prefill_custom_uninstall(flow: &mut CustomCommandFlow, update: &[String]) {
+    if !flow.uninstall_inferred
+        && flow.uninstall.value.trim().is_empty()
+        && let Some(uninstall) = infer_uninstall_command(update)
     {
-        return None;
+        flow.uninstall = TextInput::new(format_command_parts(&uninstall));
+        flow.uninstall_inferred = true;
     }
-    let name_end = if argument.starts_with('@') {
-        let slash = argument.find('/')?;
-        argument[slash + 1..]
-            .find('@')
-            .map(|offset| slash + 1 + offset)
-            .unwrap_or(argument.len())
-    } else {
-        argument.find('@').unwrap_or(argument.len())
-    };
-    let name = &argument[..name_end];
-    let valid = if let Some(scope_end) = name.find('/') {
-        name.starts_with('@')
-            && scope_end > 1
-            && scope_end + 1 < name.len()
-            && name[1..scope_end]
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-            && name[scope_end + 1..]
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-    } else {
-        !name.is_empty()
-            && name != "."
-            && name != ".."
-            && name
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
-    };
-    valid.then(|| name.to_owned())
 }
 
 fn custom_latest_choice(source: Option<&LatestVersionSource>) -> (CustomLatestChoice, String) {
@@ -14093,6 +14370,7 @@ fn next_index(current: usize, length: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::JobWarning;
 
     fn github_monitor_for_status_test() -> GithubReleaseMonitor {
         GithubReleaseMonitor {
@@ -14200,6 +14478,14 @@ mod tests {
         );
     }
 
+    /// Owns command arguments for the flow-level inference tests.
+    fn owned(arguments: &[&str]) -> Vec<String> {
+        arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect()
+    }
+
     fn render_test_screen(app: &mut App, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -14228,6 +14514,17 @@ mod tests {
             .position(|&visible| visible == row)
             .unwrap_or_else(|| panic!("tool `{name}` is visible"));
         app.tool_index = position;
+    }
+
+    /// Marks one configured tool as installed so the tool shortcuts apply to it.
+    fn make_tool_installed(app: &mut App, name: &str) {
+        let row = app
+            .tools
+            .iter()
+            .position(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("tool `{name}` is configured"));
+        app.tools[row].availability = Availability::Installed;
+        app.rebuild_visible_tool_indices(Some(name));
     }
 
     #[test]
@@ -14382,6 +14679,7 @@ mod tests {
             }),
             latest_probe_id: 0,
             uninstall: None,
+            uninstall_inferred: false,
             supports_target_version: false,
             availability,
             kind: ToolKind::BuiltIn,
@@ -14542,6 +14840,37 @@ mod tests {
     }
 
     #[test]
+    fn the_custom_flow_prefills_a_derived_uninstall_command() {
+        let mut flow = CustomCommandFlow::new(DeclarationMode::Add);
+
+        prefill_custom_uninstall(&mut flow, &owned(&["npm", "install", "-g", "dsh"]));
+
+        assert_eq!(flow.uninstall.value, "npm uninstall --global dsh");
+        assert!(flow.uninstall_inferred);
+    }
+
+    #[test]
+    fn the_custom_flow_leaves_a_reviewed_uninstall_command_alone() {
+        let mut flow = CustomCommandFlow::new(DeclarationMode::Add);
+        flow.uninstall = TextInput::new("dsh self remove".to_owned());
+
+        prefill_custom_uninstall(&mut flow, &owned(&["npm", "install", "-g", "dsh"]));
+
+        assert_eq!(flow.uninstall.value, "dsh self remove");
+        assert!(!flow.uninstall_inferred);
+    }
+
+    #[test]
+    fn the_custom_flow_does_not_prefill_an_unrecognized_install_command() {
+        let mut flow = CustomCommandFlow::new(DeclarationMode::Add);
+
+        prefill_custom_uninstall(&mut flow, &owned(&["deno", "upgrade"]));
+
+        assert!(flow.uninstall.value.is_empty());
+        assert!(!flow.uninstall_inferred);
+    }
+
+    #[test]
     fn editing_an_inferred_update_command_clears_the_inferred_source() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -14562,6 +14891,27 @@ mod tests {
                 if flow.latest == CustomLatestChoice::None
                     && flow.latest_value.value.is_empty()
                     && !flow.latest_inferred
+        ));
+    }
+
+    #[test]
+    fn editing_an_inferred_update_command_clears_the_derived_uninstall_command() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::new(state, None).expect("app");
+        let mut flow = CustomCommandFlow::new(DeclarationMode::Add);
+        flow.step = CustomCommandStep::Update;
+        flow.update = TextInput::new("npm install --global example".to_owned());
+        flow.uninstall = TextInput::new("npm uninstall --global example".to_owned());
+        flow.uninstall_inferred = true;
+        app.modal = Modal::CustomCommandFlow(flow);
+
+        handle_paste(&mut app, "-changed");
+
+        assert!(matches!(
+            &app.modal,
+            Modal::CustomCommandFlow(flow)
+                if flow.uninstall.value.is_empty() && !flow.uninstall_inferred
         ));
     }
 
@@ -15379,6 +15729,7 @@ mod tests {
             latest_source: None,
             latest_probe_id: 0,
             uninstall: None,
+            uninstall_inferred: false,
             supports_target_version: false,
             availability: Availability::Installed,
             kind: ToolKind::BuiltIn,
@@ -15876,6 +16227,7 @@ mod tests {
                 latest_source: None,
                 latest_probe_id: 0,
                 uninstall: None,
+                uninstall_inferred: false,
                 supports_target_version: false,
                 availability: Availability::Installed,
                 kind: ToolKind::BuiltIn,
@@ -15893,6 +16245,7 @@ mod tests {
                 latest_source: None,
                 latest_probe_id: 0,
                 uninstall: None,
+                uninstall_inferred: false,
                 supports_target_version: false,
                 availability: Availability::Missing,
                 kind: ToolKind::BuiltIn,
@@ -15965,6 +16318,7 @@ mod tests {
                 latest_source: None,
                 latest_probe_id: 0,
                 uninstall: None,
+                uninstall_inferred: false,
                 supports_target_version: false,
                 availability: Availability::Missing,
                 kind: ToolKind::BuiltIn,
@@ -15982,6 +16336,7 @@ mod tests {
                 latest_source: None,
                 latest_probe_id: 0,
                 uninstall: None,
+                uninstall_inferred: false,
                 supports_target_version: false,
                 availability: Availability::Installed,
                 kind: ToolKind::BuiltIn,
@@ -16055,6 +16410,7 @@ mod tests {
                 latest_source: None,
                 latest_probe_id: 0,
                 uninstall: None,
+                uninstall_inferred: false,
                 supports_target_version: false,
                 availability: Availability::Installed,
                 kind: ToolKind::BuiltIn,
@@ -16240,6 +16596,247 @@ mod tests {
     }
 
     #[test]
+    fn running_jobs_appear_in_the_job_list() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let store = JobStore::new(state.clone()).expect("job store");
+        let mut job = crate::job::Job::from_tool(
+            "rustup".to_owned(),
+            Config::starter()
+                .tools
+                .remove("rustup")
+                .expect("rustup preset"),
+            temporary.path().to_path_buf(),
+            NetworkSettings::default(),
+        );
+        let job_id = job.id.clone();
+        job.set_status(JobStatus::Running { attempt: 1 });
+        store.save(&job).expect("save running job");
+        let app = App::new(state, None).expect("app");
+
+        assert!(
+            app.jobs
+                .iter()
+                .any(|item| item.id == job_id && matches!(item.status, JobStatus::Running { .. })),
+            "an inline run must not replace the visible list with queued jobs only"
+        );
+        assert_eq!(app.job_refresh_interval(), ACTIVE_JOB_REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn wraps_result_rows_at_word_boundaries_and_hard_breaks_long_tokens() {
+        assert_eq!(wrap_output_line("", 10), [(0, 0)]);
+        assert_eq!(wrap_output_line("short", 10), [(0, 5)]);
+        assert_eq!(wrap_output_line("alpha beta", 6), [(0, 6), (6, 10)]);
+        assert_eq!(wrap_output_line("abcdefghij", 4), [(0, 4), (4, 8), (8, 10)]);
+        assert_eq!(wrap_output_line("  abc", 3), [(0, 2), (2, 5)]);
+        // A double-width character is never split across two rows.
+        assert_eq!(wrap_output_line("中中中", 5), [(0, 6), (6, 9)]);
+    }
+
+    #[test]
+    fn result_rows_remember_the_log_line_they_wrapped_from() {
+        let log = ["alpha beta".to_owned(), "second".to_owned()];
+
+        let rows = output_rows(&log, 6);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].text, "alpha ");
+        assert_eq!(rows[0].line, 0);
+        assert_eq!(rows[1].text, "beta");
+        assert_eq!(rows[1].line, 0);
+        assert_eq!(rows[2].text, "second");
+        assert_eq!(rows[2].line, 1);
+    }
+
+    #[test]
+    fn a_result_selection_copies_only_the_selected_text() {
+        let log = ["first line".to_owned(), "second".to_owned()];
+        let selection = JobResultSelection {
+            anchor: (0, 6),
+            cursor: (1, 3),
+        };
+
+        assert_eq!(
+            selection.selected_text(&log, 20).as_deref(),
+            Some("line\nsec")
+        );
+        // Dragging upwards selects the same text.
+        let reversed = JobResultSelection {
+            anchor: (1, 3),
+            cursor: (0, 6),
+        };
+        assert_eq!(
+            reversed.selected_text(&log, 20).as_deref(),
+            Some("line\nsec")
+        );
+    }
+
+    #[test]
+    fn a_selection_across_a_wrapped_row_keeps_one_newline_per_log_line() {
+        let log = ["alpha beta".to_owned()];
+        let selection = JobResultSelection {
+            anchor: (0, 0),
+            cursor: (1, 4),
+        };
+
+        assert_eq!(
+            selection.selected_text(&log, 6).as_deref(),
+            Some("alpha beta"),
+            "wrapped rows of one log line are joined without a newline"
+        );
+    }
+
+    #[test]
+    fn dragging_inside_the_job_result_panel_selects_text() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::empty(state, None).expect("empty app");
+        app.tab = Tab::Jobs;
+        app.expanded_job = Some("job-1".to_owned());
+        app.job_log = vec!["first line".to_owned(), "second".to_owned()];
+        render_test_screen(&mut app, 100, 30);
+        let area = app.job_detail_area.expect("result panel is visible");
+        let first_row = area.y.saturating_add(1);
+        let second_row = first_row.saturating_add(1);
+        let left = area.x.saturating_add(1);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: left.saturating_add(2),
+                row: first_row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: left.saturating_add(5),
+                row: second_row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        let selection = app.job_result_selection.expect("drag created a selection");
+        assert_eq!(selection.anchor, (0, 2));
+        assert_eq!(selection.cursor, (1, 5));
+        assert_eq!(
+            selection.selected_text(&app.job_log, 98).as_deref(),
+            Some("rst line\nsecon")
+        );
+
+        // Releasing keeps a drag and drops a plain click.
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: left.saturating_add(5),
+                row: second_row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.job_result_selection.is_some());
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: left,
+                row: first_row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: left,
+                row: first_row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.job_result_selection.is_none());
+    }
+
+    #[test]
+    fn the_selected_result_region_is_highlighted() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::empty(state, None).expect("empty app");
+        app.tab = Tab::Jobs;
+        app.expanded_job = Some("job-1".to_owned());
+        app.job_log = vec!["first line".to_owned()];
+        app.job_result_selection = Some(JobResultSelection {
+            anchor: (0, 0),
+            cursor: (0, 5),
+        });
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("render the jobs tab");
+        let area = app.job_detail_area.expect("result panel is visible");
+        let content = ratatui::layout::Position {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+        };
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(
+            buffer[content].bg, SELECTION_BG,
+            "selected cells are highlighted"
+        );
+        assert_ne!(
+            buffer[ratatui::layout::Position {
+                x: content.x.saturating_add(8),
+                y: content.y,
+            }]
+            .bg,
+            SELECTION_BG,
+            "cells past the selection keep the panel background"
+        );
+    }
+
+    #[test]
+    fn copying_a_result_without_a_selection_asks_for_one() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::empty(state, None).expect("empty app");
+        app.tab = Tab::Jobs;
+        app.expanded_job = Some("job-1".to_owned());
+        app.job_log = vec!["output".to_owned()];
+        render_test_screen(&mut app, 100, 30);
+        app.job_result_selection = None;
+
+        handle_jobs_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.message, "Select result text before copying");
+    }
+
+    #[test]
+    fn long_result_lines_wrap_instead_of_being_truncated() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        let mut app = App::empty(state, None).expect("empty app");
+        app.tab = Tab::Jobs;
+        app.expanded_job = Some("job-1".to_owned());
+        app.job_log = vec!["alpha beta gamma delta epsilon zeta eta theta iota kappa".to_owned()];
+
+        let screen = render_test_screen(&mut app, 40, 24);
+
+        assert!(screen.contains("alpha beta gamma"), "screen: {screen}");
+        assert!(
+            screen.contains("eta theta iota kappa"),
+            "the tail of a long line must wrap onto a second row: {screen}"
+        );
+    }
+
+    #[test]
     fn completed_background_job_reprobes_the_tool_version() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -16264,7 +16861,10 @@ mod tests {
             .expect("rustup row");
         let previous_probe = app.tools[index].version_probe_id;
 
-        job.set_status(JobStatus::Succeeded { exit_code: 0 });
+        job.set_status(JobStatus::Succeeded {
+            exit_code: 0,
+            warning: None,
+        });
         store.save(&job).expect("complete job");
         app.refresh_jobs().expect("refresh completed job");
 
@@ -16993,8 +17593,49 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_operation_that_reported_a_problem_is_flagged() {
+        let warned = "updated rustup: rustup update\nwarning rustup: the command reported a permission error although it exited successfully\n";
+
+        assert!(output_was_warned("rustup", warned));
+        assert!(
+            !output_was_queued("rustup", warned),
+            "a warning line must not read as a queued operation"
+        );
+        assert!(!output_was_warned(
+            "rustup",
+            "updated rustup: rustup update\n"
+        ));
+        assert_eq!(
+            Language::English.job_status(&JobStatus::Succeeded {
+                exit_code: 0,
+                warning: Some(JobWarning::Permission),
+            }),
+            "succeeded (warned)"
+        );
+        assert_eq!(
+            Language::Chinese.job_status(&JobStatus::Succeeded {
+                exit_code: 0,
+                warning: Some(JobWarning::Lock),
+            }),
+            "成功（有告警）"
+        );
+        assert_eq!(
+            activity_outcome_label(true, false, true, Language::English),
+            "OK (with warnings)"
+        );
+    }
+
+    #[test]
     fn colors_activity_lines_by_outcome() {
         assert_eq!(activity_tone(">>> starting bun"), ActivityTone::Start);
+        assert_eq!(
+            activity_tone("=== update rustup: OK (with warnings) ==="),
+            ActivityTone::Warning
+        );
+        assert_eq!(
+            activity_tone("=== 更新 rustup: 成功（有告警） ==="),
+            ActivityTone::Warning
+        );
         assert_eq!(
             activity_tone("=== update codex: QUEUED ==="),
             ActivityTone::Queued
@@ -17029,12 +17670,19 @@ mod tests {
             ActivityTone::Success
         );
         assert_eq!(
-            activity_outcome_label(true, true, Language::English),
+            activity_outcome_label(true, true, false, Language::English),
             "QUEUED"
         );
-        assert_eq!(activity_outcome_label(true, false, Language::English), "OK");
         assert_eq!(
-            activity_outcome_label(false, false, Language::English),
+            activity_outcome_label(true, false, false, Language::English),
+            "OK"
+        );
+        assert_eq!(
+            activity_outcome_label(true, false, true, Language::English),
+            "OK (with warnings)"
+        );
+        assert_eq!(
+            activity_outcome_label(false, false, false, Language::English),
             "FAILED"
         );
         assert_eq!(
@@ -17069,7 +17717,7 @@ mod tests {
             ActivityTone::Error
         );
         assert_eq!(
-            activity_outcome_label(true, true, Language::Chinese),
+            activity_outcome_label(true, true, false, Language::Chinese),
             "已排队"
         );
     }
@@ -18369,6 +19017,33 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_custom_command_prefills_a_derived_uninstall_command() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        state.ensure().expect("state directory");
+        UserConfig::parse(concat!(
+            "[commands.dsh]\n",
+            "type = \"custom\"\n",
+            "update = [\"npm\", \"install\", \"-g\", \"dsh\"]\n",
+            "probe = [\"dsh\", \"--version\"]\n",
+        ))
+        .expect("parse declaration")
+        .save(&state.custom_config_path())
+        .expect("seed declaration");
+        let mut app = App::new(state, None).expect("app");
+        focus_tool_named(&mut app, "dsh");
+
+        app.open_edit_command();
+
+        assert!(matches!(
+            &app.modal,
+            Modal::CustomCommandFlow(flow)
+                if flow.uninstall.value == "npm uninstall --global dsh"
+                    && flow.uninstall_inferred
+        ));
+    }
+
+    #[test]
     fn stale_package_resolution_is_discarded_after_pasted_identity_change() {
         let temporary = tempfile::TempDir::new().expect("temp dir");
         let state = StateDirs::at(temporary.path().to_path_buf());
@@ -18839,13 +19514,18 @@ mod tests {
         );
 
         match &app.modal {
-            Modal::ConfirmUninstall { name, command } => {
+            Modal::ConfirmUninstall {
+                name,
+                command,
+                inferred,
+            } => {
                 assert_eq!(name, "rustup");
                 assert_eq!(
                     command.as_deref(),
                     Some("rustup self uninstall -y"),
                     "the confirmation shows the command dvup will run"
                 );
+                assert!(!inferred, "a declared removal command is not inferred");
             }
             _ => panic!("expected the uninstall confirmation"),
         }
@@ -18854,6 +19534,80 @@ mod tests {
         assert!(
             screen.contains("rustup self uninstall -y"),
             "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn uninstall_shortcut_confirms_a_derived_removal_command() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        state.ensure().expect("state directory");
+        UserConfig::parse(concat!(
+            "[commands.dsh]\n",
+            "type = \"custom\"\n",
+            "update = [\"npm\", \"install\", \"-g\", \"dsh\"]\n",
+            "probe = [\"dsh\", \"--version\"]\n",
+        ))
+        .expect("parse declaration")
+        .save(&state.custom_config_path())
+        .expect("seed declaration");
+        let mut app = App::new(state, None).expect("app");
+        make_tool_installed(&mut app, "dsh");
+
+        handle_command_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+
+        match &app.modal {
+            Modal::ConfirmUninstall {
+                name,
+                command,
+                inferred,
+            } => {
+                assert_eq!(name, "dsh");
+                assert_eq!(command.as_deref(), Some("npm uninstall --global dsh"));
+                assert!(inferred, "an npm installation derives its removal command");
+            }
+            _ => panic!("expected the uninstall confirmation"),
+        }
+        let screen = render_test_screen(&mut app, 120, 30);
+        assert!(
+            screen.contains("npm uninstall --global dsh"),
+            "screen: {screen}"
+        );
+        assert!(
+            screen.contains("Derived from the install command"),
+            "screen: {screen}"
+        );
+    }
+
+    #[test]
+    fn uninstall_shortcut_points_a_custom_tool_at_the_declaration_editor() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let state = StateDirs::at(temporary.path().to_path_buf());
+        state.ensure().expect("state directory");
+        UserConfig::parse(concat!(
+            "[commands.example]\n",
+            "type = \"custom\"\n",
+            "update = [\"example\", \"upgrade\"]\n",
+            "probe = [\"example\", \"--version\"]\n",
+        ))
+        .expect("parse declaration")
+        .save(&state.custom_config_path())
+        .expect("seed declaration");
+        let mut app = App::new(state, None).expect("app");
+        make_tool_installed(&mut app, "example");
+
+        handle_command_tools_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            app.message,
+            "No uninstall command for example; press e to declare one"
         );
     }
 
@@ -18905,6 +19659,7 @@ mod tests {
         app.modal = Modal::ConfirmUninstall {
             name: "rustup".to_owned(),
             command: Some("rustup self uninstall -y".to_owned()),
+            inferred: false,
         };
 
         handle_key(
@@ -18931,6 +19686,7 @@ mod tests {
         app.modal = Modal::ConfirmUninstall {
             name: "rustup".to_owned(),
             command: Some("rustup self uninstall -y".to_owned()),
+            inferred: false,
         };
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

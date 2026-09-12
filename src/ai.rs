@@ -14,7 +14,7 @@ const CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_AI_RESPONSE_BYTES: u64 = 64 * 1024;
 const MAX_GENERATION_CANDIDATES: usize = 5;
 const USER_AGENT: &str = concat!("dvup/", env!("CARGO_PKG_VERSION"));
-const PACKAGE_MANAGERS: &[&str] = &["brew", "npm", "pnpm", "cargo", "pipx", "uv"];
+const PACKAGE_MANAGERS: &[&str] = &["brew", "npm", "pnpm", "bun", "cargo", "pipx", "uv"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SystemContext {
@@ -106,8 +106,9 @@ pub(crate) fn analyze_command_intent(
     let system = concat!(
         "You analyze a command-tool update intent and propose 1 to 5 command candidates. ",
         "Return one JSON object only with exactly one property, candidates. Each candidate has ",
-        "exactly name, manager, and package. manager must be homebrew, npm, pnpm, cargo, pipx, ",
-        "or uv. Never return a GitHub repository monitor, latest-version source, raw command, ",
+        "exactly name, manager, and package. manager must be homebrew, npm, pnpm, bun, cargo, ",
+        "pipx, or uv. Never return a GitHub repository monitor, latest-version source, raw ",
+        "command, ",
         "TOML, webpage, README, installer script, markdown, or explanation. If the request is ",
         "specifically for repository asset monitoring, return an empty candidates array."
     );

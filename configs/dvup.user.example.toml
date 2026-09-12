@@ -2,6 +2,7 @@
 # Uncomment complete entries only. Unknown fields and removed legacy formats are rejected.
 
 # Package-manager command. probe_args defaults to ["--version"].
+# Supported managers are homebrew, npm, pnpm, bun, cargo, pipx, and uv.
 # The update command, official latest-version source, target-version support,
 # process wait rule, retry policy, platform limits, and resource group are compiled locally.
 #
@@ -27,11 +28,19 @@
 # update = ["deno", "upgrade"]
 # probe = ["deno", "--version"]
 
-# A custom command may declare how `dvup uninstall <name>` removes it. Omit the
-# field to make the command explicitly non-uninstallable. Package-manager
-# declarations never need it: brew/npm/pnpm/cargo/pipx/uv removal is local.
+# A custom command may declare how `dvup uninstall <name>` removes it. Leaving the
+# field out derives the removal command from the update command when that command is
+# a single-package installation, such as `npm install -g <package>`, `pnpm add -g`,
+# `bun add -g`, `brew install`, `cargo install`, `pipx install`, or
+# `uv tool install`. Anything else stays non-uninstallable. Package-manager
+# declarations never need it: brew/npm/pnpm/bun/cargo/pipx/uv removal is local.
 # The command is a plain argv array with no shell expansion, so prefer the
 # tool's own uninstaller over shell built-ins.
+#
+# [commands.npm-tool]
+# type = "custom"
+# update = ["npm", "install", "-g", "npm-tool"]
+# probe = ["npm-tool", "--version"]
 #
 # [commands.mise]
 # type = "custom"

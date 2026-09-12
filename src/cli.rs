@@ -17,7 +17,7 @@ use crate::{
     },
     datetime, detach, doctor,
     error::{Error, Result},
-    job::{Job, JobStatus, JobStore},
+    job::{Job, JobStatus, JobStore, JobWarning},
     process,
     settings::{AppSettings, NetworkSettings},
     state::StateDirs,
@@ -357,6 +357,7 @@ pub fn run(cli: Cli) -> Result<u8> {
                 latest: None,
                 update_version: None,
                 uninstall: None,
+                uninstall_inferred: false,
                 background: ToolBackground::Auto,
                 processes,
                 lock_timeout_secs,
@@ -717,6 +718,8 @@ struct ExecutionSuccess {
     kind: ExecutionKind,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// Warning a successful command still reported, if any.
+    warning: Option<JobWarning>,
 }
 
 #[derive(Debug)]
@@ -943,7 +946,13 @@ fn execute_with_outcome(
         Ok(success) => {
             write_captured_output(&success.stdout, &success.stderr)?;
             match success.kind {
-                ExecutionKind::Updated => println!("{outcome} {name}: {command_display}"),
+                ExecutionKind::Updated => {
+                    println!("{outcome} {name}: {command_display}");
+                    // The TUI reads this line to label the activity entry.
+                    if let Some(warning) = success.warning {
+                        println!("warning {name}: {}", warning.message());
+                    }
+                }
                 ExecutionKind::Queued { job_id, reason } => {
                     println!("queued {name}: {reason}");
                     println!("job: {job_id}");
@@ -1003,7 +1012,10 @@ fn execute_inner(job: Job, mode: BackgroundMode, state: StateDirs) -> ExecutionR
     }
 }
 
-fn run_now_inner(job: Job, mode: BackgroundMode, store: &JobStore) -> ExecutionResult {
+/// Runs one command in the foreground while keeping the same durable job
+/// lifecycle the background worker writes, so every executed update and
+/// uninstall appears in the job list with its real status and log.
+fn run_now_inner(mut job: Job, mode: BackgroundMode, store: &JobStore) -> ExecutionResult {
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1015,38 +1027,109 @@ fn run_now_inner(job: Job, mode: BackgroundMode, store: &JobStore) -> ExecutionR
         .lock_exclusive()
         .map_err(ExecutionFailure::from_error)?;
 
+    job.set_status(JobStatus::Running { attempt: 1 });
+    record_job(store, &job)?;
+    let started = format!(
+        "attempt 1/1: {} {}",
+        job.command.program,
+        job.command.args.join(" ")
+    );
+    if let Err(error) = store.log_line(&job.id, &started) {
+        return Err(ExecutionFailure::message(format!(
+            "failed to write the job log: {error}"
+        )));
+    }
+
     let result = command::run_with_network(&job.command, &job.network);
     FileExt::unlock(&lock_file).map_err(ExecutionFailure::from_error)?;
-    let result = result.map_err(ExecutionFailure::from_error)?;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let message = record_inline_failure(&mut job, store, error.to_string(), None);
+            return Err(ExecutionFailure::message(message));
+        }
+    };
+    if let Err(error) = command::append_to_log(&store.dirs().log_path(&job.id), &result) {
+        return Err(ExecutionFailure::message(format!(
+            "failed to write the job log: {error}"
+        )));
+    }
 
     if result.status.success() {
+        // A zero exit code can still hide a locked or permission-denied file, so
+        // the job records what the command complained about.
+        let warning = result.success_warning();
+        job.set_status(JobStatus::Succeeded {
+            exit_code: result.exit_code().unwrap_or(0),
+            warning,
+        });
+        record_job(store, &job)?;
+        if let Err(error) = store.log_line(
+            &job.id,
+            &match warning {
+                Some(warning) => format!("job succeeded; {}", warning.message()),
+                None => "job succeeded".to_owned(),
+            },
+        ) {
+            return Err(ExecutionFailure::message(format!(
+                "failed to write the job log: {error}"
+            )));
+        }
         return Ok(ExecutionSuccess {
             kind: ExecutionKind::Updated,
             stdout: result.stdout,
             stderr: result.stderr,
+            warning,
         });
     }
     if matches!(mode, BackgroundMode::Auto) && result.is_lock_failure() {
+        // The worker continues this same job id, so the row stays traceable.
         let mut scheduled =
             schedule_inner(job, store, "the update command reported a locked file")?;
         scheduled.stdout = result.stdout;
         scheduled.stderr = result.stderr;
         return Ok(scheduled);
     }
-    if result.is_permission_failure() && !result.is_lock_failure() {
-        return Err(ExecutionFailure {
-            message: "permission denied; configure a user-owned global package prefix or run from an elevated terminal".to_owned(),
-            exit_code: result.exit_code(),
-            stdout: result.stdout,
-            stderr: result.stderr,
-        });
-    }
+    let message = if result.is_permission_failure() && !result.is_lock_failure() {
+        "permission denied; configure a user-owned global package prefix or run from an elevated terminal"
+            .to_owned()
+    } else {
+        "update command returned a non-zero exit status".to_owned()
+    };
+    let message = record_inline_failure(&mut job, store, message, result.exit_code());
     Err(ExecutionFailure {
-        message: "update command returned a non-zero exit status".to_owned(),
+        message,
         exit_code: result.exit_code(),
         stdout: result.stdout,
         stderr: result.stderr,
     })
+}
+
+fn record_job(store: &JobStore, job: &Job) -> std::result::Result<(), ExecutionFailure> {
+    store.save(job).map_err(|error| {
+        ExecutionFailure::message(format!("failed to record the job status: {error}"))
+    })
+}
+
+/// Marks a failed inline attempt the way the worker marks one, reporting the
+/// failure message together with any problem recording it.
+fn record_inline_failure(
+    job: &mut Job,
+    store: &JobStore,
+    message: String,
+    exit_code: Option<i32>,
+) -> String {
+    job.set_status(JobStatus::Failed {
+        message: message.clone(),
+        exit_code,
+    });
+    let recorded = store
+        .save(job)
+        .and_then(|()| store.log_line(&job.id, &format!("job failed: {message}")));
+    match recorded {
+        Ok(()) => message,
+        Err(error) => format!("{message}; also failed to record the job status: {error}"),
+    }
 }
 
 fn schedule_inner(mut job: Job, store: &JobStore, reason: &str) -> ExecutionResult {
@@ -1071,6 +1154,7 @@ fn schedule_inner(mut job: Job, store: &JobStore, reason: &str) -> ExecutionResu
         },
         stdout: Vec::new(),
         stderr: Vec::new(),
+        warning: None,
     })
 }
 
@@ -1226,6 +1310,9 @@ fn show_jobs(state: StateDirs, job_id: Option<String>, include_log: bool) -> Res
                 }
             }
             JobStatus::Pending | JobStatus::Succeeded { .. } => {}
+        }
+        if let Some(warning) = job.status.warning() {
+            println!("warning: {}", warning.message());
         }
         println!(
             "command: {} {}",
@@ -1788,5 +1875,91 @@ install = { type = "user_directory" }
         let (program, args) = tool.uninstall_command("ripgrep").expect("manager template");
         assert_eq!(program, "brew");
         assert_eq!(args, ["uninstall", "ripgrep"]);
+    }
+
+    #[test]
+    fn npm_style_custom_declarations_expose_a_derived_uninstall_command() {
+        let declaration = concat!(
+            "[commands.dsh]\n",
+            "type = \"custom\"\n",
+            "update = [\"npm\", \"install\", \"-g\", \"dsh\"]\n",
+            "probe = [\"dsh\", \"--version\"]\n",
+        );
+        let install_root = std::env::current_dir().expect("current directory");
+        let manifest = UserConfig::parse(declaration)
+            .expect("parse custom declaration")
+            .resolve_with_install_root(&install_root)
+            .expect("compile custom declaration");
+        let tool = manifest.tools.get("dsh").expect("compiled custom tool");
+
+        let (program, args) = tool.uninstall_command("dsh").expect("derived command");
+        assert_eq!(program, "npm");
+        assert_eq!(args, ["uninstall", "--global", "dsh"]);
+    }
+
+    /// Builds one inline job around a command that is always available while
+    /// running the test suite.
+    fn rustc_job(temporary: &tempfile::TempDir, args: &[&str]) -> Job {
+        let args = args.iter().map(|argument| (*argument).to_owned()).collect();
+        Job::from_tool_with_command(
+            "rustc".to_owned(),
+            Tool::custom("rustc", "rustc".to_owned(), vec!["--version".to_owned()]),
+            temporary.path().to_path_buf(),
+            NetworkSettings::default(),
+            ("rustc".to_owned(), args),
+        )
+    }
+
+    #[test]
+    fn inline_updates_record_a_succeeded_job() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let store =
+            JobStore::new(StateDirs::at(temporary.path().join("state"))).expect("job store");
+        let job = rustc_job(&temporary, &["--version"]);
+        let job_id = job.id.clone();
+
+        let success = run_now_inner(job, BackgroundMode::Never, &store).expect("inline update");
+
+        assert!(matches!(success.kind, ExecutionKind::Updated));
+        assert!(!success.stdout.is_empty(), "the command output is captured");
+        let recorded = store.load(&job_id).expect("recorded job");
+        assert!(
+            matches!(
+                recorded.status,
+                JobStatus::Succeeded {
+                    exit_code: 0,
+                    warning: None
+                }
+            ),
+            "unexpected status: {:?}",
+            recorded.status
+        );
+        let log = String::from_utf8(store.read_log(&job_id).expect("job log")).expect("utf-8 log");
+        assert!(log.contains("attempt 1/1: rustc --version"), "log: {log}");
+        assert!(log.contains("job succeeded"), "log: {log}");
+    }
+
+    #[test]
+    fn inline_failures_record_the_failed_status() {
+        let temporary = tempfile::TempDir::new().expect("temp dir");
+        let store =
+            JobStore::new(StateDirs::at(temporary.path().join("state"))).expect("job store");
+        let job = rustc_job(&temporary, &["--dvup-unknown-flag"]);
+        let job_id = job.id.clone();
+
+        let failure =
+            run_now_inner(job, BackgroundMode::Never, &store).expect_err("unknown flag fails");
+
+        assert!(!failure.message.is_empty());
+        let recorded = store.load(&job_id).expect("recorded job");
+        match &recorded.status {
+            JobStatus::Failed { message, .. } => assert_eq!(
+                message, &failure.message,
+                "the job list and the reported error must agree"
+            ),
+            status => panic!("unexpected status: {status:?}"),
+        }
+        let log = String::from_utf8(store.read_log(&job_id).expect("job log")).expect("utf-8 log");
+        assert!(log.contains("job failed:"), "log: {log}");
     }
 }

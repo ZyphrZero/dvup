@@ -8,7 +8,6 @@ use fs2::FileExt;
 use crate::{
     command,
     config::ProcessAction,
-    datetime,
     error::{Error, Result},
     job::{Job, JobStatus, JobStore},
     process,
@@ -35,7 +34,7 @@ fn run_inner(job_id: &str, store: &JobStore) -> Result<()> {
         return Ok(());
     }
 
-    log_line(store, job_id, &format!("job {} started", job.id))?;
+    store.log_line(job_id, &format!("job {} started", job.id))?;
     handle_process_rules(&mut job, store)?;
 
     let lock_path = store.dirs().resource_lock_path(&job.resource_group);
@@ -91,8 +90,7 @@ pub fn apply_terminate_rules(job: &mut Job, store: &JobStore) -> Result<usize> {
         .iter()
         .map(|matched| matched.process.clone())
         .collect::<Vec<_>>();
-    log_line(
-        store,
+    store.log_line(
         &job.id,
         &format!(
             "terminating matching processes: {}",
@@ -151,8 +149,7 @@ fn handle_process_rules(job: &mut Job, store: &JobStore) -> Result<()> {
                 .iter()
                 .map(|matched| matched.process.clone())
                 .collect::<Vec<_>>();
-            log_line(
-                store,
+            store.log_line(
                 &job.id,
                 &format!(
                     "terminating matching processes: {}",
@@ -182,8 +179,7 @@ fn handle_process_rules(job: &mut Job, store: &JobStore) -> Result<()> {
 
         let pids: Vec<_> = processes.iter().map(|process| process.pid).collect();
         if pids != last_pids {
-            log_line(
-                store,
+            store.log_line(
                 &job.id,
                 &format!(
                     "waiting for matching processes: {}",
@@ -216,8 +212,7 @@ fn terminate_process(
         }
     }
     if process::is_alive(target) {
-        log_line(
-            store,
+        store.log_line(
             job_id,
             &format!(
                 "process {} ({}) did not exit gracefully; forcing termination",
@@ -264,8 +259,7 @@ fn execute_with_retries(job: &mut Job, store: &JobStore) -> Result<()> {
     for attempt in 1..=attempts {
         job.set_status(JobStatus::Running { attempt });
         store.save(job)?;
-        log_line(
-            store,
+        store.log_line(
             &job.id,
             &format!(
                 "attempt {attempt}/{attempts}: {} {}",
@@ -286,9 +280,15 @@ fn execute_with_retries(job: &mut Job, store: &JobStore) -> Result<()> {
 
         if result.status.success() {
             let exit_code = result.exit_code().unwrap_or(0);
-            job.set_status(JobStatus::Succeeded { exit_code });
+            let warning = result.success_warning();
+            job.set_status(JobStatus::Succeeded { exit_code, warning });
             store.save(job)?;
-            log_line(store, &job.id, "job succeeded")?;
+            match warning {
+                Some(warning) => {
+                    store.log_line(&job.id, &format!("job succeeded; {}", warning.message()))?
+                }
+                None => store.log_line(&job.id, "job succeeded")?,
+            }
             return Ok(());
         }
 
@@ -305,8 +305,7 @@ fn execute_with_retries(job: &mut Job, store: &JobStore) -> Result<()> {
         }
 
         let delay = retry_delay(job.retry_delay_secs, attempt);
-        log_line(
-            store,
+        store.log_line(
             &job.id,
             &format!("command failed; retrying in {} second(s)", delay.as_secs()),
         )?;
@@ -335,11 +334,7 @@ fn fail_job(
     let log_message = format!("job failed: {message}");
     job.set_status(JobStatus::Failed { message, exit_code });
     store.save(job)?;
-    log_line(store, &job.id, &log_message)
-}
-
-fn log_line(store: &JobStore, id: &str, line: &str) -> Result<()> {
-    store.append_log(id, datetime::timestamp_line(line).as_bytes())
+    store.log_line(&job.id, &log_message)
 }
 
 #[cfg(test)]
@@ -352,22 +347,6 @@ mod tests {
         for (attempt, expected_secs) in cases {
             assert_eq!(retry_delay(2, attempt), Duration::from_secs(expected_secs));
         }
-    }
-
-    #[test]
-    fn worker_log_lines_include_a_datetime() {
-        let temporary = tempfile::TempDir::new().expect("temp dir");
-        let store = JobStore::new(crate::state::StateDirs::at(temporary.path().to_path_buf()))
-            .expect("job store");
-
-        log_line(&store, "timestamp-test", "worker event").expect("write log");
-
-        let log = String::from_utf8(store.read_log("timestamp-test").expect("read log"))
-            .expect("utf-8 log");
-        assert_eq!(
-            crate::datetime::strip_timestamp_prefix(&log),
-            "worker event\n"
-        );
     }
 
     #[test]
@@ -435,7 +414,10 @@ mod tests {
         assert!(!store.read_log(&job_id).expect("read worker log").is_empty());
 
         let mut completed = store.load(&job_id).expect("load waiting job");
-        completed.set_status(JobStatus::Succeeded { exit_code: 0 });
+        completed.set_status(JobStatus::Succeeded {
+            exit_code: 0,
+            warning: None,
+        });
         store.save(&completed).expect("complete job externally");
         FileExt::unlock(&lock_file).expect("release resource lock");
 
@@ -445,7 +427,7 @@ mod tests {
             .expect("worker should skip completed job");
         assert!(matches!(
             store.load(&job_id).expect("load completed job").status,
-            JobStatus::Succeeded { exit_code: 0 }
+            JobStatus::Succeeded { exit_code: 0, .. }
         ));
     }
 }

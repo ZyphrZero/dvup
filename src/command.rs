@@ -14,7 +14,7 @@ use crate::{
     config::Tool,
     datetime,
     error::{Error, Result},
-    job::CommandSpec,
+    job::{CommandSpec, JobWarning},
     settings::{NetworkSettings, ProxyMode},
 };
 
@@ -128,26 +128,40 @@ impl CommandResult {
         if self.status.success() {
             return false;
         }
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr)
-        )
-        .to_lowercase();
-        contains_lock_failure(&combined)
+        contains_lock_failure(&self.combined_output())
     }
 
     pub fn is_permission_failure(&self) -> bool {
         if self.status.success() {
             return false;
         }
-        let combined = format!(
+        contains_permission_failure(&self.combined_output())
+    }
+
+    /// Returns the actionable problem a successful command still reported, so a
+    /// zero exit code cannot hide a locked or permission-denied file behind the
+    /// "succeeded" label.
+    pub fn success_warning(&self) -> Option<JobWarning> {
+        if !self.status.success() {
+            return None;
+        }
+        let output = self.combined_output();
+        if contains_permission_failure(&output) {
+            Some(JobWarning::Permission)
+        } else if contains_lock_failure(&output) {
+            Some(JobWarning::Lock)
+        } else {
+            None
+        }
+    }
+
+    fn combined_output(&self) -> String {
+        format!(
             "{}\n{}",
             String::from_utf8_lossy(&self.stdout),
             String::from_utf8_lossy(&self.stderr)
         )
-        .to_lowercase();
-        contains_permission_failure(&combined)
+        .to_lowercase()
     }
 }
 
@@ -169,10 +183,22 @@ const PERMISSION_FAILURE_MARKERS: &[&str] = &[
     "requires elevated privileges",
 ];
 
+/// OS error codes that mean "the file is busy" or "access denied" in every
+/// system language, because localized messages cannot be matched by text.
+#[cfg(windows)]
+const LOCK_FAILURE_OS_ERRORS: &[i32] = &[32, 33];
+#[cfg(not(windows))]
+const LOCK_FAILURE_OS_ERRORS: &[i32] = &[16, 26];
+#[cfg(windows)]
+const PERMISSION_FAILURE_OS_ERRORS: &[i32] = &[5];
+#[cfg(not(windows))]
+const PERMISSION_FAILURE_OS_ERRORS: &[i32] = &[13];
+
 fn contains_lock_failure(output: &str) -> bool {
     LOCK_FAILURE_MARKERS
         .iter()
         .any(|marker| output.contains(marker))
+        || contains_os_error(output, LOCK_FAILURE_OS_ERRORS)
         || (output.contains("eperm")
             && ["unlink", "rename", "rmdir"]
                 .iter()
@@ -183,6 +209,18 @@ fn contains_permission_failure(output: &str) -> bool {
     PERMISSION_FAILURE_MARKERS
         .iter()
         .any(|marker| output.contains(marker))
+        || contains_os_error(output, PERMISSION_FAILURE_OS_ERRORS)
+}
+
+/// Matches `os error <code>` without matching a longer code that starts the same.
+fn contains_os_error(output: &str, codes: &[i32]) -> bool {
+    codes.iter().any(|code| {
+        let needle = format!("os error {code}");
+        output.match_indices(&needle).any(|(index, _)| {
+            !output[index + needle.len()..]
+                .starts_with(|character: char| character.is_ascii_digit())
+        })
+    })
 }
 
 /// Executes a command with the application's exact network policy.
@@ -423,7 +461,11 @@ pub fn append_to_log(path: &std::path::Path, result: &CommandResult) -> Result<(
 mod tests {
     use std::ffi::{OsStr, OsString};
 
-    use crate::settings::{NetworkSettings, ProxyMode};
+    use super::run_with_network;
+    use crate::{
+        job::JobWarning,
+        settings::{NetworkSettings, ProxyMode},
+    };
 
     fn command_environment(
         command: &std::process::Command,
@@ -553,6 +595,55 @@ mod tests {
                 "unexpected classification for {output:?}"
             );
         }
+    }
+
+    #[test]
+    fn classifies_localized_os_error_codes() {
+        // The codes are the platform's own access-denied and file-busy errors, so
+        // a system-language message still classifies.
+        let (lock_code, permission_code) = if cfg!(windows) { (32, 5) } else { (16, 13) };
+
+        assert!(super::contains_permission_failure(
+            &format!(
+                "error: could not remove 'rustup-bin' file: 'C:\\Users\\x\\.cargo\\bin\\rustup.exe': 拒绝访问。 (os error {permission_code})"
+            )
+            .to_lowercase()
+        ));
+        assert!(super::contains_lock_failure(
+            &format!("error: 文件被占用 (os error {lock_code})").to_lowercase()
+        ));
+        assert!(
+            !super::contains_permission_failure(
+                &format!("error: unrelated failure (os error {permission_code}0)").to_lowercase()
+            ),
+            "a longer code must not match a shorter one"
+        );
+        assert!(!super::contains_lock_failure(
+            "error: unrelated failure".to_lowercase().as_str()
+        ));
+    }
+
+    #[test]
+    fn warns_when_a_successful_command_still_reports_a_problem() {
+        let spec = crate::job::CommandSpec {
+            program: "rustc".to_owned(),
+            args: vec!["--version".to_owned()],
+            working_directory: std::env::current_dir().expect("current directory"),
+        };
+        let mut result =
+            run_with_network(&spec, &NetworkSettings::default()).expect("rustc --version runs");
+        assert!(result.status.success(), "the fixture command must succeed");
+        assert_eq!(result.success_warning(), None);
+
+        let (lock_code, permission_code) = if cfg!(windows) { (32, 5) } else { (16, 13) };
+        result.stderr = format!("error: 拒绝访问。 (os error {permission_code})").into_bytes();
+        assert_eq!(result.success_warning(), Some(JobWarning::Permission));
+
+        result.stderr = format!("error: file is in use (os error {lock_code})").into_bytes();
+        assert_eq!(result.success_warning(), Some(JobWarning::Lock));
+
+        result.stderr = "error: unrelated failure".to_owned().into_bytes();
+        assert_eq!(result.success_warning(), None);
     }
 
     #[test]
